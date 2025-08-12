@@ -155,9 +155,31 @@ python -m src.cli --message "Explain quantum computing" --stream
 - `OLLAMA_API_KEY`: Your Ollama API key
 - `OLLAMA_MODEL`: Model name (default: gpt-oss:120b)
 - `OLLAMA_HOST`: API endpoint (default: https://ollama.com)
-- `MAX_CONVERSATION_HISTORY`: Maximum messages to keep (default: 50)
+- `MAX_CONVERSATION_HISTORY`: Maximum messages to keep (default: 10)
 - `STREAM_BY_DEFAULT`: Enable streaming by default (default: false)
 - `LOG_LEVEL`: Logging level (default: INFO)
+
+#### Mem0 (optional)
+- `MEM0_API_KEY`: Mem0 API key (enables long-term memory)
+- `MEM0_USER_ID`: Memory namespace user id (default: "Braden")
+- `MEM0_AGENT_ID`: Optional agent id for tagging
+- `MEM0_APP_ID`: Optional app id for tagging
+- `MEM0_ORG_ID`: Optional organization id
+- `MEM0_PROJECT_ID`: Optional project id
+
+Mem0 runtime knobs (advanced):
+
+- `MEM0_ENABLED`: Enable/disable Mem0 (default: `1`)
+- `MEM0_DEBUG`: Enable Mem0 debug logs (default: `0`)
+- `MEM0_MAX_HITS`: Max memories injected per turn (default: `3`)
+- `MEM0_SEARCH_TIMEOUT_MS`: Time-boxed search timeout in ms (default: `200`)
+- `MEM0_TIMEOUT_CONNECT_MS`: HTTP connect timeout in ms (default: `1000`)
+- `MEM0_TIMEOUT_READ_MS`: HTTP read timeout in ms (default: `2000`)
+- `MEM0_ADD_QUEUE_MAX`: Background add queue size (default: `256`)
+- `MEM0_BREAKER_THRESHOLD`: Consecutive failures to trip circuit breaker (default: `3`)
+- `MEM0_BREAKER_COOLDOWN_MS`: Breaker cooldown in ms (default: `60000`)
+- `MEM0_SHUTDOWN_FLUSH_MS`: Shutdown flush timeout in ms (default: `3000`)
+- `MEM0_SEARCH_WORKERS`: Tiny thread pool size for Mem0 searches (default: `2`)
 
 ### Command Line Options
 ```
@@ -177,7 +199,22 @@ While in interactive mode:
 - `quit` or `exit`: Exit the application
 - `clear`: Clear conversation history
 - `history`: Show conversation history
+- `/mem ...`: Manage memories (list|search|add|get|update|delete|clear|link|export|import)
 - `Ctrl+C`: Exit gracefully
+
+## Mem0 Memory System
+
+Mem0 is integrated as the long-term memory store. It is optional and enabled when `MEM0_API_KEY` is present in your `.env`.
+
+- __Initialization__: Loaded silently from environment variables. No runtime prompts.
+- __Status banner__: Interactive mode shows `Mem0: enabled (user: <id>)` or `Mem0: disabled (no key)`.
+- __Injection hygiene__: At most one "Relevant information:" system block is injected per turn before your message; previous injection blocks are removed each turn. Local conversation history is capped at 10 turns.
+- __Natural language intents__: You can type phrases like:
+  - "remember ...", "forget ...", "update X to Y", "list/show memories", "link <id1> <id2>", "search memories for ...", or "what do you know about me".
+- __/mem commands__: `list`, `search <q>`, `add <text>`, `get <id>`, `update <id> <text>`, `delete <id>`, `clear`, `link <id1> <id2>`, `export [path.json]`, `import <path.json>`.
+- __Export/Import__: Exports to `mem0_export_*.json` including `id`, `memory`, `metadata`, `created_at`, `updated_at`. Git ignores these files by default.
+- __Resilience__: All Mem0 operations are wrapped in try/except; failures never block chat. A one-time notice is shown if Mem0 is unavailable; details are logged at DEBUG level.
+ - __Filters__: Minimal filters are used for recall (`user_id` only) for list/search/export until recall is proven.
 
 ## Error Handling
 
