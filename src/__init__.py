@@ -10,7 +10,9 @@ from .tools import (
     get_current_weather,
     calculate_math,
     list_files,
-    get_system_info
+    get_system_info,
+    duckduckgo_search,
+    wikipedia_search,
 )
 
 __all__ = [
@@ -18,5 +20,7 @@ __all__ = [
     "get_current_weather",
     "calculate_math",
     "list_files",
-    "get_system_info"
+    "get_system_info",
+    "duckduckgo_search",
+    "wikipedia_search",
 ]
