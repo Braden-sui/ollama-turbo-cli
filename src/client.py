@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
+from .prompt_manager import PromptManager
 
 
 class OllamaTurboClient:
@@ -94,14 +95,13 @@ class OllamaTurboClient:
             headers={'Authorization': api_key}
         )
         
-        # Initialize conversation history with a system directive for reasoning effort
+        # Prompt management
+        self.prompt = PromptManager(self.reasoning)
+        # Initialize conversation history with a system directive
         self.conversation_history = [
             {
                 'role': 'system',
-                'content': (
-                    f"Reasoning effort: {self.reasoning}. "
-                    "Use tools when helpful. Do not expose chain-of-thought. Provide a direct answer, and include brief source URLs when tools are used."
-                )
+                'content': self.prompt.initial_system_prompt()
             }
         ]
         # Enforce local history window <= 10 turns (excluding initial system)
@@ -260,7 +260,7 @@ class OllamaTurboClient:
                     self._trace("reprompt:after-tools")
                     self.conversation_history.append({
                         'role': 'user',
-                        'content': "Please use these details to answer the user's original question."
+                        'content': self.prompt.reprompt_after_tools()
                     })
 
                     rounds += 1
@@ -416,7 +416,7 @@ class OllamaTurboClient:
                     self._trace("reprompt:after-tools")
                     self.conversation_history.append({
                         'role': 'user',
-                        'content': "Please use these details to answer the user's original question."
+                        'content': self.prompt.reprompt_after_tools()
                     })
                     rounds += 1
                     # Next loop iteration may include tools again if multi-round enabled
@@ -581,7 +581,11 @@ class OllamaTurboClient:
             msg = self.conversation_history[i]
             if msg.get('role') == 'system':
                 c = msg.get('content') or ''
-                if c.startswith("Relevant information:") or c.startswith("Relevant user memories"):
+                if (
+                    c.startswith("Previous context from user history (use if relevant):")
+                    or c.startswith("Relevant information:")
+                    or c.startswith("Relevant user memories")
+                ):
                     latest_mem_idx = i
                     break
 
@@ -609,14 +613,11 @@ class OllamaTurboClient:
     
     def clear_history(self):
         """Clear conversation history."""
-        # Preserve the system reasoning directive when clearing
+        # Preserve the system directive when clearing
         self.conversation_history = [
             {
                 'role': 'system',
-                'content': (
-                    f"Reasoning effort: {self.reasoning}. "
-                    "Use tools when helpful. Do not expose chain-of-thought. Output only final answers."
-                )
+                'content': self.prompt.initial_system_prompt()
             }
         ]
         self.logger.info("Conversation history cleared")
@@ -712,7 +713,11 @@ class OllamaTurboClient:
                 msg = self.conversation_history[idx]
                 if msg.get('role') == 'system':
                     c = msg.get('content') or ''
-                    if c.startswith("Relevant information:") or c.startswith("Relevant user memories"):
+                    if (
+                        c.startswith("Previous context from user history (use if relevant):")
+                        or c.startswith("Relevant information:")
+                        or c.startswith("Relevant user memories")
+                    ):
                         self.conversation_history.pop(idx)
 
             # Minimal filter: just user_id
@@ -783,7 +788,7 @@ class OllamaTurboClient:
                 if self.mem0_debug and not self.quiet:
                     print(f"[mem0] search dt={dt_ms}ms hits=0")
                 return
-            context = "Relevant information:\n" + "\n".join(acc)
+            context = self.prompt.mem0_context_block(acc)
             self.conversation_history.append({'role': 'system', 'content': context})
             self._trace(f"mem0:inject {len(acc)}")
             # Success -> reset breaker

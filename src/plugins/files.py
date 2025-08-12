@@ -9,18 +9,18 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "list_files",
-        "description": "List files and directories in a specified directory with optional extension filtering",
+        "description": "List files and subdirectories in a directory. Use to quickly inspect project structure or discover candidate files. Prefer passing a specific directory and (when looking for code) an extension filter to reduce noise. Output is capped to avoid flooding.",
         "parameters": {
             "type": "object",
             "properties": {
                 "directory": {
                     "type": "string",
-                    "description": "Directory path to list contents of",
+                    "description": "Absolute or relative path to list (default is current directory).",
                     "default": "."
                 },
                 "extension": {
                     "type": "string",
-                    "description": "Optional file extension filter (e.g., '.py', '.txt')"
+                    "description": "Optional file extension filter like '.py' or '.txt'. When provided, only files with this extension are listed; directories are omitted."
                 }
             },
             "required": []

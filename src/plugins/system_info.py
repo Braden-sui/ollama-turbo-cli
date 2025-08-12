@@ -15,7 +15,7 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "get_system_info",
-        "description": "Get comprehensive system information including OS, CPU, memory, disk usage, and Python environment",
+        "description": "Get a concise snapshot of the runtime environment (OS, CPU, memory, disk, Python). Use to understand execution context for troubleshooting or environment-aware steps. Avoid requesting this unless necessary; do not expect secrets or private data.",
         "parameters": {
             "type": "object",
             "properties": {},

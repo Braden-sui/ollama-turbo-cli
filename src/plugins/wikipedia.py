@@ -14,12 +14,12 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "wikipedia_search",
-        "description": "Search Wikipedia and return top results with title, URL, and snippet (no API key).",
+        "description": "Keyless Wikipedia search via the MediaWiki API. Use for factual background and canonical topic pages. Provide a focused query (entity or concept). Returns concise top results (title, URL, snippet). For reading full pages, call web_fetch with a returned URL.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Number of results to return (1-5)", "default": 3}
+                "query": {"type": "string", "description": "Focused Wikipedia query (entity/term). Avoid full natural-language questions."},
+                "limit": {"type": "integer", "description": "How many results to return (1-5). Choose the smallest number sufficient to answer.", "default": 3}
             },
             "required": ["query"]
         }

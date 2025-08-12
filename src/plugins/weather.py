@@ -13,17 +13,17 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "get_current_weather",
-        "description": "Get current weather information for a specific city",
+        "description": "Get real-time current weather for a city via wttr.in. Use when the user asks about current weather or near-term conditions for a specific location. Always pass a concrete city name (not 'here'). Prefer the user's unit preference; default is celsius. The tool returns a concise plain-text summary and should not be used for historical data or multi-day forecasts.",
         "parameters": {
             "type": "object",
             "properties": {
                 "city": {
                     "type": "string",
-                    "description": "The city name to get weather for (e.g., London, Paris, Tokyo)"
+                    "description": "City name to query (e.g., 'London', 'Paris', 'Tokyo'). Do not pass vague values like 'here' or 'near me'."
                 },
                 "unit": {
                     "type": "string",
-                    "description": "Temperature unit - celsius or fahrenheit",
+                    "description": "Temperature unit to return. Choose based on user preference if provided; otherwise use the default.",
                     "enum": ["celsius", "fahrenheit"],
                     "default": "celsius"
                 }

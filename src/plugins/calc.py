@@ -8,13 +8,13 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "calculate_math",
-        "description": "Evaluate mathematical expressions including basic operations and functions like sin, cos, sqrt, log, etc.",
+        "description": "Evaluate a mathematical expression and return a numeric result. Use for arithmetic and common functions (sin, cos, tan, sqrt, log, exp, abs, pow). Do not use for units, symbolic algebra, or natural-language math problems.",
         "parameters": {
             "type": "object",
             "properties": {
                 "expression": {
                     "type": "string",
-                    "description": "Mathematical expression to evaluate (e.g., '2 + 2', 'sin(pi/2)', 'sqrt(16)')"
+                    "description": "Pure math expression (e.g., '2 + 2', 'sin(pi/2)', 'sqrt(16)', '2^10'). No variables, no units, no natural language."
                 }
             },
             "required": ["expression"]

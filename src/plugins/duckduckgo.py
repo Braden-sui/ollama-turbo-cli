@@ -16,12 +16,12 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "duckduckgo_search",
-        "description": "Search the web using DuckDuckGo Instant Answer API (no API key). Returns top results.",
+        "description": "Keyless web search via DuckDuckGo Instant Answer API. Use to discover sources or quick facts when external information is required. Provide a focused query (keywords or quoted phrase). The tool returns concise top results (title, URL, snippet). Choose a small max_results (1-5) to minimize noise.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "max_results": {"type": "integer", "description": "Number of results to return (1-5)", "default": 3}
+                "query": {"type": "string", "description": "Focused search query (keywords or quoted phrase). Avoid full natural-language questions when possible."},
+                "max_results": {"type": "integer", "description": "How many results to return (1-5). Choose the smallest number that answers the question.", "default": 3}
             },
             "required": ["query"]
         }
