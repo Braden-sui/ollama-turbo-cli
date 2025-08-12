@@ -1,185 +1,68 @@
 """Web fetch tool plugin"""
 from __future__ import annotations
-
 import json
 from typing import Any, Dict, Optional
 
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
+from ..sandbox.net_proxy import fetch_via_policy
 
 TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "web_fetch",
-        "description": "Fetch live web content from a given URL (GET/HEAD). Returns status, headers, and a body snippet or JSON.",
+        "description": "Fetch web content via a controlled allowlist proxy with SSRF protection and size caps.",
         "parameters": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "HTTP or HTTPS URL to fetch"
-                },
-                "method": {
-                    "type": "string",
-                    "enum": ["GET", "HEAD"],
-                    "default": "GET"
-                },
-                "params": {
-                    "type": "object",
-                    "description": "Optional query parameters as key/value"
-                },
-                "headers": {
-                    "type": "object",
-                    "description": "Optional HTTP headers as key/value"
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Request timeout in seconds (1-60)",
-                    "default": 10
-                },
-                "max_bytes": {
-                    "type": "integer",
-                    "description": "Maximum number of body characters to return (256-1048576)",
-                    "default": 8192
-                },
-                "allow_redirects": {
-                    "type": "boolean",
-                    "description": "Whether to follow redirects",
-                    "default": True
-                },
-                "as_json": {
-                    "type": "boolean",
-                    "description": "If true, try to parse the response as JSON and return it",
-                    "default": False
-                }
+                "url": {"type": "string"},
+                "method": {"type": "string", "enum": ["GET", "HEAD", "POST"], "default": "GET"},
+                "headers": {"type": "object"},
+                "body": {"type": "string"},
+                "timeout_s": {"type": "integer", "default": 15, "maximum": 30},
+                "max_bytes": {"type": "integer"},
+                "extract": {"type": "string", "enum": ["auto", "text", "json", "html_readability", "headers", "bytes"], "default": "auto"},
             },
-            "required": ["url"]
-        }
-    }
+            "required": ["url"],
+        },
+    },
 }
 
-def web_fetch(
-    url: str,
-    method: str = "GET",
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: float = 10,
-    max_bytes: int = 8192,
-    allow_redirects: bool = True,
-    as_json: bool = False,
-) -> str:
-    """Fetch live web content from an HTTP/HTTPS URL.
 
-    - Supports GET/HEAD with optional params and headers
-    - Returns status, final URL, content type, and a truncated body snippet
-    - If as_json is True, attempts to parse and return JSON
-    """
-    try:
-        if not requests:
-            return "Error: Python 'requests' library is not installed. Install it to use web_fetch."
+def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] = None, body: Optional[str] = None, timeout_s: int = 15, max_bytes: Optional[int] = None, extract: str = 'auto') -> str:
+    # Enforce HTTPS default inside fetch_via_policy
+    data = body.encode() if body is not None else None
+    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes)
 
-        url = (url or "").strip()
-        if not url:
-            return "Error: url must be provided"
-        if not (url.startswith("http://") or url.startswith("https://")):
-            return "Error: url must start with http:// or https://"
-
-        method_u = (method or "GET").upper()
-        if method_u not in ("GET", "HEAD"):
-            return "Error: method must be 'GET' or 'HEAD'"
-
-        # Validate numeric bounds
-        try:
-            timeout = float(timeout)
-            if timeout < 1 or timeout > 60:
-                return "Error: timeout must be between 1 and 60 seconds"
-        except Exception:
-            return "Error: timeout must be a number"
-
-        try:
-            max_bytes = int(max_bytes)
-            if max_bytes < 256 or max_bytes > 1048576:
-                return "Error: max_bytes must be between 256 and 1048576"
-        except Exception:
-            return "Error: max_bytes must be an integer"
-
-        # Merge headers with a sensible User-Agent
-        hdrs = {
-            "User-Agent": "ollama-turbo-cli/1.0 (+https://ollama.com)",
+    # Build safe injection summary; never include large bodies
+    inject = res.get('inject') or ''
+    out = {
+        'tool': 'web_fetch',
+        'ok': bool(res.get('ok')),
+        'status': int(res.get('status', 0) or 0),
+        'url': res.get('url', url),
+        'bytes': int(res.get('bytes', 0)),
+        'cached': bool(res.get('cached', False)),
+        'redirects': int(res.get('redirects', 0)),
+        'truncated': bool(res.get('truncated', False)),
+        'inject': inject,
+        'sensitive': _looks_sensitive(inject),
+        'net': {
+            'status': int(res.get('status', 0) or 0),
+            'bytes': int(res.get('bytes', 0)),
+            'cached': bool(res.get('cached', False)),
+            'redirects': int(res.get('redirects', 0)),
+            'url': res.get('url', url),
         }
-        if isinstance(headers, dict):
-            # Keep only str->str
-            for k, v in headers.items():
-                try:
-                    hdrs[str(k)] = str(v)
-                except Exception:
-                    continue
+    }
+    if not res.get('ok') and res.get('error'):
+        out['error'] = res.get('error')
+    return json.dumps(out)
 
-        try:
-            resp = requests.request(
-                method=method_u,
-                url=url,
-                params=params if isinstance(params, dict) else None,
-                headers=hdrs,
-                timeout=timeout,
-                allow_redirects=bool(allow_redirects),
-            )
-        except Exception as e:  # requests.RequestException
-            return f"Error fetching URL '{url}': network error: {e}"
 
-        status = resp.status_code
-        final_url = resp.url
-        ctype = resp.headers.get("Content-Type", "")
-
-        # HEAD has no body
-        if method_u == "HEAD":
-            return (
-                f"HTTP {status}\n"
-                f"Final URL: {final_url}\n"
-                f"Content-Type: {ctype or 'unknown'}\n"
-                f"Note: HEAD request has no body"
-            )
-
-        if as_json:
-            try:
-                data = resp.json()
-                # Truncate JSON string representation if large
-                body_str = json.dumps(data, ensure_ascii=False)[:max_bytes]
-                if len(json.dumps(data, ensure_ascii=False)) > max_bytes:
-                    body_str += f"... [truncated]"
-                return (
-                    f"HTTP {status}\n"
-                    f"Final URL: {final_url}\n"
-                    f"Content-Type: {ctype or 'unknown'}\n"
-                    f"--- JSON Body (first {max_bytes} chars) ---\n"
-                    f"{body_str}"
-                )
-            except ValueError:
-                return (
-                    f"HTTP {status}\n"
-                    f"Final URL: {final_url}\n"
-                    f"Content-Type: {ctype or 'unknown'}\n"
-                    f"Error: Response is not valid JSON"
-                )
-
-        # Text mode
-        body = resp.text or ""
-        if len(body) > max_bytes:
-            body = body[:max_bytes] + "... [truncated]"
-
-        return (
-            f"HTTP {status}\n"
-            f"Final URL: {final_url}\n"
-            f"Content-Type: {ctype or 'unknown'}\n"
-            f"--- Body (first {max_bytes} chars) ---\n"
-            f"{body}"
-        )
-    except Exception as e:
-        return f"Error fetching URL '{url}': {str(e)}"
-
+def _looks_sensitive(text: str) -> bool:
+    import re
+    return bool(re.search(r"(?i)(api[_-]?key|secret|token|authorization)\s*[:=]\s*([^\s'\"]+)", text or ''))
 
 TOOL_IMPLEMENTATION = web_fetch
 TOOL_AUTHOR = "core"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "2.0.0"

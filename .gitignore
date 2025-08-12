@@ -59,3 +59,9 @@ Thumbs.db
 
 # Data exports
 mem0_export_*.json
+
+# Sandbox
+.sandbox/
+.sandbox/cache/
+.sandbox/sessions/
+mem0_export_*.json

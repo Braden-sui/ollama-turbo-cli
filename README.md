@@ -7,6 +7,7 @@ A production-ready CLI application for interacting with OpenAI's gpt-oss:120b mo
 - 🚀 **Ollama Turbo Integration**: Connect to gpt-oss:120b on datacenter-grade hardware
 - 🔧 **Advanced Tool Calling**: Weather, calculator, file operations, system info
 - 📡 **Streaming Responses**: Real-time response streaming with tool execution
+- 🧠 **Multi-Round Tool Chaining (Streaming)**: Iteratively call multiple tools in one turn; enabled by default
 - 💬 **Interactive Mode**: Continuous conversation with history management
 - 🛡️ **Error Handling**: Robust retry logic and graceful error recovery
 - ⚙️ **Configurable**: Environment variables and command-line options
@@ -149,6 +150,8 @@ python -m src.cli --api-key sk-your-key --message "List files in /home/user/docu
 python -m src.cli --message "Explain quantum computing" --stream
 ```
 
+In streaming mode, the assistant can perform multiple tool rounds in a single turn and then synthesize a final textual answer. By default, up to 6 tool-call rounds are allowed before finalization.
+
 ## Configuration
 
 ### Environment Variables
@@ -158,6 +161,8 @@ python -m src.cli --message "Explain quantum computing" --stream
 - `MAX_CONVERSATION_HISTORY`: Maximum messages to keep (default: 10)
 - `STREAM_BY_DEFAULT`: Enable streaming by default (default: false)
 - `LOG_LEVEL`: Logging level (default: INFO)
+ - `MULTI_ROUND_TOOLS`: Enable multi-round tool chaining (default: `true`). In non-streaming mode, the client always finalizes with a textual answer after the first tool round for compatibility.
+ - `TOOL_MAX_ROUNDS`: Maximum number of tool-call rounds in streaming mode before finalizing (default: `6`).
 
 #### Mem0 (optional)
 - `MEM0_API_KEY`: Mem0 API key (enables long-term memory)
@@ -215,6 +220,35 @@ Mem0 is integrated as the long-term memory store. It is optional and enabled whe
 - __Export/Import__: Exports to `mem0_export_*.json` including `id`, `memory`, `metadata`, `created_at`, `updated_at`. Git ignores these files by default.
 - __Resilience__: All Mem0 operations are wrapped in try/except; failures never block chat. A one-time notice is shown if Mem0 is unavailable; details are logged at DEBUG level.
  - __Filters__: Minimal filters are used for recall (`user_id` only) for list/search/export until recall is proven.
+
+## Secure Execution & Web Access
+
+- __Shell tool is disabled by default__: Commands run only inside a locked-down sandbox when enabled. Set `SHELL_TOOL_ALLOW=1` and keep an explicit `SHELL_TOOL_ALLOWLIST` (prefix match) for safe commands like `git status`, `ls`, `cat`.
+- __Confirmation prompts__: In TTY, `execute_shell` shows a one-line preview and requires confirmation unless `SHELL_TOOL_CONFIRM=0`.
+- __Sandbox guarantees__: CPU/mem/pids/disk/time limits, read-only project mount at `/project`, tmpfs workspace, no host env (only `env_vars` pass-through). Windows requires Docker Desktop/WSL2. If Docker is unavailable, execution fails closed with a clear message.
+- __Web access is allowlist-only__: The `web_fetch` tool goes through a controlled client with host allowlist and SSRF protections. HTTPS-only by default (`SANDBOX_ALLOW_HTTP=0`). Add domains to `SANDBOX_NET_ALLOW` (supports wildcards like `*.wikipedia.org`).
+- __Summarization before injection__: Tool outputs are summarized and capped (`TOOL_CONTEXT_MAX_CHARS`, default 4000). Full logs and payloads are kept under `.sandbox/sessions/` and `.sandbox/cache/` and are not shared with the model.
+- __Mem0 safety__: Outputs from `execute_shell` and sensitive `web_fetch` responses are flagged and not persisted to Mem0.
+- __Caching & rate limits__: On-host HTTP cache (TTL 10m, LRU ~200MB) accelerates repeat fetches. Per-host rate-limits prevent abuse.
+
+### Enable a one-off command safely
+1. Export envs:
+   - `SHELL_TOOL_ALLOW=1`
+   - Optional: extend `SHELL_TOOL_ALLOWLIST` with a safe prefix (e.g., `git show`)
+2. Run your prompt. When asked, confirm the preview.
+
+### Add a domain to the allowlist
+- Set `SANDBOX_NET_ALLOW` to include your domain(s), comma-separated, e.g.:
+```
+SANDBOX_NET_ALLOW=api.github.com,*.wikipedia.org,example.com
+```
+- Keep HTTPS-only unless absolutely necessary (`SANDBOX_ALLOW_HTTP=0`).
+
+### Environment knobs
+See `.env.example` for all variables, including:
+- `SHELL_TOOL_ALLOW`, `SHELL_TOOL_CONFIRM`, `SHELL_TOOL_ALLOWLIST`, `SHELL_TOOL_MAX_OUTPUT`, `SHELL_TOOL_ROOT`
+- `SANDBOX_NET`, `SANDBOX_NET_ALLOW`, `SANDBOX_ALLOW_HTTP`, `SANDBOX_BLOCK_PRIVATE_IPS`, `SANDBOX_MAX_DOWNLOAD_MB`, `SANDBOX_RATE_PER_HOST`, `SANDBOX_HTTP_CACHE_TTL_S`, `SANDBOX_HTTP_CACHE_MB`
+- `TOOL_CONTEXT_MAX_CHARS`
 
 ## Error Handling
 

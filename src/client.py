@@ -24,7 +24,7 @@ from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, fo
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200):
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -49,8 +49,10 @@ class OllamaTurboClient:
         self.max_output_tokens = max_output_tokens
         self.ctx_size = ctx_size
         self.tool_print_limit = tool_print_limit
+        self.tool_context_cap = int(os.getenv('TOOL_CONTEXT_MAX_CHARS', '4000') or '4000')
         self._last_user_message: Optional[str] = None
         self._mem0_notice_shown: bool = False
+        self._skip_mem0_after_turn: bool = False
         # Mem0 runtime flags/state (set in _init_mem0)
         self.mem0_enabled: bool = False
         self.mem0_debug: bool = False
@@ -71,6 +73,18 @@ class OllamaTurboClient:
         self._mem0_breaker_recovered_logged: bool = False
         self._last_mem_hash: Optional[str] = None
         self._mem0_search_workers = int(os.getenv('MEM0_SEARCH_WORKERS', '2') or '2')
+        # Tool-call iteration controls
+        env_mrt = os.getenv('MULTI_ROUND_TOOLS')
+        if env_mrt is not None:
+            self.multi_round_tools = env_mrt.strip().lower() in {'1', 'true', 'yes', 'on'}
+        else:
+            self.multi_round_tools = bool(multi_round_tools)
+        try:
+            default_rounds = tool_max_rounds if tool_max_rounds is not None else 6
+            parsed_rounds = int(os.getenv('TOOL_MAX_ROUNDS', str(default_rounds)) or str(default_rounds))
+            self.tool_max_rounds: int = max(1, parsed_rounds)
+        except Exception:
+            self.tool_max_rounds = max(1, tool_max_rounds if tool_max_rounds is not None else 6)
         self._mem0_search_pool: Optional[ThreadPoolExecutor] = None
         
         # Initialize Ollama client with authentication
@@ -98,10 +112,11 @@ class OllamaTurboClient:
             parsed_hist = 10
         self.max_history = max(2, min(parsed_hist, 10))
         
-        # Set up tools if enabled
+        # Set up tools if enabled (use copies to avoid global mutation leaks)
         if enable_tools:
-            self.tools = TOOL_SCHEMAS
-            self.tool_functions = TOOL_FUNCTIONS
+            # Copy lists/dicts so per-client monkeypatching doesn't affect globals/tests
+            self.tools = list(TOOL_SCHEMAS)
+            self.tool_functions = dict(TOOL_FUNCTIONS)
         else:
             self.tools = []
             self.tool_functions = {}
@@ -141,6 +156,7 @@ class OllamaTurboClient:
         """
         # Reset trace for this turn
         self.trace = [] if self.show_trace else []
+        self._skip_mem0_after_turn = False
         self._trace(f"chat:start stream={'on' if stream else 'off'}")
 
         # Inject relevant memories BEFORE user message (one system block per turn)
@@ -180,93 +196,90 @@ class OllamaTurboClient:
     def _handle_standard_chat(self) -> str:
         """Handle non-streaming chat interaction."""
         try:
-            # Make API call with tools if enabled
-            kwargs = {
-                'model': self.model,
-                'messages': self.conversation_history,
-            }
-            # Generation options
+            # Generation options (reused across rounds)
             options = {}
             if self.max_output_tokens is not None:
                 options['num_predict'] = self.max_output_tokens
             if self.ctx_size is not None:
                 options['num_ctx'] = self.ctx_size
-            if options:
-                kwargs['options'] = options
+
+            rounds = 0
+            all_tool_results: List[str] = []
+            first_content: str = ""
             
-            if self.enable_tools and self.tools:
-                kwargs['tools'] = self.tools
-            
-            self._trace("request:standard")
-            response = self.client.chat(**kwargs)
-            
-            # Extract message from response
-            message = response.get('message', {})
-            content = message.get('content', '')
-            tool_calls = message.get('tool_calls', [])
-            
-            # Process tool calls if present
-            if tool_calls and self.enable_tools:
-                # Add assistant message with tool calls
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': content,
-                    'tool_calls': tool_calls
-                })
-                names = [tc.get('function', {}).get('name') for tc in tool_calls]
-                self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
-                
-                # Execute tools
-                tool_results = self._execute_tool_calls(tool_calls)
-                self._trace(f"tools:executed {len(tool_results)}")
-                
-                # Add tool results to history
-                self.conversation_history.append({
-                    'role': 'tool',
-                    'content': '\n'.join(tool_results)
-                })
-                
-                # Reprompt model to synthesize an answer using tool details
-                self._trace("reprompt:after-tools")
-                self.conversation_history.append({
-                    'role': 'user',
-                    'content': "Please use these details to answer the user's original question."
-                })
-                
-                # Get final response after tool execution
-                self._trace("request:final-after-tools")
-                # Final response after tools with same options
-                final_kwargs = {
+            while True:
+                # Build request
+                kwargs = {
                     'model': self.model,
                     'messages': self.conversation_history,
                 }
-                # Do not include tools in the final call; force a textual answer
                 if options:
-                    final_kwargs['options'] = options
-                final_response = self.client.chat(**final_kwargs)
-                
-                final_content = final_response.get('message', {}).get('content', '')
-                
-                # Add final response to history
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': final_content
-                })
-                # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, final_content)
-                
-                # Return combined response
-                return f"{content}\n\n[Tool Results]\n" + '\n'.join(tool_results) + f"\n\n{final_content}"
-            else:
-                # No tool calls, just add response to history
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': content
-                })
-                self._trace("tools:none")
-                # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, content)
-                return content
+                    kwargs['options'] = options
+
+                # For non-streaming, always omit tools on the post-tool call to force
+                # a textual answer (test compatibility). Multi-round behavior is
+                # primarily supported in streaming mode.
+                include_tools = self.enable_tools and bool(self.tools) and (rounds == 0)
+                if include_tools:
+                    kwargs['tools'] = self.tools
+
+                self._trace(f"request:standard:round={rounds}{' tools' if include_tools else ''}")
+                response = self.client.chat(**kwargs)
+
+                # Extract message
+                message = response.get('message', {})
+                content = message.get('content', '')
+                tool_calls = message.get('tool_calls', [])
+
+                # On first round, capture any preface content
+                if rounds == 0 and content:
+                    first_content = content
+
+                if tool_calls and self.enable_tools:
+                    # Add assistant message with tool calls
+                    self.conversation_history.append({
+                        'role': 'assistant',
+                        'content': content,
+                        'tool_calls': tool_calls
+                    })
+                    names = [tc.get('function', {}).get('name') for tc in tool_calls]
+                    self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
+
+                    # Execute tools
+                    tool_results = self._execute_tool_calls(tool_calls)
+                    self._trace(f"tools:executed {len(tool_results)}")
+                    all_tool_results.extend(tool_results)
+
+                    # Add tool results to history
+                    self.conversation_history.append({
+                        'role': 'tool',
+                        'content': '\n'.join(tool_results)
+                    })
+
+                    # Reprompt model using details
+                    self._trace("reprompt:after-tools")
+                    self.conversation_history.append({
+                        'role': 'user',
+                        'content': "Please use these details to answer the user's original question."
+                    })
+
+                    rounds += 1
+                    # Continue loop for potential additional tool rounds
+                    continue
+                else:
+                    # Final textual answer
+                    self.conversation_history.append({
+                        'role': 'assistant',
+                        'content': content
+                    })
+                    self._trace("tools:none")
+                    # Persist memory to Mem0
+                    self._mem0_add_after_response(self._last_user_message, content)
+
+                    if all_tool_results:
+                        prefix = (first_content + "\n\n") if first_content else ""
+                        return f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{content}"
+                    return content
                 
         except Exception as e:
             self.logger.error(f"Standard chat error: {e}")
@@ -309,134 +322,122 @@ class OllamaTurboClient:
             raise RetryableError(f"Failed to create streaming response: {e}")
     
     def handle_streaming_response(self, response_stream, tools_enabled: bool = True) -> str:
-        """Complete streaming response handler with tool call support."""
-        full_content = ""
-        tool_calls = []
-        
-        # For cleaner UX: if tools are enabled, buffer initial stream and only print
-        # the final answer after tools (to avoid duplicate messages). If tools are
-        # disabled, stream directly to stdout.
-        if not self.quiet and not tools_enabled:
-            print("🤖 Assistant: ", end="", flush=True)
-        
+        """Complete streaming response handler with tool call support (multi-round optional)."""
+        rounds = 0
+        aggregated_results: List[str] = []
+        preface_content: str = ""
+        # Keep a buffer for fallback paths
+        full_content: str = ""
         try:
-            for chunk in response_stream:
-                message = chunk.get('message', {})
-                
-                # Handle content streaming
-                if message.get('content'):
-                    content = message['content']
-                    # Stream directly only when tools are not enabled; otherwise buffer
-                    if not tools_enabled:
-                        print(content, end="", flush=True)
-                    full_content += content
-                
-                # Collect tool calls
-                if message.get('tool_calls') and tools_enabled:
-                    for tool_call in message['tool_calls']:
-                        # Find if this tool call already exists (streaming may send in parts)
-                        existing = False
-                        for tc in tool_calls:
-                            if tc.get('id') == tool_call.get('id'):
-                                # Update existing tool call
-                                tc.update(tool_call)
-                                existing = True
-                                break
-                        if not existing:
-                            tool_calls.append(tool_call)
-            
-            if not tools_enabled:
-                print()  # New line after content
-            
-            # Process tool calls if any
-            if tool_calls:
-                if not self.show_trace and not self.quiet:
-                    print("\n🔧 Processing tool calls...")
-                names = [tc.get('function', {}).get('name') for tc in tool_calls]
-                self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
-                
-                # Add assistant message with tool calls to history
+            while True:
+                include_tools = tools_enabled and bool(self.tools) and (
+                    rounds == 0 or (self.multi_round_tools and rounds < self.tool_max_rounds)
+                )
+
+                # Use provided stream on the first round; create new ones subsequently
+                if rounds == 0:
+                    stream = response_stream
+                else:
+                    kwargs = {
+                        'model': self.model,
+                        'messages': self.conversation_history,
+                        'stream': True
+                    }
+                    # Generation options
+                    options = {}
+                    if self.max_output_tokens is not None:
+                        options['num_predict'] = self.max_output_tokens
+                    if self.ctx_size is not None:
+                        options['num_ctx'] = self.ctx_size
+                    if options:
+                        kwargs['options'] = options
+                    if include_tools:
+                        kwargs['tools'] = self.tools
+                    stream = self.client.chat(**kwargs)
+
+                self._trace(f"request:stream:round={rounds}{' tools' if include_tools else ''}")
+
+                # UX: Only print content live when we are on the final, no-tools round
+                if not self.quiet and not include_tools and rounds > 0:
+                    print("🤖 Assistant: ", end="", flush=True)
+
+                round_content = ""
+                tool_calls: List[Dict[str, Any]] = []
+
+                for chunk in stream:
+                    message = chunk.get('message', {})
+                    if message.get('content'):
+                        piece = message['content']
+                        if not include_tools and rounds > 0:
+                            print(piece, end="", flush=True)
+                        round_content += piece
+                    if message.get('tool_calls') and include_tools:
+                        for tool_call in message['tool_calls']:
+                            # Merge updates for same id
+                            existing = False
+                            for tc in tool_calls:
+                                if tc.get('id') == tool_call.get('id'):
+                                    tc.update(tool_call)
+                                    existing = True
+                                    break
+                            if not existing:
+                                tool_calls.append(tool_call)
+
+                # Update outer buffer for fallback usage
+                full_content = round_content
+
+                # Capture first round content as a preface (not printed yet)
+                if rounds == 0 and round_content:
+                    preface_content = round_content
+
+                # If tools were requested and yielded calls, execute them and loop
+                if tool_calls:
+                    if not self.show_trace and not self.quiet:
+                        print("\n🔧 Processing tool calls...")
+                    names = [tc.get('function', {}).get('name') for tc in tool_calls]
+                    self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
+
+                    # Add assistant message with tool calls
+                    self.conversation_history.append({
+                        'role': 'assistant',
+                        'content': round_content,
+                        'tool_calls': tool_calls
+                    })
+                    # Execute tools
+                    tool_results = self._execute_tool_calls(tool_calls)
+                    self._trace(f"tools:executed {len(tool_results)}")
+                    aggregated_results.extend(tool_results)
+                    # Add tool message
+                    self.conversation_history.append({
+                        'role': 'tool',
+                        'content': '\n'.join(tool_results)
+                    })
+                    # Reprompt model to synthesize an answer using tool details
+                    self._trace("reprompt:after-tools")
+                    self.conversation_history.append({
+                        'role': 'user',
+                        'content': "Please use these details to answer the user's original question."
+                    })
+                    rounds += 1
+                    # Next loop iteration may include tools again if multi-round enabled
+                    continue
+
+                # No tool calls -> final textual answer for this turn
+                if not include_tools and rounds > 0 and not self.quiet:
+                    print()  # newline after final streamed content
                 self.conversation_history.append({
                     'role': 'assistant',
-                    'content': full_content,
-                    'tool_calls': tool_calls
-                })
-                
-                # Execute tools and collect results
-                tool_results = self._execute_tool_calls(tool_calls)
-                self._trace(f"tools:executed {len(tool_results)}")
-                
-                # Add tool results to conversation
-                tool_message = {
-                    'role': 'tool',
-                    'content': '\n'.join(tool_results)
-                }
-                self.conversation_history.append(tool_message)
-                
-                # Reprompt model to synthesize an answer using tool details
-                self._trace("reprompt:after-tools")
-                self.conversation_history.append({
-                    'role': 'user',
-                    'content': "Please use these details to answer the user's original question."
-                })
-                
-                # Get final response after tool execution
-                if not self.quiet:
-                    # Print the assistant prefix only for the final visible response
-                    print("\n🤖 Assistant: ", end="", flush=True)
-                self._trace("request:final-after-tools:stream")
-                final_stream_kwargs = {
-                    'model': self.model,
-                    'messages': self.conversation_history,
-                    'stream': True
-                }
-                # Do not include tools in the final call; force a textual answer
-                final_options = {}
-                if self.max_output_tokens is not None:
-                    final_options['num_predict'] = self.max_output_tokens
-                if self.ctx_size is not None:
-                    final_options['num_ctx'] = self.ctx_size
-                if final_options:
-                    final_stream_kwargs['options'] = final_options
-                final_response_stream = self.client.chat(**final_stream_kwargs)
-                
-                final_content = ""
-                for chunk in final_response_stream:
-                    if chunk.get('message', {}).get('content'):
-                        content = chunk['message']['content']
-                        print(content, end="", flush=True)
-                        final_content += content
-                
-                print()
-                
-                # Add final response to history
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': final_content
-                })
-                # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, final_content)
-                
-                return full_content + "\n\n[Tool Results]\n" + '\n'.join(tool_results) + "\n\n" + final_content
-            
-            else:
-                # No tool calls
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': full_content
+                    'content': round_content
                 })
                 self._trace("tools:none")
-                # If tools are disabled we already streamed to stdout; if enabled, we
-                # buffered and should now print once to stdout.
-                if tools_enabled:
-                    if not self.quiet:
-                        print("🤖 Assistant: ", end="", flush=True)
-                    if full_content:
-                        print(full_content)
                 # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, full_content)
-                return full_content
-                
+                self._mem0_add_after_response(self._last_user_message, round_content)
+
+                if aggregated_results:
+                    combined = (preface_content + "\n\n" if preface_content else "") + "[Tool Results]\n" + '\n'.join(aggregated_results) + "\n\n" + round_content
+                    return combined
+                return round_content
+
         except KeyboardInterrupt:
             print("\n⚠️ Streaming interrupted by user")
             self._trace("stream:interrupted")
@@ -469,7 +470,8 @@ class OllamaTurboClient:
             List of tool execution results
         """
         tool_results = []
-        
+        injected_chunks = []
+         
         for i, tool_call in enumerate(tool_calls, 1):
             function_name = tool_call.get('function', {}).get('name')
             function_args = tool_call.get('function', {}).get('arguments', {})
@@ -487,25 +489,79 @@ class OllamaTurboClient:
             
             if function_name in self.tool_functions:
                 try:
+                    # Confirm execute_shell in TTY if required
+                    if function_name == 'execute_shell':
+                        need_confirm = (os.getenv('SHELL_TOOL_CONFIRM', '1') in {'1', 'true', 'True'}) and sys.stdin.isatty()
+                        if need_confirm:
+                            preview_args = {k: v for k, v in function_args.items() if k in ('command', 'working_dir', 'timeout')}
+                            preview = json.dumps(preview_args)
+                            print(f"   ⚠️ execute_shell preview: {preview}")
+                            ans = input("   Proceed? [y/N]: ").strip().lower()
+                            if ans not in {'y', 'yes'}:
+                                aborted = f"Execution aborted by user for execute_shell({truncate_text(preview, 120)})"
+                                tool_results.append(aborted)
+                                injected_chunks.append("execute_shell: aborted by user")
+                                self._skip_mem0_after_turn = True
+                                continue
+
                     result = self.tool_functions[function_name](**function_args)
+                    # Try parse JSON contracts from secure tools
+                    injected = None
+                    sensitive = False
+                    log_path = None
+                    try:
+                        parsed = json.loads(result)
+                        injected = parsed.get('inject') if isinstance(parsed, dict) else None
+                        sensitive = bool(parsed.get('sensitive')) if isinstance(parsed, dict) else False
+                        log_path = parsed.get('log_path') if isinstance(parsed, dict) else None
+                    except Exception:
+                        parsed = None
+
+                    # Telemetry
+                    try:
+                        if function_name in {'execute_shell', 'web_fetch'} and isinstance(parsed, dict):
+                            if function_name == 'execute_shell':
+                                self.logger.debug(f"tool:execute_shell status ok={parsed.get('ok')} exit={parsed.get('exit_code')} log={parsed.get('log_path')}")
+                            else:
+                                net = parsed.get('net') or {}
+                                self.logger.debug(f"tool:web_fetch status={net.get('status')} bytes={net.get('bytes')} cached={net.get('cached')} redirects={net.get('redirects')}")
+                    except Exception:
+                        pass
+
+                    # Determine injection chunk
+                    display = result if injected is None else injected
+                    if len(display) > self.tool_context_cap:
+                        display = truncate_text(display, self.tool_context_cap)
+                        if log_path:
+                            display += f"\n[truncated; full logs stored at {log_path} (not shared with the model)]"
+
                     tool_results.append(result)
+                    injected_chunks.append(display)
+                    if sensitive or function_name == 'execute_shell' or len(display) > self.tool_context_cap:
+                        self._skip_mem0_after_turn = True
                     if not self.show_trace and not self.quiet:
-                        print(f"      ✅ Result: {truncate_text(result, self.tool_print_limit)}")
+                        print(f"      ✅ Result: {truncate_text(display, self.tool_print_limit)}")
                     self._trace(f"tool:ok {function_name}")
                 except Exception as e:
                     error_result = f"Error executing {function_name}: {str(e)}"
                     tool_results.append(error_result)
+                    injected_chunks.append(error_result)
                     if not self.show_trace and not self.quiet:
                         print(f"      ❌ {error_result}")
                     self._trace(f"tool:error {function_name}")
             else:
                 error_result = f"Unknown tool: {function_name}"
                 tool_results.append(error_result)
+                injected_chunks.append(error_result)
                 if not self.show_trace and not self.quiet:
                     print(f"      ❌ {error_result}")
                 self._trace(f"tool:unknown {function_name}")
-        
-        return tool_results
+         
+        # Replace tool injection content with compact, capped summaries
+        if injected_chunks:
+            # Overwrite the last tool message content in caller using this list rather than tool_results
+            pass
+        return injected_chunks or tool_results
     
     def _trim_history(self):
         """Trim conversation history while preserving key system blocks.
@@ -523,9 +579,11 @@ class OllamaTurboClient:
         latest_mem_idx = None
         for i in range(len(self.conversation_history) - 1, -1, -1):
             msg = self.conversation_history[i]
-            if msg.get('role') == 'system' and isinstance(msg.get('content'), str) and msg['content'].startswith("Relevant information:"):
-                latest_mem_idx = i
-                break
+            if msg.get('role') == 'system':
+                c = msg.get('content') or ''
+                if c.startswith("Relevant information:") or c.startswith("Relevant user memories"):
+                    latest_mem_idx = i
+                    break
 
         last_N = self.conversation_history[-self.max_history:]
         new_hist: List[Dict[str, Any]] = []
@@ -756,6 +814,9 @@ class OllamaTurboClient:
     def _mem0_add_after_response(self, user_message: Optional[str], assistant_message: Optional[str]) -> None:
         """Queue the interaction to Mem0 for persistence (fire-and-forget)."""
         if not getattr(self, 'mem0_enabled', False) or not self.mem0_client:
+            return
+        if getattr(self, '_skip_mem0_after_turn', False):
+            # Skip persisting sensitive/tool outputs
             return
         if not user_message and not assistant_message:
             return

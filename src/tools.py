@@ -55,25 +55,40 @@ def get_system_info() -> str:  # type: ignore[override]
     return _plugin_fn("get_system_info")()
 
 
+# Updated to match plugin schema while accepting legacy args for compatibility
+# Plugin schema: url, method, headers, body, timeout_s, max_bytes, extract
+# Legacy shim accepted: url, method, params, headers, timeout, max_bytes, allow_redirects, as_json
+# We map: timeout -> timeout_s (if provided), ignore params/allow_redirects/as_json
+
 def web_fetch(
     url: str,
     method: str = "GET",
-    params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: float = 10,
-    max_bytes: int = 8192,
-    allow_redirects: bool = True,
-    as_json: bool = False,
+    body: Optional[str] = None,
+    timeout_s: int = 15,
+    max_bytes: Optional[int] = None,
+    extract: str = "auto",
+    # legacy-only args (ignored):
+    timeout: Optional[float] = None,
+    params: Optional[Dict[str, Any]] = None,
+    allow_redirects: Optional[bool] = None,
+    as_json: Optional[bool] = None,
 ) -> str:  # type: ignore[override]
+    # Map legacy timeout -> timeout_s if explicitly provided
+    if timeout is not None and timeout_s == 15:
+        try:
+            timeout_s = int(timeout)
+        except Exception:
+            pass
+    # params/allow_redirects/as_json are intentionally ignored in the secure proxy path
     return _plugin_fn("web_fetch")(
         url=url,
         method=method,
-        params=params,
         headers=headers,
-        timeout=timeout,
+        body=body,
+        timeout_s=timeout_s,
         max_bytes=max_bytes,
-        allow_redirects=allow_redirects,
-        as_json=as_json,
+        extract=extract,
     )
 
 
