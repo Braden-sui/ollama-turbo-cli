@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Union
 import ollama
 from ollama import Client
 
-from .tools import TOOL_SCHEMAS, TOOL_FUNCTIONS
+from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
 
 

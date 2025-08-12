@@ -11,6 +11,55 @@ A production-ready CLI application for interacting with OpenAI's gpt-oss:120b mo
 - 🛡️ **Error Handling**: Robust retry logic and graceful error recovery
 - ⚙️ **Configurable**: Environment variables and command-line options
 
+## Plugin Architecture (Dynamic Tools)
+
+Tools are now loaded dynamically via a plugin system.
+
+- Built-in plugins live in `src/plugins/` and wrap the legacy implementations in `src/tools.py` for backward compatibility.
+- Third-party plugins can be dropped into the top-level `tools/` directory without modifying core code.
+- Plugins are validated using JSON Schema and auto-registered at runtime.
+- Optional env: `OLLAMA_TOOLS_DIR` can point to additional plugin directories (supports multiple paths separated by your OS path separator).
+
+### Plugin Contract
+
+Each plugin is a Python module that must define:
+
+- `TOOL_SCHEMA`: OpenAI-style function tool schema with fields `type: "function"`, `function.name`, `function.description`, and `function.parameters` (an object schema or `true` for no-arg tools).
+- An implementation callable, provided as one of:
+  - `TOOL_IMPLEMENTATION` (callable), or
+  - a function named the same as `function.name`, or
+  - a function named `execute`.
+
+Minimal example placed at `tools/hello.py`:
+
+```python
+TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "hello",
+        "description": "Return a friendly greeting message.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "default": "world"}},
+            "required": []
+        }
+    }
+}
+
+def execute(name: str = "world") -> str:
+    return f"Hello, {name}! 👋"
+```
+
+### Backward Compatibility
+
+- Existing tools in `src/tools.py` remain as-is and are exposed via built-in plugins in `src/plugins/`.
+- The client now imports dynamic aggregates from `src/plugin_loader.py` to execute tools discovered at runtime.
+
+### Validation and Safety
+
+- Schemas and call arguments are validated using `jsonschema`. Ensure `jsonschema` is installed (see `requirements.txt`).
+- Duplicate tool names are skipped with a warning; the first loaded plugin wins.
+
 ## Quick Start
 
 ### 1. Installation
@@ -189,8 +238,11 @@ ollama-turbo-cli/
 │   ├── __init__.py         # Package initialization
 │   ├── cli.py              # Main CLI application
 │   ├── client.py           # Ollama Turbo client wrapper
-│   ├── tools.py            # Tool definitions and implementations
+│   ├── tools.py            # Legacy tool implementations (wrapped by plugins)
+│   ├── plugin_loader.py    # Dynamic plugin discovery and validation
+│   └── plugins/            # Built-in tool plugins (wrapping legacy tools)
 │   └── utils.py            # Utility functions
+├── tools/                  # Third-party plugins (auto-discovered)
 ├── requirements.txt        # Python dependencies
 ├── setup.py               # Package setup configuration
 ├── README.md              # This file
@@ -214,6 +266,9 @@ python -m src.cli --message "Show system information"
 
 # Test multiple tools
 python -m src.cli --message "Weather in London and calculate 15 * 8"
+
+# Run unit tests (includes plugin system tests)
+python -m unittest -v
 ```
 
 ### Contributing
