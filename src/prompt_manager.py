@@ -39,22 +39,24 @@ class PromptManager:
 
         parts.append(
             "Tool usage strategy:\n"
-            "- Gather all necessary information before formulating your response\n"
-            "- You may call multiple tools if needed to fully answer the question\n"
-            "- After gathering data, synthesize a complete answer\n"
-            "- Avoid redundant tool calls - use each tool at most once per request"
+            "- Gather necessary facts via tools before composing your answer\n"
+            "- Chain multiple tools only when each adds required information\n"
+            "- Synthesize a final textual answer after tools\n"
+            "- Avoid redundant or speculative tool calls"
         )
 
-        parts.append(
-            "Tool selection strategy:\n"
-            "- get_current_weather: for meteorological queries\n"
-            "- calculate_math: for any mathematical computation\n"
-            "- web_fetch: for retrieving specific URL content\n"
-            "- duckduckgo_search: for general web searches or recent info\n"
-            "- wikipedia_search: for encyclopedic information\n"
-            "- system_info: for local system details\n"
-            "- list_files: for directory exploration"
-        )
+        if self._flag("PROMPT_INCLUDE_TOOL_GUIDE", True):
+            parts.append(
+                "Tool selection guide:\n"
+                "- get_current_weather: current conditions for a specific city (no 'here'); respects unit; not for forecasts.\n"
+                "- calculate_math: pure math expressions; no units or natural language.\n"
+                "- duckduckgo_search: keyless web search for sources or quick facts; keep results small.\n"
+                "- wikipedia_search: canonical topic pages; then use web_fetch to read details.\n"
+                "- web_fetch: read a specific HTTPS URL with minimal bytes; only compact summaries are injected.\n"
+                "- execute_shell: read-only diagnostics in a sandbox; disabled by default; allowlist only.\n"
+                "- list_files: inspect a directory; prefer extension filter to reduce noise.\n"
+                "- get_system_info: environment snapshot; call only when needed."
+            )
 
         parts.append(
             "Error handling:\n"
@@ -77,6 +79,8 @@ class PromptManager:
             "- Explain what each command does before execution\n"
             "- Prefer built-in tools over shell commands when possible"
         )
+        if self._flag("PROMPT_FEWSHOTS", False):
+            parts.append(self.few_shots_block())
 
         return "\n".join(parts)
 
@@ -106,3 +110,25 @@ class PromptManager:
         items = "\n".join(bullets)
         tail = "\n\nIntegrate this context naturally into your response only where it adds value."
         return f"{prefix}\n{items}{tail}"
+
+    # ---------- Helpers & Few-shots ----------
+    def _flag(self, name: str, default: bool) -> bool:
+        v = os.getenv(name)
+        if v is None:
+            return default
+        return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+    def few_shots_block(self) -> str:
+        """Optional few-shot guide appended to the system prompt when PROMPT_FEWSHOTS is enabled."""
+        return (
+            "Examples:\n"
+            "- User: 'Weather in Tokyo and 2^10'\n"
+            "  Plan: use get_current_weather(city='Tokyo', unit=celsius) then calculate_math(expression='2^10').\n"
+            "  Answer: provide a concise sentence combining both results.\n"
+            "- User: 'Who is Ada Lovelace?'\n"
+            "  Plan: use wikipedia_search(query='Ada Lovelace') then web_fetch(url=<best result URL>) if needed.\n"
+            "  Answer: summarize key facts and cite the page briefly.\n"
+            "- User: 'Show python files in this folder'\n"
+            "  Plan: use list_files(directory='.', extension='.py').\n"
+            "  Answer: present a short list of filenames."
+        )

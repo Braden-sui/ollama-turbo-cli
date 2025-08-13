@@ -5,8 +5,10 @@ from typing import Optional
 
 
 def _repo_root() -> Path:
-    # src/utils/ -> repo root is parent of src/
-    return Path(__file__).resolve().parents[2]
+    """Return repository root directory.
+    This file lives in `src/`, so the repo root is the parent of `src/`.
+    """
+    return Path(__file__).resolve().parents[1]
 
 
 def get_scratch_host_dir() -> Path:

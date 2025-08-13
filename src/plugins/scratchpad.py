@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 
 from ..sandbox.runner import run_in_sandbox
-from ..utils.scratchpad import get_scratch_host_dir, sanitize_filename, get_scratch_file_path
+from ..utils_scratchpad import get_scratch_host_dir, sanitize_filename, get_scratch_file_path
 
 TOOL_SCHEMA = {
     "type": "function",
