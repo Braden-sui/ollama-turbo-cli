@@ -80,12 +80,14 @@ def duckduckgo_search(query: str, max_results: int = 3) -> str:
             else:
                 break
 
+        data = None
         if resp is not None and resp.status_code == 200:
             try:
                 data = resp.json()
             except json.JSONDecodeError:
-                return "Error performing DuckDuckGo search: invalid JSON response"
-        else:
+                data = None  # trigger HTML fallback below
+
+        if data is None:
             # Fallback to HTML (Lite) endpoint and extract links
             html_headers = {
                 "User-Agent": "ollama-turbo-cli/1.0 (+https://ollama.com)",

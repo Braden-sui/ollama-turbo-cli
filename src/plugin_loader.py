@@ -154,15 +154,68 @@ class PluginManager:
 
     def _wrap_with_arg_validation(self, name: str, schema: Dict[str, Any], func: Callable[..., str]) -> Callable[..., str]:
         params_schema = schema.get("function", {}).get("parameters")
+        logger = self._logger
+
+        def _apply_aliases(raw_kwargs: Dict[str, Any], param_names: set) -> Dict[str, Any]:
+            """Map common alias argument names to canonical ones expected by functions.
+            This helps tolerate upstream planners that use different names.
+            Currently supported:
+            - top_n -> max_results | limit (if available)
+            - timeout -> timeout_s (if available)
+            - recency_days -> ignored
+            - loc -> ignored (selection index from search results)
+            - search -> ignored (planner hint not used by most tools)
+            """
+            out = dict(raw_kwargs)
+            # top_n alias
+            if "top_n" in out and "top_n" not in param_names:
+                if "max_results" in param_names and "max_results" not in out:
+                    out["max_results"] = out.get("top_n")
+                elif "limit" in param_names and "limit" not in out:
+                    out["limit"] = out.get("top_n")
+                out.pop("top_n", None)
+            # timeout alias
+            if "timeout" in out and "timeout" not in param_names and "timeout_s" in param_names and "timeout_s" not in out:
+                out["timeout_s"] = out.get("timeout")
+                out.pop("timeout", None)
+            # benign drops
+            if "recency_days" in out and "recency_days" not in param_names:
+                out.pop("recency_days", None)
+            if "loc" in out and "loc" not in param_names:
+                out.pop("loc", None)
+            if "search" in out and "search" not in param_names:
+                out.pop("search", None)
+            return out
 
         def wrapper(**kwargs: Any) -> str:
-            # Validate args if schema is provided
-            if params_schema and jsonschema_validate is not None:
-                try:
-                    jsonschema_validate(instance=kwargs, schema=params_schema)  # type: ignore[arg-type]
-                except Exception as e:
-                    raise ValueError(f"Arguments for {name} failed schema validation: {e}")
-            return func(**kwargs)
+            # Filter to the function's signature unless it accepts **kwargs; also apply aliases
+            try:
+                sig = inspect.signature(func)
+                params = sig.parameters
+                accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                if accepts_var_kw:
+                    # Apply aliases but keep everything; function will accept **kwargs
+                    filtered = _apply_aliases(kwargs, set(params.keys()))
+                else:
+                    # Apply aliases first, then strictly filter to function's accepted param names
+                    param_names = {n for n, p in params.items() if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)}
+                    aliased = _apply_aliases(kwargs, set(param_names))
+                    filtered = {k: v for k, v in aliased.items() if k in param_names}
+                    dropped = [k for k in kwargs.keys() if k not in param_names]
+                    if dropped:
+                        logger.debug(f"Tool '{name}': dropping unexpected arguments: {dropped}")
+
+                # Validate filtered args if schema is provided (post-alias)
+                if params_schema and jsonschema_validate is not None:
+                    try:
+                        jsonschema_validate(instance=filtered, schema=params_schema)  # type: ignore[arg-type]
+                    except Exception as e:
+                        raise ValueError(f"Arguments for {name} failed schema validation: {e}")
+
+                return func(**filtered)
+            except TypeError as te:
+                logger.error(f"Tool '{name}' invocation failed with TypeError: {te}")
+                raise
 
         # Preserve nicer debug names
         wrapper.__name__ = f"plugin_{name}"
