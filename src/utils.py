@@ -6,6 +6,8 @@ import logging
 import re
 import sys
 from typing import Optional
+import os
+import random
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -99,23 +101,77 @@ from typing import Any, Callable
 
 
 def with_retry(max_retries: int = 3, backoff_factor: float = 2.0):
-    """Decorator for retry logic with exponential backoff."""
+    """Decorator for retry logic with exponential backoff and jitter, env-controlled.
+
+    Env vars:
+    - CLI_RETRY_ENABLED: true/false (default: true)
+    - CLI_MAX_RETRIES: int (default: max_retries)
+    - CLI_RETRY_BACKOFF_BASE: float (default: backoff_factor)
+    - CLI_RETRY_JITTER_MAX: float seconds (default: 0.4)
+    - CLI_RETRYABLE_STATUS_CODES: comma list (default: 502,503,504,408)
+    """
+    def _is_retryable_http_error(exc: Exception) -> bool:
+        # Check for HTTP status codes on exceptions from HTTP libs (e.g., httpx)
+        try:
+            raw_codes = os.getenv('CLI_RETRYABLE_STATUS_CODES', '502,503,504,408')
+            codes = {int(x.strip()) for x in raw_codes.split(',') if x.strip().isdigit()}
+        except Exception:
+            codes = {502, 503, 504, 408}
+
+        # Prefer response.status_code if present
+        resp = getattr(exc, 'response', None)
+        if resp is not None:
+            status = getattr(resp, 'status_code', None)
+            if isinstance(status, int) and status in codes:
+                return True
+
+        # Some exceptions may carry a direct status_code attribute
+        status_attr = getattr(exc, 'status_code', None)
+        if isinstance(status_attr, int) and status_attr in codes:
+            return True
+        return False
+
     def decorator(func: Callable) -> Callable:
         def wrapper(*args, **kwargs) -> Any:
-            last_exception = None
-            for attempt in range(max_retries):
+            # Resolve env-controlled switches and tuning
+            retry_enabled = os.getenv('CLI_RETRY_ENABLED', 'true').strip().lower() != 'false'
+            try:
+                effective_retries = max(1, int(os.getenv('CLI_MAX_RETRIES', str(max_retries)) or str(max_retries)))
+            except Exception:
+                effective_retries = max_retries
+            try:
+                base = float(os.getenv('CLI_RETRY_BACKOFF_BASE', str(backoff_factor)) or str(backoff_factor))
+            except Exception:
+                base = backoff_factor
+            try:
+                jitter_max = max(0.0, float(os.getenv('CLI_RETRY_JITTER_MAX', '0.4') or '0.4'))
+            except Exception:
+                jitter_max = 0.4
+
+            last_exception: Optional[Exception] = None
+            for attempt in range(effective_retries):
                 try:
                     return func(*args, **kwargs)
                 except (ConnectionError, TimeoutError, RetryableError) as e:
                     last_exception = e
-                    if attempt == max_retries - 1:
+                    if not retry_enabled or attempt == effective_retries - 1:
                         raise e
-                    wait_time = backoff_factor ** attempt
-                    logging.debug(f"Retry attempt {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                    wait_time = base ** attempt + (random.uniform(0, jitter_max) if jitter_max > 0 else 0)
+                    logging.debug(f"Retry attempt {attempt + 1}/{effective_retries} after {wait_time:.2f}s: {e}")
                     time.sleep(wait_time)
                 except Exception as e:
+                    # Retry HTTP 5xx/408 if detectable from exception
+                    if _is_retryable_http_error(e) and retry_enabled and attempt < effective_retries - 1:
+                        last_exception = e
+                        wait_time = base ** attempt + (random.uniform(0, jitter_max) if jitter_max > 0 else 0)
+                        logging.debug(f"Retry attempt {attempt + 1}/{effective_retries} (HTTP) after {wait_time:.2f}s: {e}")
+                        time.sleep(wait_time)
+                        continue
                     # Non-retryable errors
                     raise e
-            raise last_exception
+            if last_exception is not None:
+                raise last_exception
+            # Should not reach here
+            return func(*args, **kwargs)
         return wrapper
     return decorator

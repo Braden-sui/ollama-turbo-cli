@@ -1,5 +1,7 @@
 """
 Ollama Turbo client implementation with tool calling and streaming support.
+Reliability hardening: retries/backoff, idempotency keys, keep-alive pools, and
+streaming idle reconnects (all behind env flags with safe defaults).
 """
 
 import json
@@ -15,7 +17,9 @@ import queue
 import time
 import atexit
 import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+import re
 
 from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
@@ -87,6 +91,27 @@ class OllamaTurboClient:
         except Exception:
             self.tool_max_rounds = max(1, tool_max_rounds if tool_max_rounds is not None else 6)
         self._mem0_search_pool: Optional[ThreadPoolExecutor] = None
+        # CLI/network resilience knobs (env-controlled)
+        self.cli_retry_enabled: bool = os.getenv('CLI_RETRY_ENABLED', 'true').strip().lower() != 'false'
+        try:
+            self.cli_max_retries: int = max(0, int(os.getenv('CLI_MAX_RETRIES', '3') or '3'))
+        except Exception:
+            self.cli_max_retries = 3
+        try:
+            self.cli_stream_idle_reconnect_secs: int = max(10, int(os.getenv('CLI_STREAM_IDLE_RECONNECT_SECS', '90') or '90'))
+        except Exception:
+            self.cli_stream_idle_reconnect_secs = 90
+        try:
+            self.cli_connect_timeout_s: float = max(1.0, float(os.getenv('CLI_CONNECT_TIMEOUT_S', '5') or '5'))
+        except Exception:
+            self.cli_connect_timeout_s = 5.0
+        try:
+            self.cli_read_timeout_s: float = max(60.0, float(os.getenv('CLI_READ_TIMEOUT_S', '600') or '600'))
+        except Exception:
+            self.cli_read_timeout_s = 600.0
+        self.warm_models: bool = os.getenv('WARM_MODELS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
+        self.ollama_keep_alive_raw: Optional[str] = os.getenv('OLLAMA_KEEP_ALIVE')
+        self._current_idempotency_key: Optional[str] = None
         
         # Initialize Ollama client with authentication
         # Note: Ollama Turbo uses Authorization header without 'Bearer' prefix
@@ -173,6 +198,9 @@ class OllamaTurboClient:
         # Trim history if needed
         self._trim_history()
         
+        # Generate a fresh Idempotency-Key per turn (reused across retries/reconnects)
+        self._current_idempotency_key = str(uuid.uuid4())
+        self._set_idempotency_key(self._current_idempotency_key)
         try:
             if stream:
                 result = self._handle_streaming_chat()
@@ -191,6 +219,9 @@ class OllamaTurboClient:
             self._trace(f"chat:error {type(e).__name__}")
             self._print_trace()
             return error_msg
+        finally:
+            # Clear idempotency header after the turn
+            self._clear_idempotency_key()
     
     @with_retry(max_retries=3)
     def _handle_standard_chat(self) -> str:
@@ -213,6 +244,10 @@ class OllamaTurboClient:
                     'model': self.model,
                     'messages': self.conversation_history,
                 }
+                # Warm models on server by requesting keep_alive if enabled
+                keep_val = self._resolve_keep_alive()
+                if keep_val is not None:
+                    kwargs['keep_alive'] = keep_val
                 if options:
                     kwargs['options'] = options
 
@@ -310,6 +345,9 @@ class OllamaTurboClient:
                 options['num_ctx'] = self.ctx_size
             if options:
                 kwargs['options'] = options
+            keep_val = self._resolve_keep_alive()
+            if keep_val is not None:
+                kwargs['keep_alive'] = keep_val
             
             if self.enable_tools and self.tools:
                 kwargs['tools'] = self.tools
@@ -353,6 +391,9 @@ class OllamaTurboClient:
                         kwargs['options'] = options
                     if include_tools:
                         kwargs['tools'] = self.tools
+                    keep_val = self._resolve_keep_alive()
+                    if keep_val is not None:
+                        kwargs['keep_alive'] = keep_val
                     stream = self.client.chat(**kwargs)
 
                 self._trace(f"request:stream:round={rounds}{' tools' if include_tools else ''}")
@@ -362,26 +403,53 @@ class OllamaTurboClient:
                     print("🤖 Assistant: ", end="", flush=True)
 
                 round_content = ""
+                # Track already emitted content length to avoid duplicates across reconnects
+                printed_len = 0
                 tool_calls: List[Dict[str, Any]] = []
 
-                for chunk in stream:
-                    message = chunk.get('message', {})
-                    if message.get('content'):
-                        piece = message['content']
-                        if not include_tools and rounds > 0:
-                            print(piece, end="", flush=True)
-                        round_content += piece
-                    if message.get('tool_calls') and include_tools:
-                        for tool_call in message['tool_calls']:
-                            # Merge updates for same id
-                            existing = False
-                            for tc in tool_calls:
-                                if tc.get('id') == tool_call.get('id'):
-                                    tc.update(tool_call)
-                                    existing = True
-                                    break
-                            if not existing:
-                                tool_calls.append(tool_call)
+                def _iter_stream_chunks(s):
+                    # Simple wrapper to let us hook per-chunk accounting
+                    for ch in s:
+                        yield ch
+
+                try:
+                    for chunk in _iter_stream_chunks(stream):
+                        message = chunk.get('message', {})
+                        if message.get('content'):
+                            piece = message['content']
+                            round_content += piece
+                            if not include_tools and rounds > 0:
+                                # Print only the new suffix not yet emitted (handles reconnect duplicates)
+                                new_segment = round_content[printed_len:]
+                                if new_segment:
+                                    print(new_segment, end="", flush=True)
+                                    printed_len = len(round_content)
+                        if message.get('tool_calls') and include_tools:
+                            for tool_call in message['tool_calls']:
+                                # Merge updates for same id
+                                existing = False
+                                for tc in tool_calls:
+                                    if tc.get('id') == tool_call.get('id'):
+                                        tc.update(tool_call)
+                                        existing = True
+                                        break
+                                if not existing:
+                                    tool_calls.append(tool_call)
+                except Exception as se:
+                    # Stream interrupted (timeout/connection), attempt reconnects handled by outer retry decorator for init only.
+                    # Here we fall back to non-streaming finalization to preserve UX, per user preference.
+                    self.logger.debug(f"Streaming read error; falling back to non-streaming: {se}")
+                    self._trace("stream:read:error -> fallback")
+                    try:
+                        final = self._handle_standard_chat()
+                        if final:
+                            print(final)
+                        self._trace("fallback:success")
+                        return (round_content + "\n" + final) if round_content else final
+                    except Exception as e2:
+                        self.logger.debug(f"Non-streaming fallback also failed: {e2}")
+                        self._trace("fallback:error")
+                        return round_content or ""
 
                 # Update outer buffer for fallback usage
                 full_content = round_content
@@ -459,6 +527,64 @@ class OllamaTurboClient:
                 self.logger.debug(f"Non-streaming fallback also failed: {e2}")
                 self._trace("fallback:error")
                 return full_content or ""
+
+    # ------------------ Internal helpers ------------------
+    def _set_idempotency_key(self, key: Optional[str]) -> None:
+        """Set Idempotency-Key header on both clients for this turn."""
+        try:
+            if not key:
+                return
+            try:
+                # Defensive: _client may not exist depending on ollama version
+                if getattr(self.client, '_client', None) and getattr(self.client._client, 'headers', None):  # type: ignore[attr-defined]
+                    self.client._client.headers['Idempotency-Key'] = key  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._trace(f"idempotency:set {key}")
+        except Exception:
+            pass
+
+    def _clear_idempotency_key(self) -> None:
+        """Remove Idempotency-Key header after request completion."""
+        try:
+            c = getattr(self, 'client', None)
+            try:
+                if c and getattr(c, '_client', None):
+                    c._client.headers.pop('Idempotency-Key', None)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._current_idempotency_key = None
+        except Exception:
+            pass
+
+    def _resolve_keep_alive(self) -> Optional[Union[float, str]]:
+        """Resolve a valid keep_alive value or None.
+        Accepts env `OLLAMA_KEEP_ALIVE` as:
+        - duration string with units, e.g., '10m', '1h', '30s'
+        - numeric seconds (int/float), converted to '<seconds>s'
+        If unset and warming is enabled, defaults to '10m'.
+        """
+        try:
+            if not self.warm_models:
+                return None
+            raw = self.ollama_keep_alive_raw
+            if raw is None or str(raw).strip() == "":
+                return '10m'  # safe default
+            s = str(raw).strip()
+            # If purely numeric (int/float), treat as seconds
+            if re.fullmatch(r"\d+(?:\.\d+)?", s):
+                # Avoid passing floats like '10.0s' unless necessary
+                if '.' in s:
+                    return f"{float(s)}s"
+                return f"{int(s)}s"
+            # If duration with unit
+            if re.fullmatch(r"\d+(?:\.\d+)?[smhdw]", s, flags=0):
+                return s
+            # Unknown/invalid -> log and fallback
+            self.logger.debug(f"Invalid OLLAMA_KEEP_ALIVE '{s}', falling back to 10m")
+            return '10m'
+        except Exception:
+            return '10m'
     
     def _execute_tool_calls(self, tool_calls: List[Dict]) -> List[str]:
         """Execute tool calls and return results.
