@@ -5,6 +5,3 @@ python-dotenv>=1.0.0
 jsonschema>=4.21.1
 mem0ai>=0.1.115
 beautifulsoup4>=4.12.2
-pydantic>=2,<3
-pydantic-settings>=2,<3
-python-dotenv>=1
