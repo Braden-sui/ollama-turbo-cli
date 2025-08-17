@@ -266,15 +266,22 @@ class OllamaTurboClient:
                 content = message.get('content', '')
                 tool_calls = message.get('tool_calls', [])
 
+                # Harmony adapter: if provider didn't canonicalize tool calls, parse from content
+                if self.enable_tools and not tool_calls and content:
+                    cleaned, parsed_calls, final_seg = self._parse_harmony_tokens(content)
+                    if parsed_calls:
+                        tool_calls = parsed_calls
+                        content = cleaned  # remove tool-call markup from assistant content
+
                 # On first round, capture any preface content
                 if rounds == 0 and content:
-                    first_content = content
+                    first_content = self._strip_harmony_markup(content)
 
                 if tool_calls and self.enable_tools:
                     # Add assistant message with tool calls
                     self.conversation_history.append({
                         'role': 'assistant',
-                        'content': content,
+                        'content': self._strip_harmony_markup(content),
                         'tool_calls': tool_calls
                     })
                     names = [tc.get('function', {}).get('name') for tc in tool_calls]
@@ -302,19 +309,29 @@ class OllamaTurboClient:
                     # Continue loop for potential additional tool rounds
                     continue
                 else:
-                    # Final textual answer
+                    # Final textual answer (extract Harmony final channel if present; strip markup)
+                    final_out = content
+                    try:
+                        if content:
+                            cleaned, _, final_seg = self._parse_harmony_tokens(content)
+                            final_out = final_seg or cleaned
+                            if not final_out:
+                                final_out = self._strip_harmony_markup(content)
+                    except Exception:
+                        final_out = self._strip_harmony_markup(content)
+
                     self.conversation_history.append({
                         'role': 'assistant',
-                        'content': content
+                        'content': final_out
                     })
                     self._trace("tools:none")
                     # Persist memory to Mem0
-                    self._mem0_add_after_response(self._last_user_message, content)
+                    self._mem0_add_after_response(self._last_user_message, final_out)
 
                     if all_tool_results:
                         prefix = (first_content + "\n\n") if first_content else ""
-                        return f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{content}"
-                    return content
+                        return f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{final_out}"
+                    return final_out
                 
         except Exception as e:
             self.logger.error(f"Standard chat error: {e}")
@@ -422,7 +439,9 @@ class OllamaTurboClient:
                                 # Print only the new suffix not yet emitted (handles reconnect duplicates)
                                 new_segment = round_content[printed_len:]
                                 if new_segment:
-                                    print(new_segment, end="", flush=True)
+                                    safe_segment = self._strip_harmony_markup(new_segment)
+                                    if safe_segment:
+                                        print(safe_segment, end="", flush=True)
                                     printed_len = len(round_content)
                         if message.get('tool_calls') and include_tools:
                             for tool_call in message['tool_calls']:
@@ -456,9 +475,19 @@ class OllamaTurboClient:
 
                 # Capture first round content as a preface (not printed yet)
                 if rounds == 0 and round_content:
-                    preface_content = round_content
+                    preface_content = self._strip_harmony_markup(round_content)
 
                 # If tools were requested and yielded calls, execute them and loop
+                # If no canonical tool_calls but Harmony markup is present, parse it
+                if not tool_calls and include_tools and round_content:
+                    try:
+                        cleaned, parsed_calls, _ = self._parse_harmony_tokens(round_content)
+                        if parsed_calls:
+                            tool_calls = parsed_calls
+                            round_content = cleaned
+                    except Exception:
+                        pass
+
                 if tool_calls:
                     if not self.show_trace and not self.quiet:
                         print("\n🔧 Processing tool calls...")
@@ -468,7 +497,7 @@ class OllamaTurboClient:
                     # Add assistant message with tool calls
                     self.conversation_history.append({
                         'role': 'assistant',
-                        'content': round_content,
+                        'content': self._strip_harmony_markup(round_content),
                         'tool_calls': tool_calls
                     })
                     # Execute tools
@@ -493,18 +522,29 @@ class OllamaTurboClient:
                 # No tool calls -> final textual answer for this turn
                 if not include_tools and rounds > 0 and not self.quiet:
                     print()  # newline after final streamed content
+                # Extract final-channel text if present; otherwise strip markup
+                final_out = round_content
+                try:
+                    if round_content:
+                        cleaned, _, final_seg = self._parse_harmony_tokens(round_content)
+                        final_out = final_seg or cleaned
+                        if not final_out:
+                            final_out = self._strip_harmony_markup(round_content)
+                except Exception:
+                    final_out = self._strip_harmony_markup(round_content)
+
                 self.conversation_history.append({
                     'role': 'assistant',
-                    'content': round_content
+                    'content': final_out
                 })
                 self._trace("tools:none")
                 # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, round_content)
+                self._mem0_add_after_response(self._last_user_message, final_out)
 
                 if aggregated_results:
-                    combined = (preface_content + "\n\n" if preface_content else "") + "[Tool Results]\n" + '\n'.join(aggregated_results) + "\n\n" + round_content
+                    combined = (preface_content + "\n\n" if preface_content else "") + "[Tool Results]\n" + '\n'.join(aggregated_results) + "\n\n" + final_out
                     return combined
-                return round_content
+                return final_out
 
         except KeyboardInterrupt:
             print("\n⚠️ Streaming interrupted by user")
@@ -527,6 +567,77 @@ class OllamaTurboClient:
                 self.logger.debug(f"Non-streaming fallback also failed: {e2}")
                 self._trace("fallback:error")
                 return full_content or ""
+
+    # ------------------ Harmony parsing helpers ------------------
+    def _strip_harmony_markup(self, text: str) -> str:
+        """Remove Harmony channel/control tokens from text, preserving natural content.
+
+        This strips tokens like <|channel|>commentary, <|channel|>final, <|message|>, <|call|>, <|end|>.
+        """
+        try:
+            if not text:
+                return text
+            # Remove channel headers (commentary/final) and inline markers
+            t = re.sub(r"<\|channel\|>\s*commentary[^\n<]*", "", text, flags=re.IGNORECASE)
+            t = re.sub(r"<\|channel\|>\s*final[^\n<]*", "", t, flags=re.IGNORECASE)
+            t = re.sub(r"<\|message\|>", "", t, flags=re.IGNORECASE)
+            t = re.sub(r"<\|call\|>", "", t, flags=re.IGNORECASE)
+            t = re.sub(r"<\|end\|>", "", t, flags=re.IGNORECASE)
+            return t
+        except Exception:
+            return text
+
+    def _parse_harmony_tokens(self, text: str):
+        """Parse Harmony tool-call and final-channel tokens from text.
+
+        Returns (cleaned_text, tool_calls, final_text)
+        - cleaned_text: input with tool-call segments removed and markup stripped
+        - tool_calls: list of OpenAI-style tool_call dicts
+        - final_text: last final-channel message content if present
+        """
+        tool_calls: List[Dict[str, Any]] = []
+        final_text: Optional[str] = None
+        if not text:
+            return text, tool_calls, final_text
+
+        # Match commentary tool calls like:
+        # <|channel|>commentary to=functions.web_fetch ... <|message|>{json}<|call|>
+        tc_re = re.compile(
+            r"<\|channel\|>\s*commentary\b.*?to=functions\.([a-zA-Z0-9_]+).*?<\|message\|>(?P<json>\{.*?\})\s*<\|call\|>",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def _tc_repl(m: re.Match) -> str:
+            name = m.group(1)
+            arg_text = m.group('json') if 'json' in m.groupdict() else '{}'
+            args: Dict[str, Any]
+            try:
+                args = json.loads(arg_text)
+                if not isinstance(args, dict):
+                    args = {}
+            except Exception:
+                args = {}
+            tool_calls.append({
+                'type': 'function',
+                'id': f"call_h_{len(tool_calls)+1}",
+                'function': {
+                    'name': name,
+                    'arguments': args,
+                }
+            })
+            return ""  # remove this segment from cleaned text
+
+        cleaned = tc_re.sub(_tc_repl, text)
+
+        # Extract final channel content (use the last occurrence if multiple)
+        final_re = re.compile(r"<\|channel\|>\s*final\b.*?<\|message\|>(?P<msg>.*?)(?:<\|end\|>|$)", re.IGNORECASE | re.DOTALL)
+        for m in final_re.finditer(cleaned):
+            final_text = m.group('msg')
+
+        # Remove any remaining markup tokens
+        cleaned = self._strip_harmony_markup(cleaned)
+
+        return cleaned, tool_calls, final_text
 
     # ------------------ Internal helpers ------------------
     def _set_idempotency_key(self, key: Optional[str]) -> None:
@@ -788,6 +899,10 @@ class OllamaTurboClient:
             self._mem0_breaker_cooldown_ms = int(os.getenv('MEM0_BREAKER_COOLDOWN_MS', '60000') or '60000')
             self._mem0_shutdown_flush_ms = int(os.getenv('MEM0_SHUTDOWN_FLUSH_MS', '3000') or '3000')
 
+            # API version preference and capability flags
+            self._mem0_api_version_pref = (os.getenv('MEM0_VERSION', 'v2') or 'v2').strip() or 'v2'
+            self._mem0_supports_version_kw = True
+
             org_id = os.getenv('MEM0_ORG_ID')
             project_id = os.getenv('MEM0_PROJECT_ID')
             if org_id or project_id:
@@ -849,12 +964,7 @@ class OllamaTurboClient:
             # Minimal filter: just user_id
             filters = {"user_id": getattr(self, 'mem0_user_id', 'Braden')}
             def _do_search():
-                return self.mem0_client.search(
-                    user_message,
-                    version="v2",
-                    filters=filters,
-                    limit=self.mem0_max_hits  # server-side limit to shrink payload
-                )
+                return self._mem0_search_api(user_message, filters=filters, limit=self.mem0_max_hits)
 
             try:
                 if self._mem0_search_pool:
@@ -862,7 +972,7 @@ class OllamaTurboClient:
                     related = fut.result(timeout=max(0.05, self.mem0_search_timeout_ms / 1000.0))
                 else:
                     # very unlikely fallback
-                    related = self.mem0_client.search(user_message, version="v2", filters=filters, limit=self.mem0_max_hits)
+                    related = self._mem0_search_api(user_message, filters=filters, limit=self.mem0_max_hits)
             except FuturesTimeout:
                 # Treat timeout like a failure for breaker accounting
                 self._trace("mem0:search:timeout")
@@ -1036,23 +1146,30 @@ class OllamaTurboClient:
         user_id = getattr(self, 'mem0_user_id', 'Braden')
 
         # First attempt: full-feature call
-        kwargs = {"messages": messages, "user_id": user_id, "version": "v2", "metadata": metadata}
+        kwargs = {"messages": messages, "user_id": user_id, "version": getattr(self, '_mem0_api_version_pref', 'v2'), "metadata": metadata}
         if getattr(self, 'mem0_agent_id', None):
             kwargs["agent_id"] = self.mem0_agent_id
         try:
             res = self.mem0_client.add(**kwargs)
         except TypeError:
-            # Second attempt: drop agent_id, keep version/metadata
+            # Second attempt: drop version, keep agent_id/metadata (older SDKs may not accept 'version')
             try:
-                kwargs.pop("agent_id", None)
-                res = self.mem0_client.add(**kwargs)
+                kwargs_no_ver = dict(kwargs)
+                kwargs_no_ver.pop("version", None)
+                res = self.mem0_client.add(**kwargs_no_ver)
             except TypeError:
-                # Third attempt: minimal signature (no version/metadata); enforce metadata later via update()
-                kwargs_min = {"messages": messages, "user_id": user_id}
+                # Third attempt: drop agent_id, keep version/metadata
                 try:
-                    res = self.mem0_client.add(**kwargs_min)
-                except Exception as e:
-                    raise e
+                    kwargs_no_agent = dict(kwargs)
+                    kwargs_no_agent.pop("agent_id", None)
+                    res = self.mem0_client.add(**kwargs_no_agent)
+                except TypeError:
+                    # Fourth attempt: minimal signature (no version/metadata); enforce metadata later via update()
+                    kwargs_min = {"messages": messages, "user_id": user_id}
+                    try:
+                        res = self.mem0_client.add(**kwargs_min)
+                    except Exception as e:
+                        raise e
 
         # Extract IDs (best-effort)
         ids: List[str] = []
@@ -1089,15 +1206,60 @@ class OllamaTurboClient:
                     except TypeError:
                         # Fallback to text/data param-less update with metadata if supported
                         self.mem0_client.update(memory_id=mid, **{"metadata": metadata})
+
+                    # Ensure agent_id is set as a first-class field when supported
+                    if getattr(self, 'mem0_agent_id', None):
+                        try:
+                            self.mem0_client.update(memory_id=mid, agent_id=self.mem0_agent_id)
+                        except TypeError:
+                            # Older SDKs may not allow setting agent_id via update; ignore
+                            pass
+                    # Ensure app_id is set as a first-class field when supported
+                    if getattr(self, 'mem0_app_id', None):
+                        try:
+                            self.mem0_client.update(memory_id=mid, app_id=self.mem0_app_id)
+                        except TypeError:
+                            pass
+
                     ok = True
                     if self.mem0_debug:
                         dt_ms = int((time.time() - start_meta) * 1000)
-                        self.logger.debug(f"[mem0] update(meta) dt={dt_ms}ms id={mid}")
+                        self.logger.debug(f"[mem0] update(meta+agent) dt={dt_ms}ms id={mid}")
                     break
                 except Exception:
                     time.sleep(delay)
             if not ok:
                 self.logger.warning(f"Mem0 metadata enforcement failed for id={mid}")
+
+    def _mem0_search_api(self, query: str, filters: Optional[Dict[str, Any]] = None, limit: Optional[int] = None):
+        """Search wrapper that prefers v2 and falls back if the SDK doesn't accept the 'version' kwarg."""
+        if not self.mem0_client:
+            return []
+        try:
+            if getattr(self, '_mem0_supports_version_kw', True):
+                try:
+                    return self.mem0_client.search(query, version=self._mem0_api_version_pref, filters=filters, limit=limit)
+                except TypeError:
+                    # Older SDK without 'version' kwarg; cache and retry without it
+                    self._mem0_supports_version_kw = False
+            # Fallback path (no version kwarg)
+            return self.mem0_client.search(query, filters=filters, limit=limit)
+        except Exception:
+            raise
+
+    def _mem0_get_all_api(self, filters: Optional[Dict[str, Any]] = None):
+        """get_all wrapper that prefers v2 and falls back if the SDK doesn't accept the 'version' kwarg."""
+        if not self.mem0_client:
+            return []
+        try:
+            if getattr(self, '_mem0_supports_version_kw', True):
+                try:
+                    return self.mem0_client.get_all(filters=filters, version=self._mem0_api_version_pref)
+                except TypeError:
+                    self._mem0_supports_version_kw = False
+            return self.mem0_client.get_all(filters=filters)
+        except Exception:
+            raise
 
     def _normalize_fact(self, text: str) -> str:
         t = ' '.join(text.strip().split())
@@ -1120,7 +1282,7 @@ class OllamaTurboClient:
                 # Optional inline query to filter display
                 query = ' '.join(parts[2:]).strip() if len(parts) > 2 else ''
                 filters = {"user_id": self.mem0_user_id}
-                items = self.mem0_client.get_all(filters=filters, version="v2")
+                items = self._mem0_get_all_api(filters=filters)
                 if not items:
                     print("📭 No memories found.")
                     return
@@ -1140,7 +1302,7 @@ class OllamaTurboClient:
                     print("Usage: /mem search <query>")
                     return
                 filters = {"user_id": self.mem0_user_id}
-                results = self.mem0_client.search(query, version="v2", filters=filters)
+                results = self._mem0_search_api(query, filters=filters)
                 if not results:
                     print("🔍 No matching memories.")
                     return
@@ -1153,7 +1315,7 @@ class OllamaTurboClient:
                 if not text:
                     print("Usage: /mem add <text>")
                     return
-                self.mem0_client.add([{"role": "user", "content": text}], user_id=self.mem0_user_id, version="v2", metadata={"source": "cli", "category": "manual"})
+                self._mem0_execute_add([{"role": "user", "content": text}], {"source": "cli", "category": "manual"})
                 print("✅ Memory added.")
             elif sub == 'get':
                 mem_id = (parts[2] if len(parts) > 2 else '').strip()
@@ -1199,7 +1361,7 @@ class OllamaTurboClient:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     out_path = f"mem0_export_{ts}.json"
                 filters = {"user_id": self.mem0_user_id}
-                items = self.mem0_client.get_all(filters=filters, version="v2")
+                items = self._mem0_get_all_api(filters=filters)
                 payload = []
                 for it in items or []:
                     payload.append({
@@ -1234,7 +1396,7 @@ class OllamaTurboClient:
                     if getattr(self, 'mem0_agent_id', None):
                         meta.setdefault('agent_id', self.mem0_agent_id)
                     try:
-                        self.mem0_client.add([{"role": "user", "content": text}], user_id=self.mem0_user_id, version="v2", metadata=meta)
+                        self._mem0_execute_add([{"role": "user", "content": text}], meta)
                         count += 1
                     except Exception:
                         continue
@@ -1296,7 +1458,7 @@ class OllamaTurboClient:
                         break
                 if q:
                     filters = {"user_id": self.mem0_user_id}
-                    results = self.mem0_client.search(q, version="v2", filters=filters)
+                    results = self._mem0_search_api(q, filters=filters)
                     deleted = 0
                     for it in results or []:
                         mem_text = it.get('memory') or (it.get('data') or {}).get('memory') or ''
@@ -1315,7 +1477,7 @@ class OllamaTurboClient:
                 if len(parts2) == 2:
                     subject, new_text = parts2[0].strip(), parts2[1].strip()
                     filters = {"user_id": self.mem0_user_id}
-                    results = self.mem0_client.search(subject, version="v2", filters=filters)
+                    results = self._mem0_search_api(subject, filters=filters)
                     if results:
                         mem_id = results[0].get('id')
                         try:
@@ -1325,13 +1487,13 @@ class OllamaTurboClient:
                         print("✅ Updated.")
                     else:
                         # If no match, add new
-                        self.mem0_client.add([{"role": "user", "content": new_text}], user_id=self.mem0_user_id, version="v2", metadata={"source": "nlu", "category": "manual"})
+                        self._mem0_execute_add([{"role": "user", "content": new_text}], {"source": "nlu", "category": "manual"})
                         print("✅ Not found; added as new.")
                     return True
             # List memories
             if lower.startswith("list memories") or lower.startswith("show memories"):
                 filters = {"user_id": self.mem0_user_id}
-                items = self.mem0_client.get_all(filters=filters, version="v2")
+                items = self._mem0_get_all_api(filters=filters)
                 if not items:
                     print("📭 No memories found.")
                     return True
@@ -1358,7 +1520,7 @@ class OllamaTurboClient:
                 q = text[len("search memories for "):].strip()
                 if q:
                     filters = {"user_id": self.mem0_user_id}
-                    results = self.mem0_client.search(q, version="v2", filters=filters)
+                    results = self._mem0_search_api(q, filters=filters)
                     if not results:
                         print("🔍 No matching memories.")
                         return True
@@ -1371,7 +1533,7 @@ class OllamaTurboClient:
             queries = {"what do you know about me", "what did i tell you", "do you remember", "what do you remember about me"}
             if any(q in lower for q in queries):
                 filters = {"user_id": self.mem0_user_id}
-                results = self.mem0_client.search(text, version="v2", filters=filters)
+                results = self._mem0_search_api(text, filters=filters)
                 if not results:
                     print("🤔 I don't have anything saved yet.")
                     return True

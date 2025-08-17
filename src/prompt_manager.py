@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from typing import List
+from . import plugin_loader
 
 
 class PromptManager:
@@ -46,17 +47,26 @@ class PromptManager:
         )
 
         if self._flag("PROMPT_INCLUDE_TOOL_GUIDE", True):
-            parts.append(
-                "Tool selection guide:\n"
-                "- get_current_weather: current conditions for a specific city (no 'here'); respects unit; not for forecasts.\n"
-                "- calculate_math: pure math expressions; no units or natural language.\n"
-                "- duckduckgo_search: keyless web search for sources or quick facts; keep results small.\n"
-                "- wikipedia_search: canonical topic pages; then use web_fetch to read details.\n"
-                "- web_fetch: read a specific HTTPS URL with minimal bytes; only compact summaries are injected.\n"
-                "- execute_shell: read-only diagnostics in a sandbox; disabled by default; allowlist only.\n"
-                "- list_files: inspect a directory; prefer extension filter to reduce noise.\n"
-                "- get_system_info: environment snapshot; call only when needed."
-            )
+            # Auto-generate tool guide from discovered plugins to avoid drift
+            try:
+                schemas = list(plugin_loader.TOOL_SCHEMAS)
+            except Exception:
+                schemas = []
+            lines: List[str] = [
+                "Tool selection guide (auto-generated from discovered plugins):"
+            ]
+            # Stable sort by tool name
+            try:
+                schemas.sort(key=lambda s: (s.get("function", {}) or {}).get("name", ""))
+            except Exception:
+                pass
+            for schema in schemas:
+                fn = (schema.get("function") or {})
+                name = fn.get("name")
+                desc = fn.get("description") or ""
+                if isinstance(name, str) and name:
+                    lines.append(f"- {name}: {desc}")
+            parts.append("\n".join(lines))
 
         parts.append(
             "Error handling:\n"
@@ -71,6 +81,20 @@ class PromptManager:
             "- Reference earlier context only when directly relevant\n"
             "- Maintain continuity without repeating information"
         )
+
+        # Harmony channels and tool orchestration guidance
+        parts.append("\n".join([
+            "Harmony orchestration:",
+            "- Valid channels: analysis, commentary, final",
+            "- All tool calls must be emitted on the commentary channel using Harmony tokens",
+            "- Tool-call format (no OpenAI function_call fields):",
+            "  <|channel|>commentary to=functions.TOOL_NAME",
+            "  <|message|>{\\\"arg1\\\": \\\"value\\\", ...}<|call|>",
+            "- After tools are done, produce the user-facing answer on the final channel:",
+            "  <|channel|>final",
+            "  <|message|>Your complete answer here<|end|>",
+            "- Do not include analysis or tool schemas in the final channel output",
+        ]))
 
         parts.append(
             "Shell command guidelines:\n"
