@@ -1,32 +1,23 @@
-"""Example third-party plugin: hello
-
-Returns a friendly greeting. Demonstrates minimalist plugin structure.
-"""
-from __future__ import annotations
-
-from typing import Optional
+# Third-party plugin: hello
 
 TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "hello",
-        "description": "Return a friendly greeting message.",
+        "description": "Say hello, optionally addressing a person by name.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Name to greet", "default": "world"},
+                "name": {"type": "string", "description": "Optional name to greet"}
             },
-            "required": []
-        }
-    }
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
-def execute(name: Optional[str] = None) -> str:
-    try:
-        who = (name or "world").strip()
-        if not who:
-            who = "world"
-        return f"Hello, {who}! 👋"
-    except Exception as e:
-        return f"Error generating greeting: {e}"
+def hello(name: str | None = None) -> str:
+    if name and str(name).strip():
+        return f"Hello, {name}! 👋"
+    return "Hello, world! 👋"

@@ -1,36 +1,28 @@
-"""Example third-party plugin: echo
-
-Echo back provided text with optional transformations.
-"""
-from __future__ import annotations
-
-from typing import Optional
+# Third-party plugin: echo
 
 TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "echo",
-        "description": "Echo back the provided text with optional uppercase or reverse transformations.",
+        "description": "Echo back the provided text, with optional transformations.",
         "parameters": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Text to echo back"},
-                "uppercase": {"type": "boolean", "description": "Convert to uppercase", "default": False},
-                "reverse": {"type": "boolean", "description": "Reverse the text", "default": False}
+                "text": {"type": "string", "description": "The text to echo back"},
+                "uppercase": {"type": "boolean", "description": "Return text in uppercase"},
+                "reverse": {"type": "boolean", "description": "Return text reversed"}
             },
-            "required": ["text"]
-        }
-    }
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
-def execute(text: str, uppercase: Optional[bool] = False, reverse: Optional[bool] = False) -> str:
-    try:
-        out = text
-        if uppercase:
-            out = out.upper()
-        if reverse:
-            out = out[::-1]
-        return out
-    except Exception as e:
-        return f"Error in echo: {e}"
+def echo(text: str, uppercase: bool = False, reverse: bool = False) -> str:
+    out = text
+    if uppercase:
+        out = out.upper()
+    if reverse:
+        out = out[::-1]
+    return out

@@ -19,6 +19,7 @@ Prompts are centralized in `src/prompt_manager.py` to ensure consistent guidance
 - Initial system directive steers tool selection, chaining, and synthesis.
 - Post-tool reprompt instructs the model to synthesize a final textual answer.
 - Mem0 context is injected as a single, hygienic system block each turn.
+  - The tool selection guide is auto-generated from discovered plugins (from `src/plugins/` and `tools/`), so newly added tools like `web_research` appear automatically.
 
 Environment flags:
 
@@ -114,30 +115,34 @@ python -m src.cli --message "Weather in London" --stream
 ## Available Tools
 
 ### 🌤️ Weather Service
+
 Get current weather for major cities worldwide.
 
-```
+```text
 "What's the weather in Tokyo?"
 ```
 
 ### 🧮 Mathematical Calculator
+
 Perform complex mathematical calculations with support for functions.
 
-```
+```text
 "Calculate sin(pi/2) + sqrt(16)"
 ```
 
 ### 📁 File Operations
+
 List files and directories with filtering options.
 
-```
+```text
 "List all Python files in the current directory"
 ```
 
 ### 💻 System Information
+
 Get comprehensive system information including CPU, memory, and disk usage.
 
-```
+```text
 "Show me system information"
 ```
 
@@ -162,12 +167,13 @@ Fetch specific HTTPS URLs through an allowlist proxy with SSRF protections.
 When to use: read a specific page/API without credentials.
 Tips: prefer HTTPS, small timeouts, minimal bytes. Only compact summaries are injected and may be truncated.
 
-### 🖥️ Execute Shell (Sandboxed)
+### 🔬 Web Research
 
-Run short, read-only commands in a locked-down sandbox. Disabled by default.
+Multi-hop web research with citations. Orchestrates Plan→Search→Fetch→Extract→Chunk→Rerank→Cite→Cache.
 
-When to use: diagnostics like `git status`, `ls`, etc.
-Tips: requires `SHELL_TOOL_ALLOW=1` and allowlisted prefixes; path-confined to `SHELL_TOOL_ROOT`; only compact summaries are injected.
+When to use: you need up-to-date facts from multiple sources and deterministic citations. Prefer over `web_fetch` when synthesis across pages is needed.
+Parameters: `top_k` (breadth, default 5), `site_include`/`site_exclude` (scope), `freshness_days` (recency), `force_refresh` (bypass caches).
+Returns: compact JSON with results, quotes, page-mapped citations (for PDFs), and archive URLs.
 
 ## Usage Examples
 
@@ -201,13 +207,25 @@ python -m src.cli --message "Explain quantum computing" --stream
 
 In streaming mode, the assistant can perform multiple tool rounds in a single turn and then synthesize a final textual answer. By default, up to 6 tool-call rounds are allowed before finalization.
 
+### Web Research Example
+
+```bash
+python -m src.cli --message "Research: What are the latest results on Llama 3.2 vision benchmarks? Include citations."
+
+🔧 Processing tool calls...
+   1. Executing web_research(query="latest Llama 3.2 vision benchmarks", top_k=5, freshness_days=365)
+      ✅ Result: { "results": [ { "title": "...", "url": "https://...", "quote": "...", "citation": { "page": 3, "line": 120 } } ], "archives": ["https://archive.is/..." ] }
+
+🤖 Final response: Summary with quotes and numbered citations.
+```
+
 ## Configuration
 
 ### Environment Variables
 
 - `OLLAMA_API_KEY`: Your Ollama API key
 - `OLLAMA_MODEL`: Model name (default: gpt-oss:120b)
-- `OLLAMA_HOST`: API endpoint (default: https://ollama.com)
+- `OLLAMA_HOST`: API endpoint (default: <https://ollama.com>)
 - `MAX_CONVERSATION_HISTORY`: Maximum messages to keep (default: 10)
 - `STREAM_BY_DEFAULT`: Enable streaming by default (default: false)
 - `LOG_LEVEL`: Logging level (default: INFO)
@@ -226,6 +244,7 @@ In streaming mode, the assistant can perform multiple tool rounds in a single tu
 - `MEM0_APP_ID`: Optional app id for tagging
 - `MEM0_ORG_ID`: Optional organization id
 - `MEM0_PROJECT_ID`: Optional project id
+- `MEM0_VERSION`: Preferred Mem0 API version (default: "v2"). The client prefers v2 and gracefully falls back if the SDK doesn't accept the `version` parameter.
 
 Mem0 runtime knobs (advanced):
 
@@ -269,31 +288,32 @@ While in interactive mode:
 
 Mem0 is integrated as the long-term memory store. It is optional and enabled when `MEM0_API_KEY` is present in your `.env`.
 
-- __Initialization__: Loaded silently from environment variables. No runtime prompts.
-- __Status banner__: Interactive mode shows `Mem0: enabled (user: <id>)` or `Mem0: disabled (no key)`.
-- __Injection hygiene__: At most one "Relevant information:" system block is injected per turn before your message; previous injection blocks are removed each turn. Local conversation history is capped at 10 turns.
-- __Natural language intents__: You can type phrases like:
-  - "remember ...", "forget ...", "update X to Y", "list/show memories", "link <id1> <id2>", "search memories for ...", or "what do you know about me".
-- __/mem commands__: `list`, `search <q>`, `add <text>`, `get <id>`, `update <id> <text>`, `delete <id>`, `clear`, `link <id1> <id2>`, `export [path.json]`, `import <path.json>`.
-- __Export/Import__: Exports to `mem0_export_*.json` including `id`, `memory`, `metadata`, `created_at`, `updated_at`. Git ignores these files by default.
-- __Resilience__: All Mem0 operations are wrapped in try/except; failures never block chat. A one-time notice is shown if Mem0 is unavailable; details are logged at DEBUG level.
-- __Filters__: Minimal filters are used for recall (`user_id` only) for list/search/export until recall is proven.
+- **Initialization**: Loaded silently from environment variables. No runtime prompts.
+- **Status banner**: Interactive mode shows `Mem0: enabled (user: <id>)` or `Mem0: disabled (no key)`.
+- **Injection hygiene**: At most one "Relevant information:" system block is injected per turn before your message; previous injection blocks are removed each turn. Local conversation history is capped at 10 turns.
+- **Natural language intents**: You can type phrases like:
+  - "remember ...", "forget ...", "update X to Y", "list/show memories", "link `<id1>` `<id2>`", "search memories for ...", or "what do you know about me".
+- **/mem commands**: `list`, `search <q>`, `add <text>`, `get <id>`, `update <id> <text>`, `delete <id>`, `clear`, `link <id1> <id2>`, `export [path.json]`, `import <path.json>`.
+- **Export/Import**: Exports to `mem0_export_*.json` including `id`, `memory`, `metadata`, `created_at`, `updated_at`. Git ignores these files by default.
+- **Resilience**: All Mem0 operations are wrapped in try/except; failures never block chat. A one-time notice is shown if Mem0 is unavailable; details are logged at DEBUG level.
+- **API versioning**: Prefers Mem0 v2 endpoints (passes `version="v2"`), and falls back automatically if the SDK does not support the `version` kwarg. Configure preferred version via `MEM0_VERSION`.
+- **Filters**: Minimal filters are used for recall (`user_id` only) for list/search/export until recall is proven.
 
 ## Secure Execution & Web Access
 
-- __Shell tool is disabled by default__: Commands run only inside a locked-down sandbox when enabled. Set `SHELL_TOOL_ALLOW=1` and keep an explicit `SHELL_TOOL_ALLOWLIST` (prefix match) for safe commands like `git status`, `ls`, `cat`.
+- **Shell tool is disabled by default**: Commands run only inside a locked-down sandbox when enabled. Set `SHELL_TOOL_ALLOW=1` and keep an explicit `SHELL_TOOL_ALLOWLIST` (prefix match) for safe commands like `git status`, `ls`, `cat`.
 
-- __Confirmation prompts__: In TTY, `execute_shell` shows a one-line preview and requires confirmation unless `SHELL_TOOL_CONFIRM=0`.
+- **Confirmation prompts**: In TTY, `execute_shell` shows a one-line preview and requires confirmation unless `SHELL_TOOL_CONFIRM=0`.
 
-- __Sandbox guarantees__: CPU/mem/pids/disk/time limits, read-only project mount at `/project`, tmpfs workspace, no host env (only `env_vars` pass-through). Windows requires Docker Desktop/WSL2. If Docker is unavailable, execution fails closed with a clear message.
+- **Sandbox guarantees**: CPU/mem/pids/disk/time limits, read-only project mount at `/project`, tmpfs workspace, no host env (only `env_vars` pass-through). Windows requires Docker Desktop/WSL2. If Docker is unavailable, execution fails closed with a clear message.
 
-- __Web access is allowlist-only__: The `web_fetch` tool goes through a controlled client with host allowlist and SSRF protections. HTTPS-only by default (`SANDBOX_ALLOW_HTTP=0`). Add domains to `SANDBOX_NET_ALLOW` (supports wildcards like `*.wikipedia.org`).
+- **Web access is allowlist-only**: The `web_fetch` tool goes through a controlled client with host allowlist and SSRF protections. HTTPS-only by default (`SANDBOX_ALLOW_HTTP=0`). Add domains to `SANDBOX_NET_ALLOW` (supports wildcards like `*.wikipedia.org`).
 
-- __Summarization before injection__: Tool outputs are summarized and capped (`TOOL_CONTEXT_MAX_CHARS`, default 4000). Full logs and payloads are kept under `.sandbox/sessions/` and `.sandbox/cache/` and are not shared with the model.
+- **Summarization before injection**: Tool outputs are summarized and capped (`TOOL_CONTEXT_MAX_CHARS`, default 4000). Full logs and payloads are kept under `.sandbox/sessions/` and `.sandbox/cache/` and are not shared with the model.
 
-- __Mem0 safety__: Outputs from `execute_shell` and sensitive `web_fetch` responses are flagged and not persisted to Mem0.
+- **Mem0 safety**: Outputs from `execute_shell` and sensitive `web_fetch` responses are flagged and not persisted to Mem0.
 
-- __Caching & rate limits__: On-host HTTP cache (TTL 10m, LRU ~200MB) accelerates repeat fetches. Per-host rate-limits prevent abuse.
+- **Caching & rate limits**: On-host HTTP cache (TTL 10m, LRU ~200MB) accelerates repeat fetches. Per-host rate-limits prevent abuse.
 
 ### Enable a one-off command safely
 
@@ -306,9 +326,11 @@ Mem0 is integrated as the long-term memory store. It is optional and enabled whe
 ### Add a domain to the allowlist
 
 - Set `SANDBOX_NET_ALLOW` to include your domain(s), comma-separated, e.g.:
-  ```
-  SANDBOX_NET_ALLOW=api.github.com,*.wikipedia.org,example.com
-  ```
+
+```bash
+SANDBOX_NET_ALLOW=api.github.com,*.wikipedia.org,example.com
+```
+
 - Keep HTTPS-only unless absolutely necessary (`SANDBOX_ALLOW_HTTP=0`).
 
 ### Environment knobs
@@ -380,7 +402,7 @@ For issues and questions:
 
 ### Project Structure
 
-```
+```text
 ollama-turbo-cli/
 ├── src/
 │   ├── __init__.py         # Package initialization
@@ -398,6 +420,18 @@ ollama-turbo-cli/
 ├── .env.example           # Environment variables template
 └── LICENSE                # MIT license
 ```
+
+### Web Research Pipeline (Internals)
+
+- **Entry point tool**: `src/plugins/web_research.py` calls `src/web/pipeline.py:run_research()`.
+- **Modules under** `src/web/` are internal (not tools). They implement the pipeline stages and safety:
+  - Plan → Search → Fetch → Extract → Chunk → Rerank → Cite → Cache
+  - Fetch enforces robots.txt crawl-delay and per-host rate/concurrency guards.
+  - Extract handles HTML and PDF; citations include exact quotes and PDF page mapping when available.
+  - Caching and content-hash dedupe keep repeated runs fast; `force_refresh=true` bypasses caches.
+- **When to use**: multi-source questions needing fresh facts and deterministic citations. Prefer over `web_fetch` when synthesizing across multiple pages.
+- **Parameters** (tool): `top_k`, `site_include`, `site_exclude`, `freshness_days`, `force_refresh`.
+- **Output**: compact JSON with results, citations, and archive URLs suitable for downstream summarization.
 
 ### Running Tests
 
@@ -422,6 +456,7 @@ pytest -q
 ```
 
 ### Contributing
+
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
@@ -431,6 +466,7 @@ pytest -q
 ## Version History
 
 ### v1.0.0 (Current)
+
 - Initial release with gpt-oss:120b support
 - Four built-in tools: weather, calculator, files, system
 - Streaming and non-streaming modes
