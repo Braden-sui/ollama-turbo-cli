@@ -15,12 +15,13 @@ TOOL_SCHEMA = {
             "additionalProperties": False,
             "properties": {
                 "url": {"type": "string", "description": "Absolute HTTP(S) URL. Prefer HTTPS. Do not include credentials. Internal/private addresses are blocked by policy."},
-                "method": {"type": "string", "enum": ["GET", "HEAD", "POST"], "default": "GET", "description": "HTTP method. Use GET to retrieve content, HEAD for metadata checks, POST only when necessary."},
+                "method": {"type": "string", "default": "GET", "description": "HTTP method. Policy allows only GET/HEAD/POST; other methods will be rejected by the network policy layer."},
                 "headers": {"type": "object", "description": "Optional request headers. Never include Authorization or cookies."},
                 "body": {"type": "string", "description": "Optional request body, used only when method is POST."},
                 "timeout_s": {"type": "integer", "default": 15, "maximum": 30, "description": "Request timeout in seconds (1-30). Use small values to reduce latency."},
                 "max_bytes": {"type": "integer", "description": "Maximum bytes to download. Smaller caps reduce cost and truncation."},
                 "extract": {"type": "string", "enum": ["auto", "text", "json", "html_readability", "headers", "bytes"], "default": "auto", "description": "How to extract the response. Prefer 'text' or 'json' for small responses; 'html_readability' extracts main content."},
+                "cache_bypass": {"type": "boolean", "default": False, "description": "If true, skip cache reads and perform a fresh network fetch (subject to policy)."},
             },
             "required": ["url"],
         },
@@ -28,10 +29,10 @@ TOOL_SCHEMA = {
 }
 
 
-def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] = None, body: Optional[str] = None, timeout_s: int = 15, max_bytes: Optional[int] = None, extract: str = 'auto') -> str:
+def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] = None, body: Optional[str] = None, timeout_s: int = 15, max_bytes: Optional[int] = None, extract: str = 'auto', cache_bypass: bool = False) -> str:
     # Enforce HTTPS default inside fetch_via_policy
     data = body.encode() if body is not None else None
-    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes)
+    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes, cache_bypass=bool(cache_bypass))
 
     # Build safe injection summary; never include large bodies
     inject = res.get('inject') or ''
@@ -46,6 +47,7 @@ def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] =
         'truncated': bool(res.get('truncated', False)),
         'inject': inject,
         'sensitive': _looks_sensitive(inject),
+        'debug': res.get('debug', {}),
         'net': {
             'status': int(res.get('status', 0) or 0),
             'bytes': int(res.get('bytes', 0)),

@@ -106,3 +106,44 @@ def test_standard_chat_final_call_omits_tools(monkeypatch):
     assert 'tools' in first
     # Final request must not include tools
     assert 'tools' not in second
+
+
+def test_web_research_alias_mapping(monkeypatch):
+    from src import plugin_loader
+    import src.plugins.web_research as wr
+
+    calls = {}
+
+    def fake_run_research(query, top_k, site_include=None, site_exclude=None, freshness_days=None, force_refresh=False):
+        echo = {
+            'query': query,
+            'top_k': top_k,
+            'site_include': site_include,
+            'site_exclude': site_exclude,
+            'freshness_days': freshness_days,
+            'force_refresh': force_refresh,
+        }
+        return {'ok': True, 'echo': echo}
+
+    # Patch the underlying pipeline function used by the plugin implementation
+    monkeypatch.setattr(wr, 'run_research', fake_run_research)
+
+    fn = plugin_loader.TOOL_FUNCTIONS['web_research']
+    out_s = fn(
+        query='q',
+        top_n=3,                # -> top_k
+        domain='example.com',   # -> site_include
+        exclude_domain='bad.com',  # -> site_exclude
+        recency_days=14,        # -> freshness_days
+        force=True,             # -> force_refresh
+        loc=1,                  # dropped
+        search='ddg'            # dropped
+    )
+    data = json.loads(out_s)
+    assert data.get('ok') is True
+    echo = data.get('echo', {})
+    assert echo['top_k'] == 3
+    assert echo['site_include'] == 'example.com'
+    assert echo['site_exclude'] == 'bad.com'
+    assert echo['freshness_days'] == 14
+    assert echo['force_refresh'] is True

@@ -24,6 +24,9 @@ import re
 from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
 from .prompt_manager import PromptManager
+from .harmony_processor import HarmonyProcessor
+from .tool_executor import ToolExecutor
+from .developer_message_builder import DeveloperMessageBuilder
 
 
 class OllamaTurboClient:
@@ -122,6 +125,8 @@ class OllamaTurboClient:
         
         # Prompt management
         self.prompt = PromptManager(self.reasoning)
+        # Harmony parsing/markup processing
+        self.harmony = HarmonyProcessor()
         # Initialize conversation history with a system directive
         self.conversation_history = [
             {
@@ -269,6 +274,12 @@ class OllamaTurboClient:
                 # Harmony adapter: if provider didn't canonicalize tool calls, parse from content
                 if self.enable_tools and not tool_calls and content:
                     cleaned, parsed_calls, final_seg = self._parse_harmony_tokens(content)
+                    # Capture analysis content into trace (if present)
+                    try:
+                        if getattr(self.harmony, 'last_analysis', None):
+                            self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                    except Exception:
+                        pass
                     if parsed_calls:
                         tool_calls = parsed_calls
                         content = cleaned  # remove tool-call markup from assistant content
@@ -314,6 +325,12 @@ class OllamaTurboClient:
                     try:
                         if content:
                             cleaned, _, final_seg = self._parse_harmony_tokens(content)
+                            # Trace analysis if available
+                            try:
+                                if getattr(self.harmony, 'last_analysis', None):
+                                    self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                            except Exception:
+                                pass
                             final_out = final_seg or cleaned
                             if not final_out:
                                 final_out = self._strip_harmony_markup(content)
@@ -482,6 +499,12 @@ class OllamaTurboClient:
                 if not tool_calls and include_tools and round_content:
                     try:
                         cleaned, parsed_calls, _ = self._parse_harmony_tokens(round_content)
+                        # Trace analysis if available
+                        try:
+                            if getattr(self.harmony, 'last_analysis', None):
+                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                        except Exception:
+                            pass
                         if parsed_calls:
                             tool_calls = parsed_calls
                             round_content = cleaned
@@ -527,6 +550,12 @@ class OllamaTurboClient:
                 try:
                     if round_content:
                         cleaned, _, final_seg = self._parse_harmony_tokens(round_content)
+                        # Trace analysis if available
+                        try:
+                            if getattr(self.harmony, 'last_analysis', None):
+                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                        except Exception:
+                            pass
                         final_out = final_seg or cleaned
                         if not final_out:
                             final_out = self._strip_harmony_markup(round_content)
@@ -575,15 +604,7 @@ class OllamaTurboClient:
         This strips tokens like <|channel|>commentary, <|channel|>final, <|message|>, <|call|>, <|end|>.
         """
         try:
-            if not text:
-                return text
-            # Remove channel headers (commentary/final) and inline markers
-            t = re.sub(r"<\|channel\|>\s*commentary[^\n<]*", "", text, flags=re.IGNORECASE)
-            t = re.sub(r"<\|channel\|>\s*final[^\n<]*", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|message\|>", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|call\|>", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|end\|>", "", t, flags=re.IGNORECASE)
-            return t
+            return self.harmony.strip_markup(text)
         except Exception:
             return text
 
@@ -595,49 +616,7 @@ class OllamaTurboClient:
         - tool_calls: list of OpenAI-style tool_call dicts
         - final_text: last final-channel message content if present
         """
-        tool_calls: List[Dict[str, Any]] = []
-        final_text: Optional[str] = None
-        if not text:
-            return text, tool_calls, final_text
-
-        # Match commentary tool calls like:
-        # <|channel|>commentary to=functions.web_fetch ... <|message|>{json}<|call|>
-        tc_re = re.compile(
-            r"<\|channel\|>\s*commentary\b.*?to=functions\.([a-zA-Z0-9_]+).*?<\|message\|>(?P<json>\{.*?\})\s*<\|call\|>",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        def _tc_repl(m: re.Match) -> str:
-            name = m.group(1)
-            arg_text = m.group('json') if 'json' in m.groupdict() else '{}'
-            args: Dict[str, Any]
-            try:
-                args = json.loads(arg_text)
-                if not isinstance(args, dict):
-                    args = {}
-            except Exception:
-                args = {}
-            tool_calls.append({
-                'type': 'function',
-                'id': f"call_h_{len(tool_calls)+1}",
-                'function': {
-                    'name': name,
-                    'arguments': args,
-                }
-            })
-            return ""  # remove this segment from cleaned text
-
-        cleaned = tc_re.sub(_tc_repl, text)
-
-        # Extract final channel content (use the last occurrence if multiple)
-        final_re = re.compile(r"<\|channel\|>\s*final\b.*?<\|message\|>(?P<msg>.*?)(?:<\|end\|>|$)", re.IGNORECASE | re.DOTALL)
-        for m in final_re.finditer(cleaned):
-            final_text = m.group('msg')
-
-        # Remove any remaining markup tokens
-        cleaned = self._strip_harmony_markup(cleaned)
-
-        return cleaned, tool_calls, final_text
+        return self.harmony.parse_tokens(text)
 
     # ------------------ Internal helpers ------------------
     def _set_idempotency_key(self, key: Optional[str]) -> None:

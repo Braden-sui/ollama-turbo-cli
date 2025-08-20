@@ -65,3 +65,4 @@ mem0_export_*.json
 .sandbox/cache/
 .sandbox/sessions/
 mem0_export_*.json
+.windsurf\rules

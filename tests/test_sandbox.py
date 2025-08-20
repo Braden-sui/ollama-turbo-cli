@@ -109,3 +109,113 @@ def test_path_confinement(tmp_path):
     # working_dir outside root should be rejected
     res = call_tool('execute_shell', command='ls', working_dir='/', timeout=1)
     assert res.get('blocked') is True
+
+
+def test_web_fetch_header_sanitization(monkeypatch):
+    # Allow example.com and avoid real DNS
+    monkeypatch.setenv('SANDBOX_NET', 'allowlist')
+    monkeypatch.setenv('SANDBOX_NET_ALLOW', 'example.com')
+
+    from src.sandbox import net_proxy as np
+
+    # Avoid real DNS/SSRF checks depending on environment
+    monkeypatch.setattr(np, '_resolve_and_check', lambda host: (host, ['93.184.216.34']))
+
+    captured = {}
+
+    class FakeResp:
+        def __init__(self, url: str):
+            self.url = url
+            self.status_code = 200
+            self.headers = {'Content-Type': 'application/json'}
+            self.history = []
+
+        def iter_content(self, chunk_size=8192):
+            yield b'{}'
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def merge_environment_settings(self, url, proxies, stream, verify, cert):
+            return {'verify': True, 'cert': None, 'proxies': None}
+
+        def request(self, method, url, headers, data, timeout, stream, allow_redirects, verify, cert, proxies):
+            captured['headers'] = dict(headers)
+            return FakeResp(url)
+
+    class FakeRequests:
+        def Session(self):
+            return FakeSession()
+
+    # Patch requests used by net_proxy
+    monkeypatch.setattr(np, 'requests', FakeRequests())
+
+    # Call via tool wrapper to exercise plugin path
+    res = call_tool('web_fetch', url='https://example.com', headers={
+        'Authorization': 'Bearer SECRET',
+        'X-Forwarded-For': '1.2.3.4',
+        'Accept': 'application/json'
+    })
+    assert res.get('ok') is True
+    sent = {k.lower(): v for k, v in captured.get('headers', {}).items()}
+    # Sensitive headers should be stripped
+    assert 'authorization' not in sent
+    assert 'x-forwarded-for' not in sent
+    # Allowed headers should remain
+    assert sent.get('accept') == 'application/json'
+    assert 'user-agent' in sent
+
+
+def test_blocklist_policy(monkeypatch):
+    # Enable blocklist mode: allow entire web except matching patterns
+    monkeypatch.setenv('SANDBOX_NET', 'blocklist')
+    monkeypatch.setenv('SANDBOX_NET_BLOCK', 'bad.com,*.malware.test')
+    # Keep HTTPS requirement
+    monkeypatch.setenv('SANDBOX_ALLOW_HTTP', '0')
+
+    from src.sandbox import net_proxy as np
+
+    # Avoid real DNS checks and private IP resolution during test
+    monkeypatch.setattr(np, '_resolve_and_check', lambda host: (host, ['203.0.113.1']))
+
+    # Fake requests session
+    captured = {}
+
+    class FakeResp:
+        def __init__(self, url: str):
+            self.url = url
+            self.status_code = 200
+            self.headers = {'Content-Type': 'text/plain'}
+            self.history = []
+        def iter_content(self, chunk_size=8192):
+            yield b'ok'
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def merge_environment_settings(self, url, proxies, stream, verify, cert):
+            return {'verify': True, 'cert': None, 'proxies': None}
+        def request(self, method, url, headers, data, timeout, stream, allow_redirects, verify, cert, proxies):
+            captured['last_url'] = url
+            return FakeResp(url)
+
+    class FakeRequests:
+        def Session(self):
+            return FakeSession()
+
+    monkeypatch.setattr(np, 'requests', FakeRequests())
+
+    # Allowed host should pass
+    r_ok = call_tool('web_fetch', url='https://example.com')
+    assert r_ok.get('ok') is True
+
+    # Blocklisted host should be blocked
+    r_bad = call_tool('web_fetch', url='https://bad.com')
+    assert r_bad.get('ok') is False
+    assert 'blocklisted' in (r_bad.get('error') or '')

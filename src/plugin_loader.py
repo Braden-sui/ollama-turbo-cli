@@ -125,14 +125,24 @@ class PluginManager:
                 if os.path.isfile(init_py):
                     files.append(init_py)
             elif name.endswith(".py"):
+                # Skip the package's own __init__.py (e.g., src/plugins/__init__.py)
+                if name == "__init__.py":
+                    continue
                 files.append(path)
         return files
 
     def _import_module_from_path(self, file_path: str, pkg_base: Optional[str]) -> ModuleType:
         module_name = None
         if pkg_base:
-            # derive module_name like 'src.plugins.weather' or 'tools.example'
-            rel = os.path.splitext(os.path.basename(file_path))[0] if file_path.endswith(".py") else os.path.basename(os.path.dirname(file_path))
+            # derive module_name like 'src.plugins.weather' or package 'src.plugins.foo'
+            base_name = os.path.basename(file_path)
+            if base_name == "__init__.py":
+                # Treat package __init__ as the package module
+                rel = os.path.basename(os.path.dirname(file_path))
+            elif file_path.endswith(".py"):
+                rel = os.path.splitext(base_name)[0]
+            else:
+                rel = os.path.basename(os.path.dirname(file_path))
             module_name = f"{pkg_base}.{rel}"
         else:
             module_name = f"plugin_{abs(hash(file_path))}"
@@ -160,16 +170,20 @@ class PluginManager:
             """Map common alias argument names to canonical ones expected by functions.
             This helps tolerate upstream planners that use different names.
             Currently supported:
-            - top_n -> max_results | limit (if available)
+            - top_n -> top_k | max_results | limit (if available)
             - timeout -> timeout_s (if available)
-            - recency_days -> ignored
+            - site | domain -> site_include (if available)
+            - freshness | recency_days -> freshness_days (if available)
+            - force -> force_refresh (if available)
             - loc -> ignored (selection index from search results)
             - search -> ignored (planner hint not used by most tools)
             """
             out = dict(raw_kwargs)
-            # top_n alias
+            # top_n alias -> prefer top_k, else max_results, else limit
             if "top_n" in out and "top_n" not in param_names:
-                if "max_results" in param_names and "max_results" not in out:
+                if "top_k" in param_names and "top_k" not in out:
+                    out["top_k"] = out.get("top_n")
+                elif "max_results" in param_names and "max_results" not in out:
                     out["max_results"] = out.get("top_n")
                 elif "limit" in param_names and "limit" not in out:
                     out["limit"] = out.get("top_n")
@@ -178,9 +192,34 @@ class PluginManager:
             if "timeout" in out and "timeout" not in param_names and "timeout_s" in param_names and "timeout_s" not in out:
                 out["timeout_s"] = out.get("timeout")
                 out.pop("timeout", None)
-            # benign drops
+            # site/domain -> site_include
+            if "site" in out and "site" not in param_names and "site_include" in param_names and "site_include" not in out:
+                out["site_include"] = out.get("site")
+                out.pop("site", None)
+            if "domain" in out and "domain" not in param_names and "site_include" in param_names and "site_include" not in out:
+                out["site_include"] = out.get("domain")
+                out.pop("domain", None)
+            # exclude synonyms -> site_exclude
+            if "exclude" in out and "exclude" not in param_names and "site_exclude" in param_names and "site_exclude" not in out:
+                out["site_exclude"] = out.get("exclude")
+                out.pop("exclude", None)
+            if "exclude_domain" in out and "exclude_domain" not in param_names and "site_exclude" in param_names and "site_exclude" not in out:
+                out["site_exclude"] = out.get("exclude_domain")
+                out.pop("exclude_domain", None)
+            # freshness/recency -> freshness_days
+            if "freshness" in out and "freshness" not in param_names and "freshness_days" in param_names and "freshness_days" not in out:
+                out["freshness_days"] = out.get("freshness")
+                out.pop("freshness", None)
             if "recency_days" in out and "recency_days" not in param_names:
+                if "freshness_days" in param_names and "freshness_days" not in out:
+                    out["freshness_days"] = out.get("recency_days")
+                # drop original alias regardless
                 out.pop("recency_days", None)
+            # force -> force_refresh
+            if "force" in out and "force" not in param_names and "force_refresh" in param_names and "force_refresh" not in out:
+                out["force_refresh"] = out.get("force")
+                out.pop("force", None)
+            # benign drops
             if "loc" in out and "loc" not in param_names:
                 out.pop("loc", None)
             if "search" in out and "search" not in param_names:
