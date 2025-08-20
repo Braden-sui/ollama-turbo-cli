@@ -1,6 +1,6 @@
 # Ollama Turbo CLI
 
-A production-ready CLI application for interacting with OpenAI's gpt-oss:120b model through Ollama Turbo cloud service, featuring advanced tool calling capabilities and streaming responses.
+A production-ready CLI application for interacting with gpt-oss:120b model through Ollama Turbo cloud service, featuring advanced tool calling capabilities and streaming responses.
 
 ## Features
 
@@ -172,7 +172,19 @@ Tips: prefer HTTPS, small timeouts, minimal bytes. Only compact summaries are in
 Grounded and validated answers via the internal Reliability API. Supports non-streaming and SSE streaming with a trailing summary event.
 
 When to use: you want citations, validator checks, or consensus heuristics.
-Flags: `ground`, `k`, `cite`, `check` (`off|warn|strict`), `consensus`, `engine`, `eval_corpus`.
+Flags: `ground`, `k`, `cite`, `check` (`off|warn|enforce`), `consensus` (int|bool; sent as integer), `engine`, `eval_corpus`.
+
+Notes:
+
+- If `consensus` is provided as `true` and `k` is unset, the client sends `consensus=3` by default.
+- `k` controls retrieval breadth; `consensus` controls the number of model votes. They are coupled only for defaults.
+- Fail-closed: if `ground=true` and `cite=true` but no sources resolve, the client returns a clear refusal and sets `summary.status = "no_docs"` with `grounded=false` and empty `citations`.
+- Streaming `summary` contract: `status` ∈ {`ok`,`no_docs`,`timeout`,`http_error`}; `provenance` is `retrieval` when grounded else `none`.
+
+Performance tips:
+
+- When responses are slow: omit `consensus`, set `check="off"`, and leave `k` unset to minimize load.
+- For complex queries, consider running `web_research` first to fetch sources, then ask `reliable_chat` to synthesize with citations.
 
 Example (non-stream):
 
@@ -190,6 +202,20 @@ from src import plugin_loader
 fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
 out_json = fn(message="Verify the claim and cite sources; aim for consensus, k=3.", stream=True)
 # content aggregates token stream; summary includes validator/consensus info
+```
+
+#### Windows-safe curl (SSE) — quick smoke
+
+```powershell
+$env:BASE = "http://127.0.0.1:8000"
+
+# Happy path (expect tokens + trailing summary with grounded:true when sources found)
+curl.exe --no-buffer $env:BASE/v1/chat/stream -H "content-type: application/json" `
+  -d '{"message":"When did Pearl Street Mall open?","ground":true,"cite":true,"k":4}'
+
+# Fail-closed path (expect refusal text + summary.status=no_docs, grounded:false, citations:[])
+curl.exe --no-buffer $env:BASE/v1/chat/stream -H "content-type: application/json" `
+  -d '{"message":"who won the 2047 denver mayor race","ground":true,"cite":true}'
 ```
 
 Notes:
@@ -252,6 +278,7 @@ Feature flag: set `API_ENABLED=0` to disable. If `API_KEY` is set, clients must 
 
 ### Endpoints
 
+- `GET /health` — root health (FastAPI app)
 - `GET /v1/health` — basic health
 - `GET /v1/live` — liveness probe
 - `GET /v1/ready` — readiness probe
@@ -275,6 +302,16 @@ Feature flag: set `API_ENABLED=0` to disable. If `API_KEY` is set, clients must 
 ```
 
 `tool_results_format` controls the shape of tool results in responses. Default is `string` for backward compatibility; set `TOOL_RESULTS_FORMAT=object` or pass in `options` to get structured objects.
+
+Reliability fields (all optional):
+
+- `ground` (bool): Enable retrieval + grounding context injection
+- `k` (int): General breadth parameter (retrieval top-k and/or consensus runs)
+- `cite` (bool): Ask the model to include inline citations when grounded
+- `check` ("off"|"warn"|"enforce"): Validator mode
+- `consensus` (bool): Enable multi-run consensus (streaming returns trace-only summary)
+- `engine` (string): Backend engine alias or URL
+- `eval_corpus` (string): Eval corpus identifier for micro-eval
 
 ### Responses
 
@@ -566,7 +603,15 @@ pytest -q
 
 ## Version History
 
-### v1.0.0 (Current)
+### v1.1.0 (Current)
+
+- Reliability mode: grounding, citations, validator (off|warn|enforce), consensus (k)
+- Streaming reliability with trailing summary (grounded, citations, validator, consensus)
+- Heuristic auto-flags based on message intent; CLI/API flags plumbed end-to-end
+- Hardened plugin validation and None-stripping for tool args
+- Version bump and README/documentation updates
+
+### v1.0.0
 
 - Initial release with gpt-oss:120b support
 - Four built-in tools: weather, calculator, files, system

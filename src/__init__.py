@@ -2,7 +2,7 @@
 Ollama Turbo CLI - A production-ready CLI application for gpt-oss:120b via Ollama Turbo.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Ollama Turbo CLI Team"
 
 from .client import OllamaTurboClient
