@@ -42,10 +42,15 @@ def test_execute_tool_calls_injection_cap_and_memskip(monkeypatch):
     client.tool_functions['web_fetch'] = fake_web_fetch
 
     tool_calls = [_make_tool_call('web_fetch', {'url': 'https://example.com'})]
-    injected = client._execute_tool_calls(tool_calls)
+    res = client._execute_tool_calls(tool_calls)
 
-    assert isinstance(injected, list) and len(injected) == 1
-    disp = injected[0]
+    assert isinstance(res, list) and len(res) == 1
+    tr = res[0]
+    assert isinstance(tr, dict)
+    assert tr.get('tool') == 'web_fetch'
+    assert tr.get('status') == 'ok'
+    disp = tr.get('content')
+    assert isinstance(disp, str)
     # Should be capped and include truncation notice with log_path
     assert len(disp) <= client.tool_context_cap + 120  # allow for notice text
     assert 'truncated; full logs stored at sandbox://sessions/123/full.log' in disp

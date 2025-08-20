@@ -244,14 +244,17 @@ class PluginManager:
                     if dropped:
                         logger.debug(f"Tool '{name}': dropping unexpected arguments: {dropped}")
 
-                # Validate filtered args if schema is provided (post-alias)
+                # Remove None values to avoid schema type mismatches (e.g., string vs null)
+                cleaned = {k: v for k, v in filtered.items() if v is not None}
+
+                # Validate cleaned args if schema is provided (post-alias)
                 if params_schema and jsonschema_validate is not None:
                     try:
-                        jsonschema_validate(instance=filtered, schema=params_schema)  # type: ignore[arg-type]
+                        jsonschema_validate(instance=cleaned, schema=params_schema)  # type: ignore[arg-type]
                     except Exception as e:
                         raise ValueError(f"Arguments for {name} failed schema validation: {e}")
 
-                return func(**filtered)
+                return func(**cleaned)
             except TypeError as te:
                 logger.error(f"Tool '{name}' invocation failed with TypeError: {te}")
                 raise
