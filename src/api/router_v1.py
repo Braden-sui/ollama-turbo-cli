@@ -132,11 +132,15 @@ async def chat_stream(
                     payload_final['tool_results'] = tr
                 yield f"data: {json.dumps(payload_final)}\n\n"
                 # Emit trailing summary event
+                grounded = bool(getattr(client, '_last_context_blocks', []) or [])
+                citations = list((getattr(client, '_last_citations_map', {}) or {}).keys()) or []
                 summary = {
-                    'grounded': bool(getattr(client, '_last_context_blocks', []) or []),
-                    'citations': list((getattr(client, '_last_citations_map', {}) or {}).keys()) or [],
+                    'grounded': grounded,
+                    'citations': citations,
                     'validator': None,
                     'consensus': {'k': int(payload.k or 1), 'agree_rate': 1.0},
+                    'status': ('no_docs' if bool(payload.ground or False) and bool(payload.cite or False) and not citations else 'ok'),
+                    'provenance': ('retrieval' if grounded else 'none'),
                 }
                 try:
                     if (payload.check or 'off') != 'off':
@@ -169,11 +173,15 @@ async def chat_stream(
                             payload_final['tool_results'] = tr
                         yield f"data: {json.dumps(payload_final)}\n\n"
                         # Emit trailing summary event (consensus skipped due to tools)
+                        grounded = bool(getattr(client, '_last_context_blocks', []) or [])
+                        citations = list((getattr(client, '_last_citations_map', {}) or {}).keys()) or []
                         summary = {
-                            'grounded': bool(getattr(client, '_last_context_blocks', []) or []),
-                            'citations': list((getattr(client, '_last_citations_map', {}) or {}).keys()) or [],
+                            'grounded': grounded,
+                            'citations': citations,
                             'validator': None,
                             'consensus': {'k': 1, 'agree_rate': 1.0},
+                            'status': ('no_docs' if bool(payload.ground or False) and bool(payload.cite or False) and not citations else 'ok'),
+                            'provenance': ('retrieval' if grounded else 'none'),
                         }
                         try:
                             if (payload.check or 'off') != 'off':
@@ -193,11 +201,15 @@ async def chat_stream(
                     payload_final['tool_results'] = tr
                 yield f"data: {json.dumps(payload_final)}\n\n"
                 # Emit trailing summary event after fallback
+                grounded = bool(getattr(client, '_last_context_blocks', []) or [])
+                citations = list((getattr(client, '_last_citations_map', {}) or {}).keys()) or []
                 summary = {
-                    'grounded': bool(getattr(client, '_last_context_blocks', []) or []),
-                    'citations': list((getattr(client, '_last_citations_map', {}) or {}).keys()) or [],
+                    'grounded': grounded,
+                    'citations': citations,
                     'validator': None,
                     'consensus': {'k': int(payload.k or 1), 'agree_rate': 1.0},
+                    'status': 'http_error' if (bool(payload.ground or False) and bool(payload.cite or False) and not citations) else 'http_error',
+                    'provenance': ('retrieval' if grounded else 'none'),
                 }
                 try:
                     if (payload.check or 'off') != 'off':
@@ -228,11 +240,15 @@ async def chat_stream(
             # No tool_results for pure text path
             yield f"data: {json.dumps({'type': 'final', 'content': final_out})}\n\n"
             # Emit trailing summary event (trace-only consensus)
+            grounded = bool(getattr(client, '_last_context_blocks', []) or [])
+            citations = list((getattr(client, '_last_citations_map', {}) or {}).keys()) or []
             summary = {
-                'grounded': bool(getattr(client, '_last_context_blocks', []) or []),
-                'citations': list((getattr(client, '_last_citations_map', {}) or {}).keys()) or [],
+                'grounded': grounded,
+                'citations': citations,
                 'validator': None,
                 'consensus': None,
+                'status': ('no_docs' if bool(payload.ground or False) and bool(payload.cite or False) and not citations else 'ok'),
+                'provenance': ('retrieval' if grounded else 'none'),
             }
             # Validator
             try:

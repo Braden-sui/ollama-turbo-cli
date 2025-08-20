@@ -11,7 +11,7 @@ from .router_v1 import router as router_v1
 def create_app() -> FastAPI:
     # Ensure environment variables from .env are loaded when running the API server
     load_dotenv()
-    app = FastAPI(title="Ollama Turbo CLI API", version="0.1.0")
+    app = FastAPI(title="Ollama Turbo CLI API", version="1.1.0")
 
     logger = logging.getLogger("ollama_turbo_api")
     logger.setLevel(logging.INFO)

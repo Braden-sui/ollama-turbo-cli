@@ -8,13 +8,13 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="ollama-turbo-cli",
-    version="1.0.0",
-    author="Your Name",
-    author_email="your.email@example.com",
+    version="1.1.0",
+    author="Braden",
+    author_email="braden.yig@gmail.com",
     description="CLI application for Ollama Turbo with gpt-oss:120b and tool calling",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/ollama-turbo-cli",
+    url="https://github.com/Braden-sui/ollama-turbo-cli",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     classifiers=[
