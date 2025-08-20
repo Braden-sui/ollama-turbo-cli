@@ -14,6 +14,8 @@ from .tools import (
     duckduckgo_search,
     wikipedia_search,
 )
+# Ensure subpackage re-export so `import src.plugins.web_research` works
+from . import plugins as plugins
 
 __all__ = [
     "OllamaTurboClient",
@@ -23,4 +25,5 @@ __all__ = [
     "get_system_info",
     "duckduckgo_search",
     "wikipedia_search",
+    "plugins",
 ]

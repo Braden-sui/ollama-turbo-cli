@@ -34,6 +34,7 @@ class WebConfig:
     # Caching and robots
     cache_ttl_seconds: int = int(os.getenv("WEB_CACHE_TTL_SECONDS", "86400"))  # 24h
     robots_ttl_seconds: int = int(os.getenv("WEB_ROBOTS_TTL_SECONDS", "3600"))
+    max_crawl_delay_s: int = int(os.getenv("WEB_MAX_CRAWL_DELAY_S", "20"))
 
     # Provider keys
     brave_key: Optional[str] = os.getenv("BRAVE_API_KEY")
@@ -58,6 +59,7 @@ class WebConfig:
     # Allowlist integration (reuse sandbox policy)
     sandbox_allow: Optional[str] = os.getenv("SANDBOX_NET_ALLOW", "")
     sandbox_allow_http: bool = os.getenv("SANDBOX_ALLOW_HTTP", "0") in {"1","true","True"}
+    sandbox_allow_proxies: bool = os.getenv("SANDBOX_ALLOW_PROXIES", "0") in {"1","true","True"}
 
     # Storage locations
     cache_root: str = os.getenv("WEB_CACHE_ROOT", ".sandbox/webcache")
@@ -108,6 +110,7 @@ class WebConfig:
         # Caching and robots
         object.__setattr__(self, 'cache_ttl_seconds', int(e("WEB_CACHE_TTL_SECONDS", "86400")))
         object.__setattr__(self, 'robots_ttl_seconds', int(e("WEB_ROBOTS_TTL_SECONDS", "3600")))
+        object.__setattr__(self, 'max_crawl_delay_s', int(e("WEB_MAX_CRAWL_DELAY_S", "20")))
         # Provider keys
         object.__setattr__(self, 'brave_key', e("BRAVE_API_KEY"))
         object.__setattr__(self, 'tavily_key', e("TAVILY_API_KEY"))
@@ -127,6 +130,7 @@ class WebConfig:
         # Allowlist
         object.__setattr__(self, 'sandbox_allow', e("SANDBOX_NET_ALLOW", ""))
         object.__setattr__(self, 'sandbox_allow_http', e("SANDBOX_ALLOW_HTTP", "0") in {"1","true","True"})
+        object.__setattr__(self, 'sandbox_allow_proxies', e("SANDBOX_ALLOW_PROXIES", "0") in {"1","true","True"})
         # Storage and archiving
         object.__setattr__(self, 'cache_root', e("WEB_CACHE_ROOT", ".sandbox/webcache"))
         object.__setattr__(self, 'archive_enabled', e("WEB_ARCHIVE_ENABLED", "1") in {"1","true","True"})

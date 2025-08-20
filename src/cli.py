@@ -72,6 +72,27 @@ Examples:
                        type=int,
                        default=int(env_tool_print) if env_tool_print.isdigit() else 200,
                        help='Character limit when printing tool results inline in CLI (does not affect tool messages sent to the model).')
+    # Reliability mode flags (no-op until pipeline is wired)
+    parser.add_argument('--ground',
+                       action='store_true',
+                       help='Enable retrieval-grounded reliability mode (adds external context).')
+    parser.add_argument('--k',
+                       type=int,
+                       help='Top-k retrieval and/or consensus runs (context-dependent).')
+    parser.add_argument('--cite',
+                       action='store_true',
+                       help='Request inline citations in the final answer when reliability mode is active.')
+    parser.add_argument('--check',
+                       choices=['off', 'warn', 'enforce'],
+                       default='off',
+                       help='Validator/guard mode for reliability: off, warn, or enforce (default: off).')
+    parser.add_argument('--consensus',
+                       action='store_true',
+                       help='Enable k-run consensus voting (majority/agree-rate).')
+    parser.add_argument('--engine',
+                       help='Target engine: cloud | local | full URL (http[s]://...). Default: cloud / OLLAMA_HOST.')
+    parser.add_argument('--eval',
+                       help='Path to a JSONL corpus for micro-evaluation (optional).')
     parser.add_argument('--log-level', 
                        default=os.getenv('LOG_LEVEL', 'INFO'),
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -107,7 +128,15 @@ Examples:
             quiet=args.quiet,
             max_output_tokens=args.max_output_tokens,
             ctx_size=args.ctx_size,
-            tool_print_limit=args.tool_print_limit
+            tool_print_limit=args.tool_print_limit,
+            # Reliability mode plumbing (no-op until implemented)
+            ground=args.ground,
+            k=args.k,
+            cite=args.cite,
+            check=args.check,
+            consensus=args.consensus,
+            engine=args.engine,
+            eval_corpus=args.eval
         )
         
         logger.info(f"Initialized Ollama Turbo client with model: {args.model}")

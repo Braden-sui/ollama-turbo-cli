@@ -10,3 +10,5 @@ PyMuPDF>=1.23.0
 pdfminer.six>=20221105
 trafilatura>=1.7.0
 readability-lxml>=0.8.1
+fastapi>=0.110.0
+uvicorn[standard]>=0.23.0

@@ -12,9 +12,10 @@ import random
 
 def setup_logging(level: str = "INFO") -> None:
     """Setup logging configuration."""
+    fmt = os.getenv('LOG_FORMAT', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logging.basicConfig(
         level=getattr(logging, level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format=fmt,
         handlers=[
             logging.StreamHandler(sys.stderr)
         ]

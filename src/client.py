@@ -24,12 +24,19 @@ import re
 from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
 from .prompt_manager import PromptManager
+from .harmony_processor import HarmonyProcessor
+from .tool_executor import ToolExecutor
+from .developer_message_builder import DeveloperMessageBuilder
+from .reliability.retrieval.pipeline import RetrievalPipeline
+from .reliability.grounding.context_builder import ContextBuilder
+from .reliability.guards.validator import Validator
+from .reliability.guards.consensus import run_consensus
 
 
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None):
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -112,16 +119,37 @@ class OllamaTurboClient:
         self.warm_models: bool = os.getenv('WARM_MODELS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
         self.ollama_keep_alive_raw: Optional[str] = os.getenv('OLLAMA_KEEP_ALIVE')
         self._current_idempotency_key: Optional[str] = None
-        
+        # Tool results return format (for future API use). Default preserves v1 behavior (strings)
+        trf = (os.getenv('TOOL_RESULTS_FORMAT') or 'string').strip().lower()
+        self.tool_results_format: str = 'object' if trf == 'object' else 'string'
+        # Reliability mode configuration (no-op placeholders until wired)
+        self.engine: Optional[str] = engine
+        self.reliability = {
+            'ground': bool(ground),
+            'k': k,
+            'cite': bool(cite),
+            'check': check if check in {'off', 'warn', 'enforce'} else 'off',
+            'consensus': bool(consensus),
+            'eval_corpus': eval_corpus,
+        }
+        # Reliability runtime state
+        self._last_context_blocks: List[Dict[str, Any]] = []
+        self._last_citations_map: Dict[str, Any] = {}
+        self._system_cited_cache: Optional[str] = None
+
         # Initialize Ollama client with authentication
         # Note: Ollama Turbo uses Authorization header without 'Bearer' prefix
+        resolved_host = self._resolve_host(self.engine)
+        self.host = resolved_host
         self.client = Client(
-            host='https://ollama.com',
+            host=resolved_host,
             headers={'Authorization': api_key}
         )
         
         # Prompt management
         self.prompt = PromptManager(self.reasoning)
+        # Harmony parsing/markup processing
+        self.harmony = HarmonyProcessor()
         # Initialize conversation history with a system directive
         self.conversation_history = [
             {
@@ -149,10 +177,10 @@ class OllamaTurboClient:
         # Initialize Mem0 memory system (optional)
         self._init_mem0()
 
-        self.logger.info(f"Initialized client with model: {model}, tools enabled: {enable_tools}, reasoning={self.reasoning}, quiet={self.quiet}")
+        self.logger.info(f"Initialized client with model: {model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, quiet={self.quiet}")
         # Initial trace state
         if self.show_trace:
-            self.trace.append(f"client:init model={model} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} quiet={'on' if self.quiet else 'off'}")
+            self.trace.append(f"client:init model={model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} quiet={'on' if self.quiet else 'off'}")
 
     def _trace(self, event: str):
         """Record a structured, non-sensitive trace event."""
@@ -194,6 +222,15 @@ class OllamaTurboClient:
         })
         # Track last user message for Mem0 capture
         self._last_user_message = message
+        # Reliability: clear per-request state to avoid cross-call bleed
+        self._last_context_blocks = []
+        self._last_citations_map = {}
+        # Reliability: optional retrieval/grounding/citation system additions
+        if self.reliability.get('ground'):
+            try:
+                self._prepare_reliability_context(message)
+            except Exception as e:
+                self.logger.debug(f"reliability:context skipped: {e}")
         
         # Trim history if needed
         self._trim_history()
@@ -269,6 +306,12 @@ class OllamaTurboClient:
                 # Harmony adapter: if provider didn't canonicalize tool calls, parse from content
                 if self.enable_tools and not tool_calls and content:
                     cleaned, parsed_calls, final_seg = self._parse_harmony_tokens(content)
+                    # Capture analysis content into trace (if present)
+                    try:
+                        if getattr(self.harmony, 'last_analysis', None):
+                            self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                    except Exception:
+                        pass
                     if parsed_calls:
                         tool_calls = parsed_calls
                         content = cleaned  # remove tool-call markup from assistant content
@@ -289,13 +332,16 @@ class OllamaTurboClient:
 
                     # Execute tools
                     tool_results = self._execute_tool_calls(tool_calls)
-                    self._trace(f"tools:executed {len(tool_results)}")
-                    all_tool_results.extend(tool_results)
+                    self._last_tool_results_structured = tool_results  # for future API
+                    tool_strings = [self._serialize_tool_result_to_string(tr) for tr in tool_results]
+                    self._last_tool_results_strings = tool_strings
+                    self._trace(f"tools:executed {len(tool_strings)}")
+                    all_tool_results.extend(tool_strings)
 
                     # Add tool results to history
                     self.conversation_history.append({
                         'role': 'tool',
-                        'content': '\n'.join(tool_results)
+                        'content': '\n'.join(tool_strings)
                     })
 
                     # Reprompt model using details
@@ -314,11 +360,63 @@ class OllamaTurboClient:
                     try:
                         if content:
                             cleaned, _, final_seg = self._parse_harmony_tokens(content)
+                            # Trace analysis if available
+                            try:
+                                if getattr(self.harmony, 'last_analysis', None):
+                                    self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                            except Exception:
+                                pass
                             final_out = final_seg or cleaned
                             if not final_out:
                                 final_out = self._strip_harmony_markup(content)
                     except Exception:
                         final_out = self._strip_harmony_markup(content)
+
+                    # Reliability integrations (non-streaming): consensus and validator
+                    try:
+                        # Skip consensus if tools were involved to avoid voting on a different path
+                        tools_used_this_turn = bool(all_tool_results)
+                        if (not tools_used_this_turn) and self.reliability.get('consensus') and isinstance(self.reliability.get('k'), int) and (self.reliability.get('k') or 0) > 1:
+                            def _gen_once():
+                                kwargs2 = {
+                                    'model': self.model,
+                                    'messages': self.conversation_history,
+                                }
+                                options2: Dict[str, Any] = {}
+                                if self.max_output_tokens is not None:
+                                    options2['num_predict'] = self.max_output_tokens
+                                if self.ctx_size is not None:
+                                    options2['num_ctx'] = self.ctx_size
+                                # Deterministic settings for consensus runs
+                                options2['temperature'] = 0
+                                options2['top_p'] = 0
+                                if options2:
+                                    kwargs2['options'] = options2
+                                keep_val2 = self._resolve_keep_alive()
+                                if keep_val2 is not None:
+                                    kwargs2['keep_alive'] = keep_val2
+                                # Do not include tools for consensus finalization
+                                resp2 = self.client.chat(**kwargs2)
+                                msg2 = resp2.get('message', {})
+                                cont2 = msg2.get('content', '') or ''
+                                try:
+                                    cleaned2, _, final2 = self._parse_harmony_tokens(cont2)
+                                    return (final2 or cleaned2 or self._strip_harmony_markup(cont2)) or ""
+                                except Exception:
+                                    return self._strip_harmony_markup(cont2)
+                            cns = run_consensus(_gen_once, k=int(self.reliability.get('k') or 1))
+                            if cns.get('final'):
+                                final_out = cns['final']
+                            self._trace(f"consensus:agree_rate={cns.get('agree_rate')}")
+                    except Exception as ce:
+                        self.logger.debug(f"consensus skipped: {ce}")
+
+                    try:
+                        if (self.reliability.get('check') or 'off') != 'off':
+                            report = Validator(mode=str(self.reliability.get('check'))).validate(final_out, getattr(self, '_last_context_blocks', []))
+                            self._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
+                    except Exception as ve:
+                        self.logger.debug(f"validator skipped: {ve}")
 
                     self.conversation_history.append({
                         'role': 'assistant',
@@ -482,6 +580,12 @@ class OllamaTurboClient:
                 if not tool_calls and include_tools and round_content:
                     try:
                         cleaned, parsed_calls, _ = self._parse_harmony_tokens(round_content)
+                        # Trace analysis if available
+                        try:
+                            if getattr(self.harmony, 'last_analysis', None):
+                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                        except Exception:
+                            pass
                         if parsed_calls:
                             tool_calls = parsed_calls
                             round_content = cleaned
@@ -502,12 +606,15 @@ class OllamaTurboClient:
                     })
                     # Execute tools
                     tool_results = self._execute_tool_calls(tool_calls)
-                    self._trace(f"tools:executed {len(tool_results)}")
-                    aggregated_results.extend(tool_results)
+                    self._last_tool_results_structured = tool_results  # for future API
+                    tool_strings = [self._serialize_tool_result_to_string(tr) for tr in tool_results]
+                    self._last_tool_results_strings = tool_strings
+                    self._trace(f"tools:executed {len(tool_strings)}")
+                    aggregated_results.extend(tool_strings)
                     # Add tool message
                     self.conversation_history.append({
                         'role': 'tool',
-                        'content': '\n'.join(tool_results)
+                        'content': '\n'.join(tool_strings)
                     })
                     # Reprompt model to synthesize an answer using tool details
                     self._trace("reprompt:after-tools")
@@ -527,11 +634,59 @@ class OllamaTurboClient:
                 try:
                     if round_content:
                         cleaned, _, final_seg = self._parse_harmony_tokens(round_content)
+                        # Trace analysis if available
+                        try:
+                            if getattr(self.harmony, 'last_analysis', None):
+                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                        except Exception:
+                            pass
                         final_out = final_seg or cleaned
                         if not final_out:
                             final_out = self._strip_harmony_markup(round_content)
                 except Exception:
                     final_out = self._strip_harmony_markup(round_content)
+
+                # Reliability integrations (streaming): trace consensus and validator without altering streamed text
+                try:
+                    # Skip consensus if tools were involved during streaming rounds
+                    tools_used_stream = bool(aggregated_results)
+                    if (not tools_used_stream) and self.reliability.get('consensus') and isinstance(self.reliability.get('k'), int) and (self.reliability.get('k') or 0) > 1:
+                        def _gen_once_stream():
+                            kwargs2 = {
+                                'model': self.model,
+                                'messages': self.conversation_history,
+                            }
+                            options2: Dict[str, Any] = {}
+                            if self.max_output_tokens is not None:
+                                options2['num_predict'] = self.max_output_tokens
+                            if self.ctx_size is not None:
+                                options2['num_ctx'] = self.ctx_size
+                            # Deterministic settings for consensus runs
+                            options2['temperature'] = 0
+                            options2['top_p'] = 0
+                            if options2:
+                                kwargs2['options'] = options2
+                            keep_val2 = self._resolve_keep_alive()
+                            if keep_val2 is not None:
+                                kwargs2['keep_alive'] = keep_val2
+                            resp2 = self.client.chat(**kwargs2)
+                            msg2 = resp2.get('message', {})
+                            cont2 = msg2.get('content', '') or ''
+                            try:
+                                cleaned2, _, final2 = self._parse_harmony_tokens(cont2)
+                                return (final2 or cleaned2 or self._strip_harmony_markup(cont2)) or ""
+                            except Exception:
+                                return self._strip_harmony_markup(cont2)
+                        cns = run_consensus(_gen_once_stream, k=int(self.reliability.get('k') or 1))
+                        self._trace(f"consensus:agree_rate={cns.get('agree_rate')}")
+                except Exception as ce:
+                    self.logger.debug(f"consensus skipped: {ce}")
+                try:
+                    if (self.reliability.get('check') or 'off') != 'off':
+                        report = Validator(mode=str(self.reliability.get('check'))).validate(final_out, getattr(self, '_last_context_blocks', []))
+                        self._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
+                except Exception as ve:
+                    self.logger.debug(f"validator skipped: {ve}")
 
                 self.conversation_history.append({
                     'role': 'assistant',
@@ -575,15 +730,7 @@ class OllamaTurboClient:
         This strips tokens like <|channel|>commentary, <|channel|>final, <|message|>, <|call|>, <|end|>.
         """
         try:
-            if not text:
-                return text
-            # Remove channel headers (commentary/final) and inline markers
-            t = re.sub(r"<\|channel\|>\s*commentary[^\n<]*", "", text, flags=re.IGNORECASE)
-            t = re.sub(r"<\|channel\|>\s*final[^\n<]*", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|message\|>", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|call\|>", "", t, flags=re.IGNORECASE)
-            t = re.sub(r"<\|end\|>", "", t, flags=re.IGNORECASE)
-            return t
+            return self.harmony.strip_markup(text)
         except Exception:
             return text
 
@@ -595,49 +742,7 @@ class OllamaTurboClient:
         - tool_calls: list of OpenAI-style tool_call dicts
         - final_text: last final-channel message content if present
         """
-        tool_calls: List[Dict[str, Any]] = []
-        final_text: Optional[str] = None
-        if not text:
-            return text, tool_calls, final_text
-
-        # Match commentary tool calls like:
-        # <|channel|>commentary to=functions.web_fetch ... <|message|>{json}<|call|>
-        tc_re = re.compile(
-            r"<\|channel\|>\s*commentary\b.*?to=functions\.([a-zA-Z0-9_]+).*?<\|message\|>(?P<json>\{.*?\})\s*<\|call\|>",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        def _tc_repl(m: re.Match) -> str:
-            name = m.group(1)
-            arg_text = m.group('json') if 'json' in m.groupdict() else '{}'
-            args: Dict[str, Any]
-            try:
-                args = json.loads(arg_text)
-                if not isinstance(args, dict):
-                    args = {}
-            except Exception:
-                args = {}
-            tool_calls.append({
-                'type': 'function',
-                'id': f"call_h_{len(tool_calls)+1}",
-                'function': {
-                    'name': name,
-                    'arguments': args,
-                }
-            })
-            return ""  # remove this segment from cleaned text
-
-        cleaned = tc_re.sub(_tc_repl, text)
-
-        # Extract final channel content (use the last occurrence if multiple)
-        final_re = re.compile(r"<\|channel\|>\s*final\b.*?<\|message\|>(?P<msg>.*?)(?:<\|end\|>|$)", re.IGNORECASE | re.DOTALL)
-        for m in final_re.finditer(cleaned):
-            final_text = m.group('msg')
-
-        # Remove any remaining markup tokens
-        cleaned = self._strip_harmony_markup(cleaned)
-
-        return cleaned, tool_calls, final_text
+        return self.harmony.parse_tokens(text)
 
     # ------------------ Internal helpers ------------------
     def _set_idempotency_key(self, key: Optional[str]) -> None:
@@ -668,6 +773,37 @@ class OllamaTurboClient:
         except Exception:
             pass
 
+    def _resolve_host(self, engine: Optional[str]) -> str:
+        """Resolve the Ollama host to use based on engine flag or env.
+
+        Priority:
+        1) Explicit --engine flag
+           - 'cloud' -> https://ollama.com
+           - 'local' -> http://localhost:11434
+           - Full URL (http/https) -> use as-is
+           - Bare hostname -> prefix with https://
+        2) OLLAMA_HOST env var
+        3) Default https://ollama.com
+        """
+        try:
+            if engine:
+                e = engine.strip()
+                el = e.lower()
+                if el in {"cloud", "default"}:
+                    return "https://ollama.com"
+                if el == "local":
+                    return "http://localhost:11434"
+                if e.startswith("http://") or e.startswith("https://"):
+                    return e
+                # Fallback: treat as hostname
+                return f"https://{e}"
+            host = os.getenv('OLLAMA_HOST')
+            if host and str(host).strip() != "":
+                return str(host).strip()
+            return "https://ollama.com"
+        except Exception:
+            return "https://ollama.com"
+
     def _resolve_keep_alive(self) -> Optional[Union[float, str]]:
         """Resolve a valid keep_alive value or None.
         Accepts env `OLLAMA_KEEP_ALIVE` as:
@@ -697,108 +833,155 @@ class OllamaTurboClient:
         except Exception:
             return '10m'
     
-    def _execute_tool_calls(self, tool_calls: List[Dict]) -> List[str]:
+    def _execute_tool_calls(self, tool_calls: List[Dict]) -> List[Dict[str, Any]]:
         """Execute tool calls and return results.
         
         Args:
-            tool_calls: List of tool call dictionaries
-            
+            tool_calls: List of tool call dictionaries with function name and arguments.
         Returns:
-            List of tool execution results
+            List of structured tool results objects with shape:
+            { tool: str, status: 'ok'|'error', content: Any|None, metadata: dict, error: Optional[...]}.
         """
-        tool_results = []
-        injected_chunks = []
-         
-        for i, tool_call in enumerate(tool_calls, 1):
-            function_name = tool_call.get('function', {}).get('name')
-            function_args = tool_call.get('function', {}).get('arguments', {})
-            
-            # Handle arguments that might be JSON strings
-            if isinstance(function_args, str):
-                try:
-                    function_args = json.loads(function_args)
-                except json.JSONDecodeError:
+        tool_results: List[Dict[str, Any]] = []
+        injected_chunks: List[str] = []
+        try:
+            for i, tc in enumerate(tool_calls, 1):
+                function = tc.get('function', {})
+                function_name = function.get('name')
+                function_args = function.get('arguments', {})
+                if not isinstance(function_args, dict):
                     function_args = {}
-            
-            if not self.show_trace and not self.quiet:
-                print(f"   {i}. Executing {function_name}({', '.join(f'{k}={v}' for k, v in function_args.items())})")
-            self._trace(f"tool:exec {function_name}")
-            
-            if function_name in self.tool_functions:
-                try:
-                    # Confirm execute_shell in TTY if required
-                    if function_name == 'execute_shell':
-                        need_confirm = (os.getenv('SHELL_TOOL_CONFIRM', '1') in {'1', 'true', 'True'}) and sys.stdin.isatty()
-                        if need_confirm:
-                            preview_args = {k: v for k, v in function_args.items() if k in ('command', 'working_dir', 'timeout')}
-                            preview = json.dumps(preview_args)
-                            print(f"   ⚠️ execute_shell preview: {preview}")
-                            ans = input("   Proceed? [y/N]: ").strip().lower()
-                            if ans not in {'y', 'yes'}:
-                                aborted = f"Execution aborted by user for execute_shell({truncate_text(preview, 120)})"
-                                tool_results.append(aborted)
-                                injected_chunks.append("execute_shell: aborted by user")
-                                self._skip_mem0_after_turn = True
-                                continue
-
-                    result = self.tool_functions[function_name](**function_args)
-                    # Try parse JSON contracts from secure tools
-                    injected = None
-                    sensitive = False
-                    log_path = None
+                if not function_name:
+                    tool_results.append({
+                        'tool': 'unknown',
+                        'status': 'error',
+                        'content': None,
+                        'metadata': {'index': i},
+                        'error': {'code': 'invalid_call', 'message': 'Missing function name'}
+                    })
+                    continue
+                if not self.quiet:
+                    print(f"   {i}. Executing {function_name}({', '.join(f'{k}={v}' for k, v in function_args.items())})")
+                self._trace(f"tool:exec {function_name}")
+                
+                if function_name in self.tool_functions:
                     try:
-                        parsed = json.loads(result)
-                        injected = parsed.get('inject') if isinstance(parsed, dict) else None
-                        sensitive = bool(parsed.get('sensitive')) if isinstance(parsed, dict) else False
-                        log_path = parsed.get('log_path') if isinstance(parsed, dict) else None
-                    except Exception:
-                        parsed = None
+                        # Confirm execute_shell in TTY if required
+                        if function_name == 'execute_shell':
+                            preview = function_args.get('command') or ''
+                            if os.getenv('CONFIRM_EXECUTE_SHELL', '1').strip().lower() not in {'0', 'false', 'no', 'off'} and sys.stdin.isatty():
+                                print(f"   ⚠️ execute_shell preview: {preview}")
+                                ans = input("   Proceed? [y/N]: ").strip().lower()
+                                if ans not in {'y', 'yes'}:
+                                    aborted_msg = f"Execution aborted by user for execute_shell({truncate_text(preview, 120)})"
+                                    tool_results.append({
+                                        'tool': function_name,
+                                        'status': 'error',
+                                        'content': None,
+                                        'metadata': {'aborted': True, 'preview': truncate_text(preview, 120)},
+                                        'error': {'code': 'aborted', 'message': aborted_msg}
+                                    })
+                                    injected_chunks.append("execute_shell: aborted by user")
+                                    self._skip_mem0_after_turn = True
+                                    continue
 
-                    # Telemetry
-                    try:
-                        if function_name in {'execute_shell', 'web_fetch'} and isinstance(parsed, dict):
-                            if function_name == 'execute_shell':
-                                self.logger.debug(f"tool:execute_shell status ok={parsed.get('ok')} exit={parsed.get('exit_code')} log={parsed.get('log_path')}")
+                        result = self.tool_functions[function_name](**function_args)
+                        # Try parse JSON contracts from secure tools
+                        injected = None
+                        sensitive = False
+                        log_path = None
+                        try:
+                            if isinstance(result, str):
+                                parsed = json.loads(result)
                             else:
-                                net = parsed.get('net') or {}
-                                self.logger.debug(f"tool:web_fetch status={net.get('status')} bytes={net.get('bytes')} cached={net.get('cached')} redirects={net.get('redirects')}")
-                    except Exception:
-                        pass
+                                parsed = result  # may already be dict
+                            if isinstance(parsed, dict):
+                                injected = parsed.get('inject')
+                                sensitive = bool(parsed.get('sensitive'))
+                                log_path = parsed.get('log_path')
+                        except Exception:
+                            pass
 
-                    # Determine injection chunk
-                    display = result if injected is None else injected
-                    if len(display) > self.tool_context_cap:
-                        display = truncate_text(display, self.tool_context_cap)
-                        if log_path:
-                            display += f"\n[truncated; full logs stored at {log_path} (not shared with the model)]"
+                        # Determine injection chunk
+                        display = result if injected is None else injected
+                        if len(display) > self.tool_context_cap:
+                            display = truncate_text(display, self.tool_context_cap)
+                            if log_path:
+                                display += f"\n[truncated; full logs stored at {log_path} (not shared with the model)]"
 
-                    tool_results.append(result)
-                    injected_chunks.append(display)
-                    if sensitive or function_name == 'execute_shell' or len(display) > self.tool_context_cap:
-                        self._skip_mem0_after_turn = True
-                    if not self.show_trace and not self.quiet:
-                        print(f"      ✅ Result: {truncate_text(display, self.tool_print_limit)}")
-                    self._trace(f"tool:ok {function_name}")
-                except Exception as e:
-                    error_result = f"Error executing {function_name}: {str(e)}"
-                    tool_results.append(error_result)
-                    injected_chunks.append(error_result)
-                    if not self.show_trace and not self.quiet:
-                        print(f"      ❌ {error_result}")
-                    self._trace(f"tool:error {function_name}")
+                        if sensitive or function_name == 'execute_shell' or len(display) > self.tool_context_cap:
+                            self._skip_mem0_after_turn = True
+                        if not self.show_trace and not self.quiet:
+                            print(f"      ✅ Result: {truncate_text(display, self.tool_print_limit)}")
+                        self._trace(f"tool:ok {function_name}")
+                        structured: Dict[str, Any] = {
+                            'tool': function_name,
+                            'status': 'ok',
+                            'content': display,
+                            'metadata': {
+                                'args': function_args,
+                                **({'log_path': log_path} if log_path else {})
+                            },
+                            'error': None
+                        }
+                        tool_results.append(structured)
+                        injected_chunks.append(str(display))
+                    except Exception as e:
+                        error_result = f"Error executing {function_name}: {str(e)}"
+                        tool_results.append({
+                            'tool': function_name,
+                            'status': 'error',
+                            'content': None,
+                            'metadata': {'args': function_args},
+                            'error': {'code': 'execution_error', 'message': error_result}
+                        })
+                        injected_chunks.append(error_result)
+                        self._trace(f"tool:error {function_name}")
+                else:
+                    tool_results.append({
+                        'tool': function_name or 'unknown',
+                        'status': 'error',
+                        'content': None,
+                        'metadata': {},
+                        'error': {'code': 'unknown_tool', 'message': f"Unknown tool: {function_name}"}
+                    })
+                    injected_chunks.append(f"Unknown tool: {function_name}")
+ 
+            return tool_results
+        except Exception as e:
+            self._trace(f"tools:failed {type(e).__name__}")
+            return [{
+                'tool': 'tools_batch',
+                'status': 'error',
+                'content': None,
+                'metadata': {},
+                'error': {'code': 'batch_failure', 'message': f"Tools execution failed: {str(e)}"}
+            }]
+    
+    def _serialize_tool_result_to_string(self, tr: Dict[str, Any]) -> str:
+        """Serialize a structured tool result to a safe string for model context/CLI output.
+        
+        Default v1 behavior remains string output; this function centralizes the representation.
+        """
+        try:
+            tool = tr.get('tool', 'tool')
+            status = tr.get('status', 'ok')
+            content = tr.get('content')
+            if status == 'error' and tr.get('error'):
+                err = tr.get('error') or {}
+                msg = err.get('message') or 'error'
+                return f"{tool}: ERROR - {msg}"
+            # content may be non-string JSON; stringify safely
+            if isinstance(content, (dict, list)):
+                try:
+                    content_str = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content_str = str(content)
             else:
-                error_result = f"Unknown tool: {function_name}"
-                tool_results.append(error_result)
-                injected_chunks.append(error_result)
-                if not self.show_trace and not self.quiet:
-                    print(f"      ❌ {error_result}")
-                self._trace(f"tool:unknown {function_name}")
-         
-        # Replace tool injection content with compact, capped summaries
-        if injected_chunks:
-            # Overwrite the last tool message content in caller using this list rather than tool_results
-            pass
-        return injected_chunks or tool_results
+                content_str = str(content) if content is not None else ''
+            return f"{tool}: {content_str}"
+        except Exception:
+            return "tool: (unserializable result)"
     
     def _trim_history(self):
         """Trim conversation history while preserving key system blocks.
@@ -867,6 +1050,58 @@ class OllamaTurboClient:
         """
         return format_conversation_history(self.conversation_history)
     
+    # ------------------ Reliability integration helpers ------------------
+    def _load_system_cited(self) -> str:
+        try:
+            if getattr(self, '_system_cited_cache', None):
+                return self._system_cited_cache or ""
+            base = os.path.dirname(__file__)
+            path = os.path.join(base, 'reliability', 'prompts', 'system_cited.md')
+            text = ""
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except Exception:
+                text = "When citing sources, include inline citations like [1], [2] mapped to provided context."
+            self._system_cited_cache = text
+            return text
+        except Exception:
+            return ""
+
+    def _prepare_reliability_context(self, user_message: str) -> None:
+        """Optionally run retrieval + grounding and inject a system addition for this turn."""
+        try:
+            rp = RetrievalPipeline()
+            try:
+                topk = int(self.reliability.get('k') or int(os.getenv('RAG_TOPK', '5') or '5'))
+            except Exception:
+                topk = 5
+            docs = rp.run(user_message, k=topk)
+            cb = ContextBuilder()
+            try:
+                max_tokens = int(os.getenv('RAG_MAX_TOKENS', '1200') or '1200')
+            except Exception:
+                max_tokens = 1200
+            ctx = cb.build(self.conversation_history, docs, max_tokens=max_tokens)
+            self._last_context_blocks = ctx.get('context_blocks') or []
+            self._last_citations_map = ctx.get('citations_map') or {}
+            system_add = ctx.get('system_prompt_addition') or ""
+            if self.reliability.get('cite'):
+                # Only add strict citation instructions if we actually have grounded context
+                if self._last_context_blocks:
+                    cited = self._load_system_cited()
+                    if cited:
+                        system_add = (system_add + "\n" + cited).strip() if system_add else cited
+                else:
+                    # Soft rule when no sources are provided
+                    soft_rule = "If no sources are provided, avoid specific figures (numbers/dates) or mark uncertainty clearly."
+                    system_add = (system_add + "\n" + soft_rule).strip() if system_add else soft_rule
+            if system_add:
+                self.conversation_history.append({'role': 'system', 'content': system_add})
+            self._trace(f"reliability:context blocks={len(self._last_context_blocks)}")
+        except Exception as e:
+            self.logger.debug(f"reliability context error: {e}")
+    
     # ------------------ Mem0 Integration ------------------
     def _init_mem0(self) -> None:
         """Initialize Mem0 client and runtime settings from environment variables if available."""
@@ -917,7 +1152,7 @@ class OllamaTurboClient:
 
             # Initialize background worker for async adds
             self._mem0_add_queue = queue.Queue(maxsize=max(1, self.mem0_add_queue_max))
-            self._mem0_worker_stop.clear()
+            self._mem0_worker_stop = threading.Event()
             self._mem0_worker = threading.Thread(target=self._mem0_worker_loop, name="mem0-add-worker", daemon=True)
             self._mem0_worker.start()
             # Ensure graceful shutdown
@@ -1290,8 +1525,6 @@ class OllamaTurboClient:
                 shown = 0
                 for i, it in enumerate(items, 1):
                     mem_text = it.get('memory') or (it.get('data') or {}).get('memory')
-                    if query and mem_text and query.lower() not in mem_text.lower():
-                        continue
                     print(f"  {i}. {it.get('id')}: {truncate_text(mem_text or '', 200)}")
                     shown += 1
                 if shown == 0:

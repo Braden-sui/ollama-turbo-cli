@@ -3,6 +3,7 @@ import pytest
 import types
 
 from src.client import OllamaTurboClient
+from src.harmony_processor import HarmonyProcessor
 
 
 @pytest.fixture(autouse=True)
@@ -110,3 +111,63 @@ def test_streaming_chat_harmony_tool_call_and_final_channel(monkeypatch):
 
     out = client.chat('Use web', stream=True)
     assert 'Final streaming' in out
+
+
+# ---------- Analysis channel handling ----------
+def test_harmony_processor_captures_analysis_and_removes_from_cleaned():
+    hp = HarmonyProcessor()
+    text = (
+        "<|channel|>analysis\n<|message|>Internal reasoning XYZ<|end|>\n"
+        "<|channel|>final\n<|message|>Visible answer<|end|>"
+    )
+    cleaned, tool_calls, final_text = hp.parse_tokens(text)
+    assert tool_calls == []
+    assert final_text == "Visible answer"
+    # Captured for tracing, not leaked in cleaned text
+    assert getattr(hp, 'last_analysis', None) is not None
+    assert "Internal reasoning XYZ" in hp.last_analysis
+    assert "Internal reasoning XYZ" not in cleaned
+
+
+class DummyClientWithAnalysis:
+    def __init__(self):
+        self.calls = []
+        self._step = 0
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._step == 0:
+            self._step += 1
+            # Include analysis + a harmony commentary tool call
+            content = (
+                "<|channel|>analysis\n<|message|>THINKING-SECRET 123<|end|>\n"
+                "<|channel|>commentary to=functions.web_fetch\n"
+                "<|message|>{\"url\": \"https://example.com\"}<|call|>"
+            )
+            return {"message": {"content": content}}
+        # Second step: final with another analysis block up front
+        return {
+            "message": {
+                "content": (
+                    "<|channel|>analysis\n<|message|>ANOTHER SECRET STEP<|end|>\n"
+                    "<|channel|>final\n<|message|>Answer only<|end|>"
+                )
+            }
+        }
+
+
+def test_non_streaming_chat_does_not_leak_analysis(monkeypatch):
+    client = OllamaTurboClient(api_key='test', enable_tools=True, quiet=True)
+    dummy = DummyClientWithAnalysis()
+    client.client = dummy
+
+    def fake_web_fetch(**kwargs):
+        return json.dumps({
+            'tool': 'web_fetch', 'ok': True,
+            'inject': 'ok', 'sensitive': False
+        })
+    client.tool_functions['web_fetch'] = fake_web_fetch
+
+    out = client.chat('Use web', stream=False)
+    assert 'Answer only' in out
+    assert 'THINKING-SECRET' not in out
+    assert 'ANOTHER SECRET STEP' not in out

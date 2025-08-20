@@ -167,11 +167,42 @@ Fetch specific HTTPS URLs through an allowlist proxy with SSRF protections.
 When to use: read a specific page/API without credentials.
 Tips: prefer HTTPS, small timeouts, minimal bytes. Only compact summaries are injected and may be truncated.
 
+### ✅ Reliable Chat (Reliability API)
+
+Grounded and validated answers via the internal Reliability API. Supports non-streaming and SSE streaming with a trailing summary event.
+
+When to use: you want citations, validator checks, or consensus heuristics.
+Flags: `ground`, `k`, `cite`, `check` (`off|warn|strict`), `consensus`, `engine`, `eval_corpus`.
+
+Example (non-stream):
+
+```python
+from src import plugin_loader
+fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
+out_json = fn(message="Summarize latest Llama 3.2 results; include citations.")
+# out_json is a JSON string with keys: tool, ok, content, summary, inject
+```
+
+Example (streaming aggregation):
+
+```python
+from src import plugin_loader
+fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
+out_json = fn(message="Verify the claim and cite sources; aim for consensus, k=3.", stream=True)
+# content aggregates token stream; summary includes validator/consensus info
+```
+
+Notes:
+
+- By default, auto-heuristics infer flags from the message (citations → ground+cite, verify → check=warn, consensus → consensus+k).
+- Configure base URL via `RELIABILITY_API_BASE` (defaults to `http://127.0.0.1:8000`).
+- Requires `API_KEY` if the FastAPI server enforces it; upstream `OLLAMA_API_KEY` is forwarded when present.
+
 ### 🔬 Web Research
 
 Multi-hop web research with citations. Orchestrates Plan→Search→Fetch→Extract→Chunk→Rerank→Cite→Cache.
 
-When to use: you need up-to-date facts from multiple sources and deterministic citations. Prefer over `web_fetch` when synthesis across pages is needed.
+When to use: you need up-to-date facts from multiple sources and deterministic citations. Prefer over `web_fetch` when synthesizing across pages is needed.
 Parameters: `top_k` (breadth, default 5), `site_include`/`site_exclude` (scope), `freshness_days` (recency), `force_refresh` (bypass caches).
 Returns: compact JSON with results, quotes, page-mapped citations (for PDFs), and archive URLs.
 
@@ -207,6 +238,75 @@ python -m src.cli --message "Explain quantum computing" --stream
 
 In streaming mode, the assistant can perform multiple tool rounds in a single turn and then synthesize a final textual answer. By default, up to 6 tool-call rounds are allowed before finalization.
 
+## HTTP API (v1)
+
+The project includes a versioned FastAPI server for programmatic access.
+
+### Start the server
+
+```bash
+uvicorn src.api.app:app --reload
+```
+
+Feature flag: set `API_ENABLED=0` to disable. If `API_KEY` is set, clients must send `X-API-Key`.
+
+### Endpoints
+
+- `GET /v1/health` — basic health
+- `GET /v1/live` — liveness probe
+- `GET /v1/ready` — readiness probe
+- `POST /v1/chat` — non-streaming chat
+- `POST /v1/chat/stream` — SSE streaming chat
+
+### Headers
+
+- `X-API-Key: <key>` — required if `API_KEY` is configured
+- `Idempotency-Key: <uuid>` — optional; reserved for future de-duplication
+
+### Request model (POST /v1/chat and /v1/chat/stream)
+
+```json
+{
+  "message": "Hello",
+  "options": {
+    "tool_results_format": "string|object"
+  }
+}
+```
+
+`tool_results_format` controls the shape of tool results in responses. Default is `string` for backward compatibility; set `TOOL_RESULTS_FORMAT=object` or pass in `options` to get structured objects.
+
+### Responses
+
+Non-streaming (`/v1/chat`):
+
+```json
+{
+  "content": "Hello there!",
+  "tool_results": [
+    "calc: 42"
+  ]
+}
+```
+
+With `tool_results_format=object`, `tool_results` becomes a list of objects:
+
+```json
+{
+  "content": "Hello there!",
+  "tool_results": [
+    {"tool":"calc","status":"ok","content":42,"metadata":{"args":{"x":40,"y":2}},"error":null}
+  ]
+}
+```
+
+Streaming (`/v1/chat/stream`): Server-Sent Events (SSE). Events are sent as `data: {json}` lines.
+
+- Token chunks: `{ "type": "token", "content": "..." }`
+- Final event: `{ "type": "final", "content": "...", "tool_results": [...] }`
+
+Tool-calls or stream errors are silently finalized via a non-streaming fallback, and only a final event is emitted (no tokens), matching CLI behavior.
+
 ### Web Research Example
 
 ```bash
@@ -226,6 +326,7 @@ python -m src.cli --message "Research: What are the latest results on Llama 3.2 
 - `OLLAMA_API_KEY`: Your Ollama API key
 - `OLLAMA_MODEL`: Model name (default: gpt-oss:120b)
 - `OLLAMA_HOST`: API endpoint (default: <https://ollama.com>)
+- `RELIABILITY_API_BASE`: Reliability router base URL (default: <http://127.0.0.1:8000>)
 - `MAX_CONVERSATION_HISTORY`: Maximum messages to keep (default: 10)
 - `STREAM_BY_DEFAULT`: Enable streaming by default (default: false)
 - `LOG_LEVEL`: Logging level (default: INFO)

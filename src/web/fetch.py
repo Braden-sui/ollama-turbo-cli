@@ -13,12 +13,20 @@ from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 import threading
+import ipaddress
+import fnmatch
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 from .config import WebConfig
 from .robots import RobotsPolicy
 
 
+# Note: Remote DNS semantics
+# - When a proxy is enabled and selected for a domain host, we deliberately skip local DNS
+#   to avoid leaking queries (remote DNS via proxy). IP-literals are always resolved locally
+#   and checked against private/link-local/multicast/reserved ranges to enforce SSRF policy.
+# - With HTTP(S) proxies, any peer IP obtained post-connect is the proxy's IP, not the origin.
+#   Do not treat it as origin verification.
 @dataclass
 class FetchResult:
     ok: bool
@@ -66,16 +74,17 @@ def _host_allowed(cfg: WebConfig, host: str) -> bool:
     allow = os.getenv('SANDBOX_NET_ALLOW', cfg.sandbox_allow or '')
     if not allow:
         return True  # if no allowlist defined, default allow
-    patterns = [x.strip() for x in allow.split(',') if x.strip()]
-    for pat in patterns:
-        if re.fullmatch(pat.replace('*', '.*'), host):
+    for pat in (p.strip() for p in allow.split(',') if p.strip()):
+        if fnmatch.fnmatch(host or '', pat):
             return True
     return False
 
 
 def _check_ip_blocks(host: str) -> None:
     import socket, ipaddress
-    infos = socket.getaddrinfo(host, None)
+    # Strip brackets for IPv6 literals like "[::1]" to keep getaddrinfo happy
+    raw = (host or '').strip('[]')
+    infos = socket.getaddrinfo(raw, None)
     for info in infos:
         ip = info[4][0]
         ip_obj = ipaddress.ip_address(ip)
@@ -91,11 +100,65 @@ def _cache_paths(cfg: WebConfig, url: str) -> Tuple[str, str]:
     return os.path.join(cfg.cache_root, f"{key}.bin"), os.path.join(cfg.cache_root, f"{key}.json")
 
 
+def _idna_ascii(host: str) -> str:
+    try:
+        return host.encode('idna').decode('ascii') if host else host
+    except Exception:
+        return host
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ip = (host or '').strip('[]')
+        ipaddress.ip_address(ip)
+        return True
+    except Exception:
+        return False
+
+
+def _bypass_proxy(host: str, no_proxy: str) -> bool:
+    try:
+        h = host or ''
+        patterns = [p.strip() for p in (no_proxy or '').split(',') if p.strip()]
+        for pat in patterns:
+            if pat.startswith('.'):
+                if h.endswith(pat) or h == pat.lstrip('.'):
+                    return True
+            else:
+                if fnmatch.fnmatch(h, pat):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _env_proxy_for_scheme(scheme: str) -> Optional[str]:
+    keys = [
+        f"{scheme.upper()}_PROXY",
+        f"{scheme.lower()}_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return None
+
+
 def _httpx_client(cfg: WebConfig):
     import httpx  # type: ignore
     timeout = httpx.Timeout(connect=cfg.timeout_connect, read=cfg.timeout_read, write=cfg.timeout_write)
     limits = httpx.Limits(max_connections=cfg.max_connections, max_keepalive_connections=cfg.max_keepalive)
-    return httpx.Client(http2=True, timeout=timeout, limits=limits, headers={"User-Agent": cfg.user_agent}, follow_redirects=cfg.follow_redirects)
+    # Disable environment proxies unless explicitly allowed via SANDBOX_ALLOW_PROXIES
+    return httpx.Client(
+        http2=True,
+        timeout=timeout,
+        limits=limits,
+        headers={"User-Agent": cfg.user_agent},
+        follow_redirects=cfg.follow_redirects,
+        trust_env=bool(cfg.sandbox_allow_proxies),
+    )
 
 
 # Small LRU pool of httpx.Clients keyed by origin
@@ -228,10 +291,28 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
     parsed = urlparse(url)
     if parsed.scheme == 'http' and not cfg.sandbox_allow_http:
         return FetchResult(False, 0, url, url, {}, '', 0, None, None, False, False, reason='HTTP blocked by policy')
-    if not _host_allowed(cfg, parsed.hostname or ''):
+    # IDNA-normalize host for allowlist matching
+    if not _host_allowed(cfg, _idna_ascii(parsed.hostname or '')):
         return FetchResult(False, 0, url, url, {}, '', 0, None, None, False, False, reason=f'Host not in allowlist: {parsed.hostname}')
+    # Apply remote DNS semantics: if proxies are enabled and would be used for this host (and the host is not an IP literal),
+    # skip local DNS resolution to avoid leaks. Always resolve and check IP literals, or when not using a proxy.
     try:
-        _check_ip_blocks(parsed.hostname or '')
+        host = parsed.hostname or ''
+        a_host = _idna_ascii(host)
+        use_proxy = False
+        try:
+            if cfg.sandbox_allow_proxies:
+                proxy_url = _env_proxy_for_scheme(parsed.scheme) or _env_proxy_for_scheme('http')
+                if proxy_url:
+                    no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
+                    use_proxy = not _bypass_proxy(a_host, no_proxy)
+        except Exception:
+            use_proxy = False
+        if _is_ip_literal(a_host):
+            _check_ip_blocks(a_host)
+        else:
+            if not use_proxy:
+                _check_ip_blocks(a_host)
     except Exception as e:
         return FetchResult(False, 0, url, url, {}, '', 0, None, None, False, False, reason=str(e))
 
@@ -240,7 +321,7 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
         if not rec.allow:
             delay = rec.crawl_delay or 0
             if delay:
-                time.sleep(min(delay, 5))
+                time.sleep(min(delay, cfg.max_crawl_delay_s))
             return FetchResult(False, 0, url, url, {}, '', 0, None, None, False, False, reason='Blocked by robots.txt')
         # Enforce crawl-delay for allowed hosts as well
         host = parsed.hostname or ''
@@ -250,7 +331,7 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
                 now = time.time()
                 wait = rec.crawl_delay - (now - last)
             if wait and wait > 0:
-                time.sleep(min(wait, 5))
+                time.sleep(min(wait, cfg.max_crawl_delay_s))
             with _lf_lock:
                 _last_fetch[host] = time.time()
 
@@ -377,6 +458,32 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             raise last_exc or RuntimeError("request failed")
 
         final_url = resp_final_url
+        # Revalidate final URL host/scheme and SSRF/IP policy similar to sandbox path
+        try:
+            f_parsed = urlparse(final_url)
+            if f_parsed.scheme == 'http' and not cfg.sandbox_allow_http:
+                return FetchResult(False, int(status or 0), url, final_url, headers, content_type, len(data or b''), None, None, False, False, reason='HTTP blocked by policy')
+            # Use IDNA-normalized host for allowlist check
+            if not _host_allowed(cfg, _idna_ascii(f_parsed.hostname or '')):
+                return FetchResult(False, int(status or 0), url, final_url, headers, content_type, len(data or b''), None, None, False, False, reason=f'Final host not in allowlist: {f_parsed.hostname}')
+            # Apply remote DNS semantics for final host
+            f_host = _idna_ascii(f_parsed.hostname or '')
+            use_proxy_f = False
+            try:
+                if cfg.sandbox_allow_proxies:
+                    purl = _env_proxy_for_scheme(f_parsed.scheme) or _env_proxy_for_scheme('http')
+                    if purl:
+                        no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
+                        use_proxy_f = not _bypass_proxy(f_host, no_proxy)
+            except Exception:
+                use_proxy_f = False
+            if _is_ip_literal(f_host):
+                _check_ip_blocks(f_host)
+            else:
+                if not use_proxy_f:
+                    _check_ip_blocks(f_host)
+        except Exception as reval_err:
+            return FetchResult(False, int(status or 0), url, final_url, headers, content_type, len(data or b''), None, None, False, False, reason=str(reval_err))
         raw = data
         browser_needed = use_browser_if_needed and _should_escalate_to_browser(status, content_type, raw)
     except Exception as e:
