@@ -7,10 +7,20 @@ import argparse
 import os
 import sys
 import logging
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from the closest .env.local then .env (searching upward)
+try:
+    path_local = find_dotenv('.env.local', usecwd=True)
+    if path_local:
+        load_dotenv(path_local, override=True)
+    path_default = find_dotenv('.env', usecwd=True)
+    if path_default:
+        # Do not override values already loaded from .env.local or process env
+        load_dotenv(path_default, override=False)
+except Exception:
+    # Fail-closed if dotenv is unavailable or search fails
+    pass
 
 # Import after loading env vars to ensure proper configuration
 from .client import OllamaTurboClient

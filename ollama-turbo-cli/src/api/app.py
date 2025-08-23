@@ -5,13 +5,23 @@ import time
 import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from .router_v1 import router as router_v1
 
 
 def create_app() -> FastAPI:
-    # Ensure environment variables from .env are loaded when running the API server
-    load_dotenv()
+    # Load environment variables from the closest .env.local then .env (searching upward)
+    try:
+        path_local = find_dotenv('.env.local', usecwd=True)
+        if path_local:
+            load_dotenv(path_local, override=True)
+        path_default = find_dotenv('.env', usecwd=True)
+        if path_default:
+            # Do not override values already loaded from .env.local or process env
+            load_dotenv(path_default, override=False)
+    except Exception:
+        # Fail-closed: continue without env file if lookup fails
+        pass
     app = FastAPI(title="Ollama Turbo CLI API", version="1.1.0")
 
     logger = logging.getLogger("ollama_turbo_api")
