@@ -18,6 +18,7 @@ test-results/
 
 # Project caches and artifacts
 .sandbox/
+.windsurf/
 **/target/
 
 # Local env files in subprojects (already ignored where present)
