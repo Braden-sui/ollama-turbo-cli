@@ -1,0 +1,24 @@
+# Global ignores
+.DS_Store
+Thumbs.db
+*.log
+
+# Python
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Node/JS
+node_modules/
+dist/
+build/
+coverage/
+playwright-report/
+test-results/
+
+# Project caches and artifacts
+.sandbox/
+**/target/
+
+# Local env files in subprojects (already ignored where present)
+# agent-desk-pro/.env.local is ignored by its own .gitignore
