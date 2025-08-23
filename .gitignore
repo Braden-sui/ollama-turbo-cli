@@ -23,3 +23,12 @@ test-results/
 
 # Local env files in subprojects (already ignored where present)
 # agent-desk-pro/.env.local is ignored by its own .gitignore
+
+# Root environment files (do not commit secrets)
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+!.env.example
