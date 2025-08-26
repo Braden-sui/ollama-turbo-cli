@@ -65,23 +65,65 @@ class HarmonyProcessor:
         if not text:
             return text, tool_calls, final_text
 
-        # Match commentary tool calls like:
-        # <|channel|>commentary to=functions.web_fetch ... <|message|>{json}<|call|>
+        # More permissive matcher for commentary tool calls. Capture fname and the opening brace.
+        # Examples accepted:
+        #   to=functions.web_search
+        #   to=functions.web.run.search_query
+        #   to=web-search
         tc_re = re.compile(
-            r"<\|channel\|>\s*commentary\b.*?to=functions\.([a-zA-Z0-9_]+).*?<\|message\|>(?P<json>\{.*?\})\s*<\|call\|>",
+            r"<\|channel\|>\s*commentary\b[^<]*?to=(?:functions\.)?(?P<fname>[a-zA-Z0-9_.:-]+)[^<]*?<\|message\|>(?P<json>\{)",
             flags=re.IGNORECASE | re.DOTALL,
         )
 
-        def _tc_repl(m: re.Match) -> str:
-            name = m.group(1)
-            arg_text = m.group('json') if 'json' in m.groupdict() else '{}'
-            args: Dict[str, Any]
-            try:
-                args = json.loads(arg_text)
-                if not isinstance(args, dict):
+        def _extract_balanced_json(s: str, start_idx: int) -> Tuple[Optional[str], int]:
+            depth = 0
+            i = start_idx
+            in_str = False
+            esc = False
+            while i < len(s):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == '\\':
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return s[start_idx:i+1], i + 1
+                i += 1
+            return None, start_idx
+
+        # Manually scan and remove matched commentary tool segments while extracting JSON args
+        cleaned_parts: List[str] = []
+        idx = 0
+        for m in tc_re.finditer(text):
+            # Append any literal text before the match
+            cleaned_parts.append(text[idx:m.start()])
+            name = m.group('fname')
+            json_start = m.start('json')
+            json_blob, after = _extract_balanced_json(text, json_start)
+            args: Dict[str, Any] = {}
+            if json_blob:
+                try:
+                    parsed = json.loads(json_blob)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except Exception:
                     args = {}
-            except Exception:
-                args = {}
+            # Consume an optional trailing <|call|> after the JSON
+            end_pos = after
+            call_m = re.match(r"\s*<\|call\|>", text[after:], flags=re.IGNORECASE)
+            if call_m:
+                end_pos = after + call_m.end()
+            # Record tool call
             tool_calls.append({
                 'type': 'function',
                 'id': f"call_h_{len(tool_calls)+1}",
@@ -90,9 +132,11 @@ class HarmonyProcessor:
                     'arguments': args,
                 }
             })
-            return ""  # remove this segment from cleaned text
-
-        cleaned = tc_re.sub(_tc_repl, text)
+            # Skip the entire matched commentary segment
+            idx = end_pos
+        # Append the remainder and join all pieces
+        cleaned_parts.append(text[idx:])
+        cleaned = ''.join(cleaned_parts)
 
         # Extract and remove analysis channel content (accumulate all segments)
         analysis_segments: List[str] = []

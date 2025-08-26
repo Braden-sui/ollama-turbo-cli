@@ -17,102 +17,49 @@ from . import plugin_loader
 class PromptManager:
     """Builds and returns prompt strings used across the client."""
 
-    def __init__(self, reasoning: str = "high") -> None:
-        self.reasoning = reasoning if reasoning in {"low", "medium", "high"} else "high"
-        self.version = os.getenv("PROMPT_VERSION", "v1").strip() or "v1"
+    def __init__(self, reasoning: str) -> None:
+        self.reasoning = reasoning
 
     # ---------- System / Initial Prompt ----------
     def initial_system_prompt(self) -> str:
-        """Return the initial system directive used to steer model behavior."""
-        # Sections can be toggled in the future via env flags if needed
-        parts: List[str] = []
-        parts.append(f"You are a helpful assistant with access to tools. Reasoning level: {self.reasoning}.")
-
-        parts.append(
-            "Guidelines:\n"
-            "- Analyze the user's request to determine if tools are needed\n"
-            "- For factual queries requiring current data, use appropriate tools\n"
-            "- For computational tasks, use the calculator tool\n"
-            "- Keep your thinking process internal - only show final answers\n"
-            "- When using web tools, cite sources briefly\n"
-            "- Be concise but complete in your responses"
+        import os
+        verbosity = (os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower()
+        style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
+        return (
+            "You are GPT-OSS running with Harmony channels.\n\n"
+            "— Safety/Process —\n"
+            "• Keep internal reasoning private (no chain-of-thought). Provide only final answers and short, audit-friendly summaries of steps.\n"
+            "• Cite sources briefly when using web tools.\n"
+            f"• {style_line}\n\n"
+            "— Harmony I/O Protocol —\n"
+            "• To call a tool, emit EXACTLY:\n"
+            "  <|channel|>commentary to=functions.TOOLNAME\n"
+            "  <|message|>{JSON_ARGS}<|call|>\n"
+            "• Always finish with:\n"
+            "  <|channel|>final\n"
+            "  <|message|>YOUR ANSWER HERE<|end|>\n\n"
+            "— Tool Use Policy —\n"
+            "• Prefer minimal calls that answer the question directly.\n"
+            "• Summarize tool results; avoid dumping raw blobs unless asked.\n\n"
+            "— Formatting —\n"
+            "• Use clear paragraphs or short bullets when synthesizing.\n"
         )
-
-        parts.append(
-            "Tool usage strategy:\n"
-            "- Gather necessary facts via tools before composing your answer\n"
-            "- Chain multiple tools only when each adds required information\n"
-            "- Synthesize a final textual answer after tools\n"
-            "- Avoid redundant or speculative tool calls"
-        )
-
-        if self._flag("PROMPT_INCLUDE_TOOL_GUIDE", True):
-            # Auto-generate tool guide from discovered plugins to avoid drift
-            try:
-                schemas = list(plugin_loader.TOOL_SCHEMAS)
-            except Exception:
-                schemas = []
-            lines: List[str] = [
-                "Tool selection guide (auto-generated from discovered plugins):"
-            ]
-            # Stable sort by tool name
-            try:
-                schemas.sort(key=lambda s: (s.get("function", {}) or {}).get("name", ""))
-            except Exception:
-                pass
-            for schema in schemas:
-                fn = (schema.get("function") or {})
-                name = fn.get("name")
-                desc = fn.get("description") or ""
-                if isinstance(name, str) and name:
-                    lines.append(f"- {name}: {desc}")
-            parts.append("\n".join(lines))
-
-        parts.append(
-            "Error handling:\n"
-            "- If a tool fails, acknowledge the limitation and offer alternatives\n"
-            "- Never expose technical error details to the user\n"
-            "- Suggest workarounds when appropriate"
-        )
-
-        parts.append(
-            "Conversation context:\n"
-            "- Focus on the most recent exchanges\n"
-            "- Reference earlier context only when directly relevant\n"
-            "- Maintain continuity without repeating information"
-        )
-
-        # Harmony channels and tool orchestration guidance
-        parts.append("\n".join([
-            "Harmony orchestration:",
-            "- Valid channels: analysis, commentary, final",
-            "- All tool calls must be emitted on the commentary channel using Harmony tokens",
-            "- Tool-call format (no OpenAI function_call fields):",
-            "  <|channel|>commentary to=functions.TOOL_NAME",
-            "  <|message|>{\\\"arg1\\\": \\\"value\\\", ...}<|call|>",
-            "- After tools are done, produce the user-facing answer on the final channel:",
-            "  <|channel|>final",
-            "  <|message|>Your complete answer here<|end|>",
-            "- Do not include analysis or tool schemas in the final channel output",
-        ]))
-
-        parts.append(
-            "Shell command guidelines:\n"
-            "- Only execute read-only, safe commands\n"
-            "- Never run commands that modify system state\n"
-            "- Explain what each command does before execution\n"
-            "- Prefer built-in tools over shell commands when possible"
-        )
-        if self._flag("PROMPT_FEWSHOTS", False):
-            parts.append(self.few_shots_block())
-
-        return "\n".join(parts)
 
     # ---------- Post-Tool Reprompt ----------
     def reprompt_after_tools(self) -> str:
+        import os
+        verbose = (os.getenv("PROMPT_VERBOSE_AFTER_TOOLS", "0") or "0").lower() in {"1","true","yes","on"}
+        if verbose:
+            return (
+                "Using the tool results above, produce <|channel|>final with:\n"
+                "1) What you checked (1–2 sentences)\n"
+                "2) Key findings (3–7 bullets with brief inline citations)\n"
+                "3) Direct answer\n"
+                "4) Important caveats\n"
+            )
         return (
-            "Based on the tool results above, provide a comprehensive answer to the user's original question. "
-            "Synthesize the information naturally without repeating raw tool output."
+            "Based on the tool results above, produce <|channel|>final with a clear, synthesized answer. "
+            "Summarize; avoid copying raw tool output."
         )
 
     # ---------- Mem0 Context Block ----------

@@ -72,8 +72,9 @@ def _build_docker_cmd(image: str, command: List[str], *, cwd: str, timeout_s: in
         '--pids-limit', str(int(pids_max)),
         '--cpus', str(cpus),
         '--memory', mem,
-        '--read-only',
-        # tmpfs for writable workspace
+        # Only apply read-only rootfs for non-permissive mode
+        # (when mount_project_ro == True we keep stricter settings)
+        # tmpfs provides a small writable workspace regardless
         '--tmpfs', f"/workspace:rw,size={int(disk_write_mb)}m,nosuid,nodev,noexec",
         # mount session logs dir (persisted on host)
         '-v', f"{session_dir.as_posix()}:/workspace/logs:rw",
@@ -90,10 +91,14 @@ def _build_docker_cmd(image: str, command: List[str], *, cwd: str, timeout_s: in
     for k, v in (env_allowlist or {}).items():
         docker_cmd += ['-e', f"{k}={v}"]
 
-    # Mount project read-only
+    # Mount project path: ro in secure mode, rw in permissive mode
+    project_root = Path(os.getenv('SHELL_TOOL_ROOT', os.getcwd())).resolve()
     if mount_project_ro:
-        project_root = Path(os.getenv('SHELL_TOOL_ROOT', os.getcwd())).resolve()
         docker_cmd += ['-v', f"{project_root.as_posix()}:/project:ro"]
+        # In restrictive mode, prefer read-only rootfs
+        docker_cmd += ['--read-only']
+    else:
+        docker_cmd += ['-v', f"{project_root.as_posix()}:/project:rw"]
 
     # Extra mounts
     if extra_mounts:
@@ -101,11 +106,15 @@ def _build_docker_cmd(image: str, command: List[str], *, cwd: str, timeout_s: in
             docker_cmd += ['-v', f"{Path(src).resolve().as_posix()}:{dst}:{mode}"]
 
     # Working directory inside container
-    docker_cmd += ['-w', '/workspace']
+    # Permissive mode (mount_project_ro=False) runs in the project root for better tooling (e.g., git)
+    docker_cmd += ['-w', '/project' if not mount_project_ro else '/workspace']
 
-    # User: try non-root user if exists; fallback to default container user
-    # Many minimal images have nobody (65534)
-    docker_cmd += ['-u', '65534:65534']
+    # User: honor requested user; root when permissive, nobody otherwise
+    if str(user).lower() == 'root':
+        docker_cmd += ['-u', '0:0']
+    else:
+        # Many minimal images have nobody (65534)
+        docker_cmd += ['-u', '65534:65534']
 
     docker_cmd += [image]
     docker_cmd += command

@@ -599,7 +599,8 @@ class OllamaTurboClient:
                             round_content += piece
                             if not self.quiet:
                                 # Print only the new suffix not yet emitted (handles reconnect duplicates)
-                                can_print_live = (not include_tools) or (include_tools and rounds == 0 and not tool_calls_detected)
+                                # Print live until a tool call is detected in the current round
+                                can_print_live = (not include_tools) or (not tool_calls_detected)
                                 if can_print_live:
                                     new_segment = round_content[printed_len:]
                                     if new_segment:
@@ -705,6 +706,7 @@ class OllamaTurboClient:
                     print()  # newline after final streamed content
                 # Extract final-channel text if present; otherwise strip markup
                 final_out = round_content
+                found_final = False
                 try:
                     if round_content:
                         cleaned, _, final_seg = self._parse_harmony_tokens(round_content)
@@ -714,6 +716,7 @@ class OllamaTurboClient:
                                 self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
                         except Exception:
                             pass
+                        found_final = bool(final_seg)
                         final_out = final_seg or cleaned
                         if not final_out:
                             final_out = self._strip_harmony_markup(round_content)
@@ -769,6 +772,21 @@ class OllamaTurboClient:
                 self._trace("tools:none")
                 # Persist memory to Mem0
                 self._mem0_add_after_response(self._last_user_message, final_out)
+
+                # Optional compliance nudge: if tools were used but no explicit <|channel|>final was detected, nudge once
+                try:
+                    if aggregated_results and (not found_final):
+                        self.conversation_history.append({
+                            "role": "user",
+                            "content": "Please conclude with <|channel|>final and a single <|message|>…<|end|>."
+                        })
+                except Exception:
+                    pass
+
+                # If nothing was printed live this round (e.g., post-tool synthesis), print the final once
+                if (not printed_prefix) and (not self.quiet) and final_out:
+                    print("🤖 Assistant: ", end="", flush=True)
+                    print(self._strip_harmony_markup(final_out), flush=True)
 
                 if aggregated_results:
                     combined = (preface_content + "\n\n" if preface_content else "") + "[Tool Results]\n" + '\n'.join(aggregated_results) + "\n\n" + final_out
@@ -1207,7 +1225,7 @@ class OllamaTurboClient:
             # Runtime knobs
             self.mem0_debug = os.getenv('MEM0_DEBUG', '0').strip() in {'1', 'true', 'True'}
             self.mem0_max_hits = int(os.getenv('MEM0_MAX_HITS', '3') or '3')
-            self.mem0_search_timeout_ms = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '200') or '200')
+            self.mem0_search_timeout_ms = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
             self.mem0_timeout_connect_ms = int(os.getenv('MEM0_TIMEOUT_CONNECT_MS', '1000') or '1000')
             self.mem0_timeout_read_ms = int(os.getenv('MEM0_TIMEOUT_READ_MS', '2000') or '2000')
             self.mem0_add_queue_max = int(os.getenv('MEM0_ADD_QUEUE_MAX', '256') or '256')
