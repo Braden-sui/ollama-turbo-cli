@@ -8,7 +8,7 @@ import json
 import sys
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Union
 import ollama
 from ollama import Client
@@ -197,6 +197,40 @@ class OllamaTurboClient:
             # Clear after printing to avoid duplication on next call
             self.trace = []
     
+    def _trace_mem0_presence(self, messages: Optional[List[Dict[str, Any]]], where: str) -> None:
+        """Record whether Mem0 context is present in the first system message or as a separate system block.
+
+        The trace is non-sensitive and only records booleans/counts. Used to verify that providers that
+        only honor the first system message still receive Mem0 context when enabled.
+        """
+        if not self.show_trace:
+            return
+        try:
+            msgs = messages or []
+            prefixes: List[str] = []
+            try:
+                prefixes = self.prompt.mem0_prefixes()
+            except Exception:
+                prefixes = [
+                    "Previous context from user history (use if relevant):",
+                    "Relevant information:",
+                    "Relevant user memories",
+                ]
+            in_first = False
+            if msgs and (msgs[0] or {}).get('role') == 'system':
+                first_c = str((msgs[0] or {}).get('content') or '')
+                in_first = any((p and (p in first_c)) for p in prefixes)
+            blocks = 0
+            for m in msgs:
+                if m.get('role') == 'system':
+                    c = str(m.get('content') or '')
+                    if any((p and (p in c)) for p in prefixes):
+                        blocks += 1
+            self._trace(f"mem0:present:{where} first={'1' if in_first else '0'} blocks={blocks}")
+        except Exception:
+            # Never fail request due to tracing
+            pass
+    
     def chat(self, message: str, stream: bool = False) -> str:
         """Send a message to the model and get a response.
         
@@ -296,6 +330,8 @@ class OllamaTurboClient:
                     kwargs['tools'] = self.tools
 
                 self._trace(f"request:standard:round={rounds}{' tools' if include_tools else ''}")
+                # Trace Mem0 presence prior to dispatch
+                self._trace_mem0_presence(kwargs.get('messages'), f"standard:r{rounds}")
                 response = self.client.chat(**kwargs)
 
                 # Extract message
@@ -449,7 +485,12 @@ class OllamaTurboClient:
             self.logger.debug(f"Streaming init failed; falling back to non-streaming: {e}")
             self._trace("stream:init:error -> fallback")
             try:
-                return self._handle_standard_chat(_suppress_errors=True)
+                final = self._handle_standard_chat(_suppress_errors=True)
+                # Print final response so the user sees output even when streaming init fails
+                if final and not str(final).startswith("Error during chat:") and not self.quiet:
+                    print(final)
+                self._trace("stream:init:fallback:success")
+                return final
             except Exception as e2:
                 # Still suppress to avoid leaking error text in streaming mode
                 self.logger.debug(f"Non-streaming fallback also failed: {e2}")
@@ -485,6 +526,8 @@ class OllamaTurboClient:
                 kwargs['tools'] = self.tools
             
             self._trace("request:stream:start")
+            # Trace Mem0 presence prior to initial streaming dispatch
+            self._trace_mem0_presence(kwargs.get('messages'), "stream:init")
             return self.client.chat(**kwargs)
         except Exception as e:
             # Downgrade to DEBUG to avoid noisy CLI output; with_retry will handle retries
@@ -508,6 +551,8 @@ class OllamaTurboClient:
                 # Use provided stream on the first round; create new ones subsequently
                 if rounds == 0:
                     stream = response_stream
+                    # Trace Mem0 presence for the initial streaming round (r0) as well
+                    self._trace_mem0_presence(self.conversation_history, "stream:r0")
                 else:
                     kwargs = {
                         'model': self.model,
@@ -527,18 +572,19 @@ class OllamaTurboClient:
                     keep_val = self._resolve_keep_alive()
                     if keep_val is not None:
                         kwargs['keep_alive'] = keep_val
+                    # Trace Mem0 presence prior to subsequent streaming round dispatch
+                    self._trace_mem0_presence(kwargs.get('messages'), f"stream:r{rounds}")
                     stream = self.client.chat(**kwargs)
 
                 self._trace(f"request:stream:round={rounds}{' tools' if include_tools else ''}")
 
-                # UX: Only print content live when we are on the final, no-tools round
-                if not self.quiet and not include_tools and rounds > 0:
-                    print("🤖 Assistant: ", end="", flush=True)
-
+                # Streaming print control: print live on no-tools rounds, and on round 0 until a tool_call is detected
                 round_content = ""
                 # Track already emitted content length to avoid duplicates across reconnects
                 printed_len = 0
                 tool_calls: List[Dict[str, Any]] = []
+                tool_calls_detected = False
+                printed_prefix = False
 
                 def _iter_stream_chunks(s):
                     # Simple wrapper to let us hook per-chunk accounting
@@ -551,15 +597,21 @@ class OllamaTurboClient:
                         if message.get('content'):
                             piece = message['content']
                             round_content += piece
-                            if not include_tools and rounds > 0:
+                            if not self.quiet:
                                 # Print only the new suffix not yet emitted (handles reconnect duplicates)
-                                new_segment = round_content[printed_len:]
-                                if new_segment:
-                                    safe_segment = self._strip_harmony_markup(new_segment)
-                                    if safe_segment:
-                                        print(safe_segment, end="", flush=True)
-                                    printed_len = len(round_content)
+                                can_print_live = (not include_tools) or (include_tools and rounds == 0 and not tool_calls_detected)
+                                if can_print_live:
+                                    new_segment = round_content[printed_len:]
+                                    if new_segment:
+                                        safe_segment = self._strip_harmony_markup(new_segment)
+                                        if safe_segment:
+                                            if not printed_prefix:
+                                                print("🤖 Assistant: ", end="", flush=True)
+                                                printed_prefix = True
+                                            print(safe_segment, end="", flush=True)
+                                            printed_len = len(round_content)
                         if message.get('tool_calls') and include_tools:
+                            tool_calls_detected = True
                             for tool_call in message['tool_calls']:
                                 # Merge updates for same id
                                 existing = False
@@ -578,7 +630,7 @@ class OllamaTurboClient:
                     try:
                         final = self._handle_standard_chat(_suppress_errors=True)
                         # Suppress printing raw error text returned by non-streaming fallback
-                        if final and not str(final).startswith("Error during chat:"):
+                        if final and not str(final).startswith("Error during chat:") and not self.quiet:
                             print(final)
                         self._trace("fallback:success")
                         if final and not str(final).startswith("Error during chat:"):
@@ -649,7 +701,7 @@ class OllamaTurboClient:
                     continue
 
                 # No tool calls -> final textual answer for this turn
-                if not include_tools and rounds > 0 and not self.quiet:
+                if printed_prefix and not self.quiet:
                     print()  # newline after final streamed content
                 # Extract final-channel text if present; otherwise strip markup
                 final_out = round_content
@@ -735,7 +787,7 @@ class OllamaTurboClient:
             try:
                 final = self._handle_standard_chat()
                 # Print only the final response so the user still sees a complete answer
-                if final:
+                if final and not self.quiet:
                     print(final)
                 self._trace("fallback:success")
                 return (full_content + "\n" + final) if full_content else final
@@ -1225,6 +1277,29 @@ class OllamaTurboClient:
                     ):
                         self.conversation_history.pop(idx)
 
+            # If Mem0 was previously merged into the first system message, strip it
+            try:
+                if self.conversation_history and (self.conversation_history[0] or {}).get('role') == 'system':
+                    first_c = str((self.conversation_history[0] or {}).get('content') or '')
+                    # Find any known Mem0 prefix and truncate content at that point
+                    prefixes = []
+                    try:
+                        prefixes = self.prompt.mem0_prefixes()
+                    except Exception:
+                        prefixes = ["Previous context from user history (use if relevant):", "Relevant information:", "Relevant user memories"]
+                    cut = -1
+                    for p in prefixes:
+                        if not p:
+                            continue
+                        pos = first_c.find(p)
+                        if pos != -1:
+                            cut = pos if cut == -1 else min(cut, pos)
+                    if cut != -1:
+                        self.conversation_history[0]['content'] = first_c[:cut].rstrip()
+            except Exception:
+                # Non-fatal; proceed without stripping
+                pass
+
             # Minimal filter: just user_id
             filters = {"user_id": getattr(self, 'mem0_user_id', 'Braden')}
             def _do_search():
@@ -1289,8 +1364,22 @@ class OllamaTurboClient:
                     print(f"[mem0] search dt={dt_ms}ms hits=0")
                 return
             context = self.prompt.mem0_context_block(acc)
-            self.conversation_history.append({'role': 'system', 'content': context})
-            self._trace(f"mem0:inject {len(acc)}")
+            # Merge into first system message if enabled via env
+            in_first = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {"1", "true", "yes", "on"}
+            if in_first and self.conversation_history and (self.conversation_history[0] or {}).get('role') == 'system':
+                try:
+                    base = str((self.conversation_history[0] or {}).get('content') or '').rstrip()
+                    new_content = (base + "\n\n" + context).strip()
+                    self.conversation_history[0]['content'] = new_content
+                    self._trace(f"mem0:inject:first {len(acc)}")
+                except Exception:
+                    # Fallback to separate system message on any error
+                    self.conversation_history.append({'role': 'system', 'content': context})
+                    self._trace(f"mem0:inject {len(acc)}")
+            else:
+                # Default: inject as a separate system message before the user turn
+                self.conversation_history.append({'role': 'system', 'content': context})
+                self._trace(f"mem0:inject {len(acc)}")
             # Success -> reset breaker
             if self._mem0_fail_count >= self._mem0_breaker_threshold and not self._mem0_breaker_recovered_logged:
                 self.logger.info("Mem0 recovered; resuming calls")
@@ -1333,7 +1422,7 @@ class OllamaTurboClient:
         metadata: Dict[str, Any] = {
             "source": "chat",
             "category": "inferred",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         if getattr(self, 'mem0_app_id', None):
             metadata["app_id"] = self.mem0_app_id
@@ -1693,7 +1782,7 @@ class OllamaTurboClient:
                     try:
                         h = hashlib.sha1(self._normalize_fact(mem_text).encode('utf-8')).hexdigest()[:10]
                         if self._last_mem_hash != h:
-                            metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.utcnow().isoformat() + "Z"}
+                            metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
                             if getattr(self, 'mem0_app_id', None):
                                 metadata["app_id"] = self.mem0_app_id
                             if getattr(self, 'mem0_agent_id', None):
@@ -1702,7 +1791,7 @@ class OllamaTurboClient:
                             self._last_mem_hash = h
                     except Exception:
                         # Fallback enqueue without dedupe
-                        metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.utcnow().isoformat() + "Z"}
+                        metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
                         if getattr(self, 'mem0_app_id', None):
                             metadata["app_id"] = self.mem0_app_id
                         if getattr(self, 'mem0_agent_id', None):

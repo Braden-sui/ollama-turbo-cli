@@ -59,7 +59,7 @@ async def chat(
         engine=payload.engine,
         eval_corpus=payload.eval_corpus,
     )
-    fmt = _resolve_tool_results_format((payload.options or {}).dict() if payload.options else None)
+    fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
     # Respect API-level idempotency key in future by exposing a setter in client;
     # currently client generates a key internally per turn.
     content = client.chat(payload.message, stream=False)
@@ -87,7 +87,7 @@ async def chat_stream(
     """
     upstream_key = os.getenv("OLLAMA_API_KEY", "") or _api_key
     client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True)
-    fmt = _resolve_tool_results_format((payload.options or {}).dict() if payload.options else None)
+    fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
 
     def sse_gen():
         # Prepare conversation similar to client.chat()
