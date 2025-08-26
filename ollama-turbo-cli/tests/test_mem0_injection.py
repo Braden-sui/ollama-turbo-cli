@@ -171,3 +171,55 @@ def test_mem0_injection_can_affect_model_output(monkeypatch):
 
     out = client.chat('Greet me', stream=False)
     assert 'Braden' in out
+
+
+def test_mem0_merge_first_system_and_replace_next_turn(monkeypatch):
+    # Enable Mem0 and force merge into first system message
+    monkeypatch.setenv('MEM0_ENABLED', '1')
+    monkeypatch.setenv('MEM0_API_KEY', 'test-key')
+    monkeypatch.setenv('MEM0_IN_FIRST_SYSTEM', '1')
+
+    _install_fake_mem0(monkeypatch)
+
+    client = OllamaTurboClient(api_key='test', enable_tools=False, quiet=True)
+
+    # First search returns memory A
+    def search_a(query, version='v2', filters=None, limit=None):
+        return [{'memory': 'First fact A'}]
+
+    # Second search returns memory B
+    def search_b(query, version='v2', filters=None, limit=None):
+        return [{'memory': 'Second fact B'}]
+
+    # Replace underlying network client
+    dummy = DummyOllamaClient()
+    client.client = dummy
+
+    # Turn 1
+    monkeypatch.setattr(client.mem0_client, 'search', search_a, raising=False)
+    _ = client.chat('Turn 1', stream=False)
+
+    # First system message should include Mem0 prefix and the A fact
+    first_sys = client.conversation_history[0]
+    prefix = client.prompt.mem0_prefix()
+    assert first_sys.get('role') == 'system'
+    assert prefix in str(first_sys.get('content', ''))
+    assert 'First fact A' in str(first_sys.get('content', ''))
+
+    # There should be no separate Mem0 system message (since merged into first)
+    separate_blocks = [m for m in client.conversation_history[1:] if m.get('role') == 'system' and str(m.get('content','')).startswith(prefix)]
+    assert len(separate_blocks) == 0
+
+    # Turn 2 -> swap search function
+    monkeypatch.setattr(client.mem0_client, 'search', search_b, raising=False)
+    _ = client.chat('Turn 2', stream=False)
+
+    # The first system message Mem0 section should now reflect B, not A
+    first_sys2 = client.conversation_history[0]
+    content2 = str(first_sys2.get('content', ''))
+    assert prefix in content2
+    assert 'Second fact B' in content2
+    assert 'First fact A' not in content2
+    # Still no separate blocks
+    separate_blocks2 = [m for m in client.conversation_history[1:] if m.get('role') == 'system' and str(m.get('content','')).startswith(prefix)]
+    assert len(separate_blocks2) == 0

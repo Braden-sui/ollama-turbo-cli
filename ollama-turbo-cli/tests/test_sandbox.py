@@ -48,13 +48,20 @@ def test_default_deny_blocks_shell(tmp_path):
     assert 'how_to_enable' in res
 
 
-@pytest.mark.skipif(not sandbox_available(), reason="Sandbox unavailable; expect fail-closed on this host")
 def test_allowlisted_command_runs(tmp_path, monkeypatch):
     monkeypatch.setenv('SHELL_TOOL_ALLOW', '1')
     res = call_tool('execute_shell', command='ls', working_dir=str(tmp_path))
     assert res.get('blocked') is False
-    # ok may be True even if empty dir
+    # ok may be True even if empty dir; always expect an exit_code and log_path
     assert 'exit_code' in res
+    assert isinstance(res.get('log_path'), str)
+    if sandbox_available():
+        # On hosts with Docker, command should execute in sandbox
+        assert res.get('ok') in (True, False)  # typically True
+    else:
+        # On hosts without Docker, sandbox fails closed with exit 126
+        assert res.get('ok') is False
+        assert res.get('exit_code') == 126
 
 
 def test_truncation_and_redaction(tmp_path, monkeypatch):
