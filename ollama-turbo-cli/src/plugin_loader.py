@@ -317,8 +317,16 @@ class PluginManager:
 
                 for file_path in self._iter_module_files(path):
                     try:
+                        # Skip disabled core plugin by filename to avoid importing module-level code
+                        if os.path.basename(file_path) == "reliable_chat.py":
+                            self._logger.info(f"Skipping disabled plugin module by filename: {file_path}")
+                            continue
                         module = self._import_module_from_path(file_path, pkg_base)
                         plugin = self._extract_plugin(module, file_path)
+                        # Skip disabled core plugin 'reliable_chat'
+                        if plugin.name == "reliable_chat":
+                            self._logger.info(f"Skipping disabled plugin '{plugin.name}' from {file_path}")
+                            continue
                         if plugin.name in loaded_names:
                             self._logger.warning(f"Duplicate tool name '{plugin.name}' from {file_path}; skipping")
                             continue

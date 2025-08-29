@@ -131,6 +131,11 @@ class DeepSeekAdapter(ProtocolAdapter):
             mapped["temperature"] = float(options["temperature"])  # 0..1
         if options.get("top_p") is not None:
             mapped["top_p"] = float(options["top_p"])  # 0..1
+        # Repetition controls (supported by DeepSeek chat backends and OpenAI-compatible proxies)
+        if options.get("presence_penalty") is not None:
+            mapped["presence_penalty"] = float(options["presence_penalty"])  # typically 0..1 or -2..2
+        if options.get("frequency_penalty") is not None:
+            mapped["frequency_penalty"] = float(options["frequency_penalty"])  # typically 0..1 or -2..2
         if options.get("stop") is not None:
             mapped["stop"] = list(options["stop"] or [])
         extra = options.get("extra") or {}

@@ -47,6 +47,23 @@ class PromptManager:
             "• Use clear paragraphs or short bullets when synthesizing.\n"
         )
 
+    def deepseek_system_prompt(self) -> str:
+        """Minimal, neutral system prompt tailored for DeepSeek Chat (v3.x).
+
+        Avoids Harmony-specific markup and focuses on clarity and focus.
+        Controlled by PROMPT_VERBOSITY similar to the default prompt.
+        """
+        verbosity = (os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower()
+        style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
+        return (
+            "You are a helpful AI assistant.\n"
+            f"• Reasoning effort: {self.reasoning}.\n"
+            f"• Style: {style_line}\n"
+            "• Stay focused on the user's request.\n"
+            "• Use tools only when necessary and summarize results clearly.\n"
+            "• Provide clear steps or short bullets when appropriate.\n"
+        )
+
     # ---------- Post-Tool Reprompt ----------
     def reprompt_after_tools(self) -> str:
         import os

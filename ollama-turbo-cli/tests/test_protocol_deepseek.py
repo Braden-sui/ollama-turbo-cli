@@ -45,6 +45,17 @@ def test_map_options_basic():
     assert mapped["num_ctx"] == 2048
 
 
+def test_map_options_penalties():
+    adapter = make_adapter()
+    opts = {
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.25,
+    }
+    mapped = adapter.map_options(opts)  # type: ignore[arg-type]
+    assert mapped["presence_penalty"] == pytest.approx(0.1)
+    assert mapped["frequency_penalty"] == pytest.approx(0.25)
+
+
 def test_capabilities_support_tools():
     adapter = make_adapter()
     caps = adapter.capabilities

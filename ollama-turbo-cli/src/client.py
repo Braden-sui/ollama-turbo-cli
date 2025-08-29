@@ -37,7 +37,7 @@ from .protocols import get_adapter
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto'):
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -64,6 +64,11 @@ class OllamaTurboClient:
         self.logger = logging.getLogger(__name__)
         self.max_output_tokens = max_output_tokens
         self.ctx_size = ctx_size
+        # Sampling parameters (may be None; adapter- or model-specific defaults can be applied later)
+        self.temperature: Optional[float] = temperature
+        self.top_p: Optional[float] = top_p
+        self.presence_penalty: Optional[float] = presence_penalty
+        self.frequency_penalty: Optional[float] = frequency_penalty
         self.tool_print_limit = tool_print_limit
         self.tool_context_cap = int(os.getenv('TOOL_CONTEXT_MAX_CHARS', '4000') or '4000')
         self._last_user_message: Optional[str] = None
@@ -160,11 +165,35 @@ class OllamaTurboClient:
         except Exception:
             self.protocol = 'auto'
         self.adapter = get_adapter(model=self.model, protocol=self.protocol)
+        # Apply DeepSeek-specific defaults and minimal system prompt
+        try:
+            adapter_name = getattr(self.adapter, 'name', '')
+        except Exception:
+            adapter_name = ''
+        # Resolve DeepSeek defaults only if not provided explicitly
+        if adapter_name == 'deepseek':
+            def _env_float(name: str, default: float) -> float:
+                try:
+                    v = os.getenv(name)
+                    return float(v) if v is not None and str(v).strip() != '' else default
+                except Exception:
+                    return default
+            if self.temperature is None:
+                self.temperature = _env_float('DEEPSEEK_TEMP', 0.6)
+            if self.top_p is None:
+                self.top_p = _env_float('DEEPSEEK_TOP_P', 0.95)
+            if self.presence_penalty is None:
+                self.presence_penalty = _env_float('DEEPSEEK_PRESENCE_PENALTY', 0.0)
+            if self.frequency_penalty is None:
+                self.frequency_penalty = _env_float('DEEPSEEK_FREQUENCY_PENALTY', 0.2)
+            sys_prompt = self.prompt.deepseek_system_prompt()
+        else:
+            sys_prompt = self.prompt.initial_system_prompt()
         # Initialize conversation history with a system directive
         self.conversation_history = [
             {
                 'role': 'system',
-                'content': self.prompt.initial_system_prompt()
+                'content': sys_prompt
             }
         ]
         # Enforce local history window <= 10 turns (excluding initial system)
@@ -431,6 +460,15 @@ class OllamaTurboClient:
                 adapter_opts['max_tokens'] = self.max_output_tokens
             if self.ctx_size is not None:
                 adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+            # Sampling parameters
+            if self.temperature is not None:
+                adapter_opts['temperature'] = self.temperature
+            if self.top_p is not None:
+                adapter_opts['top_p'] = self.top_p
+            if self.presence_penalty is not None:
+                adapter_opts['presence_penalty'] = self.presence_penalty
+            if self.frequency_penalty is not None:
+                adapter_opts['frequency_penalty'] = self.frequency_penalty
             try:
                 mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
                 if mapped:
@@ -677,6 +715,15 @@ class OllamaTurboClient:
                 adapter_opts['max_tokens'] = self.max_output_tokens
             if self.ctx_size is not None:
                 adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+            # Sampling parameters
+            if self.temperature is not None:
+                adapter_opts['temperature'] = self.temperature
+            if self.top_p is not None:
+                adapter_opts['top_p'] = self.top_p
+            if self.presence_penalty is not None:
+                adapter_opts['presence_penalty'] = self.presence_penalty
+            if self.frequency_penalty is not None:
+                adapter_opts['frequency_penalty'] = self.frequency_penalty
 
             # Use adapter to format initial messages and merge Mem0 if needed
             norm_msgs, overrides = self._prepare_initial_messages_for_adapter(
@@ -738,6 +785,15 @@ class OllamaTurboClient:
                         adapter_opts['max_tokens'] = self.max_output_tokens
                     if self.ctx_size is not None:
                         adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+                    # Sampling parameters
+                    if self.temperature is not None:
+                        adapter_opts['temperature'] = self.temperature
+                    if self.top_p is not None:
+                        adapter_opts['top_p'] = self.top_p
+                    if self.presence_penalty is not None:
+                        adapter_opts['presence_penalty'] = self.presence_penalty
+                    if self.frequency_penalty is not None:
+                        adapter_opts['frequency_penalty'] = self.frequency_penalty
                     try:
                         mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
                         if mapped:

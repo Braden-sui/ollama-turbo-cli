@@ -112,6 +112,29 @@ Examples:
                        help='Target engine: cloud | local | full URL (http[s]://...). Default: cloud / OLLAMA_HOST.')
     parser.add_argument('--eval',
                        help='Path to a JSONL corpus for micro-evaluation (optional).')
+    # Sampling parameters
+    # Generic env defaults (apply to any protocol)
+    env_temp = os.getenv('TEMPERATURE')
+    env_topp = os.getenv('TOP_P')
+    env_pp = os.getenv('PRESENCE_PENALTY')
+    env_fp = os.getenv('FREQUENCY_PENALTY')
+    parser.add_argument('--temperature',
+                       type=float,
+                       default=(float(env_temp) if env_temp not in (None, '') else None),
+                       help='Sampling temperature (0..2). Overrides protocol defaults if provided.')
+    parser.add_argument('--top-p',
+                       dest='top_p',
+                       type=float,
+                       default=(float(env_topp) if env_topp not in (None, '') else None),
+                       help='Top-p nucleus sampling (0..1). Overrides protocol defaults if provided.')
+    parser.add_argument('--presence-penalty',
+                       type=float,
+                       default=(float(env_pp) if env_pp not in (None, '') else None),
+                       help='Presence penalty to reduce repetition. Overrides protocol defaults if provided.')
+    parser.add_argument('--frequency-penalty',
+                       type=float,
+                       default=(float(env_fp) if env_fp not in (None, '') else None),
+                       help='Frequency penalty to reduce token repetition. Overrides protocol defaults if provided.')
     parser.add_argument('--log-level', 
                        default=os.getenv('LOG_LEVEL', 'INFO'),
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -186,6 +209,10 @@ Examples:
             max_output_tokens=args.max_output_tokens,
             ctx_size=args.ctx_size,
             tool_print_limit=args.tool_print_limit,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
             # Reliability mode plumbing (no-op until implemented)
             ground=args.ground,
             k=args.k,

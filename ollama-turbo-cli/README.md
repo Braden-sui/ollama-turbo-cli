@@ -184,25 +184,11 @@ Notes:
 Performance tips:
 
 - When responses are slow: omit `consensus`, set `check="off"`, and leave `k` unset to minimize load.
-- For complex queries, consider running `web_research` first to fetch sources, then ask `reliable_chat` to synthesize with citations.
+- For complex queries, consider running `web_research` first to fetch sources, then synthesize with citations using your preferred workflow.
 
-Example (non-stream):
+Reliable Chat plugin is currently disabled and unavailable.
 
-```python
-from src import plugin_loader
-fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
-out_json = fn(message="Summarize latest Llama 3.2 results; include citations.")
-# out_json is a JSON string with keys: tool, ok, content, summary, inject
-```
-
-Example (streaming aggregation):
-
-```python
-from src import plugin_loader
-fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
-out_json = fn(message="Verify the claim and cite sources; aim for consensus, k=3.", stream=True)
-# content aggregates token stream; summary includes validator/consensus info
-```
+Reliable Chat streaming aggregation is disabled.
 
 #### Windows-safe curl (SSE) — quick smoke
 
