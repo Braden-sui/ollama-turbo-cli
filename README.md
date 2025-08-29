@@ -4,7 +4,7 @@ A production-ready CLI application for interacting with gpt-oss:120b model throu
 
 ## Features
 
-- 🚀 **Ollama Turbo Integration**: Connect to gpt-oss:120b on datacenter-grade hardware
+- 🚀 **Ollama Turbo Integration**: Connect to gpt-oss:120b AND Deepseek V3.1:671B on datacenter-grade hardware
 - 🔧 **Advanced Tool Calling**: Weather, calculator, file operations, system info
 - 📡 **Streaming Responses**: Real-time response streaming with tool execution
 - 🧠 **Multi-Round Tool Chaining (Streaming)**: Iteratively call multiple tools in one turn; enabled by default
@@ -673,3 +673,4 @@ pytest -q
 - Streaming and non-streaming modes
 - Interactive and single-message modes
 - Comprehensive error handling and retry logic
+
