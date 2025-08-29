@@ -66,3 +66,8 @@ mem0_export_*.json
 .sandbox/sessions/
 mem0_export_*.json
 .windsurf\rules
+
+# Disabled Reliable Chat plugin and tests
+src/plugins/reliable_chat.py
+tests/test_reliable_chat_tool.py
+tests/test_reliable_chat_plugin.py
