@@ -27,6 +27,8 @@ class PromptManager:
         style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
         return (
             "You are GPT-OSS running with Harmony channels.\n\n"
+            "— Reasoning —\n"
+            f"• Reasoning: {self.reasoning}\n\n"
             "— Safety/Process —\n"
             "• Keep internal reasoning private (no chain-of-thought). Provide only final answers and short, audit-friendly summaries of steps.\n"
             "• Cite sources briefly when using web tools.\n"

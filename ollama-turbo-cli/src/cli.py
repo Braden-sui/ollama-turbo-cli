@@ -62,10 +62,19 @@ Examples:
     parser.add_argument('--quiet',
                        action='store_true',
                        help='Reduce CLI output (suppress helper prints)')
-    parser.add_argument('--reasoning',
+    parser.add_argument('--reasoning', 
                        default=os.getenv('REASONING', 'high'),
                        choices=['low', 'medium', 'high'],
                        help='Set reasoning effort (low, medium, high). Default: high')
+    parser.add_argument('--reasoning-mode',
+                       default=(os.getenv('REASONING_MODE') or 'system'),
+                       choices=['system', 'request:top', 'request:options'],
+                       help='How to send reasoning effort to the provider: system (system message directive), request:top (top-level payload), request:options (under options). Default: system')
+    # Protocol selection
+    parser.add_argument('--protocol',
+                       default=(os.getenv('OLLAMA_PROTOCOL') or 'auto'),
+                       choices=['auto', 'harmony', 'deepseek'],
+                       help='Model protocol to use: auto (detect), harmony, deepseek. Default: auto')
     # Generation and display controls
     env_max_out = os.getenv('MAX_OUTPUT_TOKENS')
     env_ctx = os.getenv('CTX_SIZE')
@@ -117,6 +126,42 @@ Examples:
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
     
+    # Auto-select model based on --protocol when --model is not explicitly provided.
+    # We treat an explicit --model flag as authoritative and only warn on mismatches.
+    try:
+        has_model_flag = any(tok == "--model" for tok in sys.argv)
+    except Exception:
+        has_model_flag = False
+    
+    try:
+        if args.protocol in ("deepseek", "harmony"):
+            if not has_model_flag:
+                if args.protocol == "deepseek":
+                    # Allow override via env, else default to DeepSeek v3.1
+                    args.model = os.getenv("DEEPSEEK_DEFAULT_MODEL", "deepseek-v3.1:671b")
+                else:
+                    # Harmony default
+                    args.model = os.getenv("HARMONY_DEFAULT_MODEL", "gpt-oss:120b")
+                logger.info(f"Protocol '{args.protocol}' selected; using model: {args.model} (auto)")
+            else:
+                # User specified a model explicitly; emit gentle warnings on mismatch
+                m = (args.model or "").lower()
+                if args.protocol == "deepseek" and ("deepseek" not in m):
+                    logger.warning(
+                        "Protocol 'deepseek' selected but model '%s' does not look like a DeepSeek model. "
+                        "Consider --model deepseek-v3.1:671b or set DEEPSEEK_DEFAULT_MODEL.",
+                        args.model,
+                    )
+                if args.protocol == "harmony" and ("deepseek" in m):
+                    logger.warning(
+                        "Protocol 'harmony' selected with a DeepSeek-looking model '%s'. "
+                        "If this is intentional, ignore; otherwise consider --protocol deepseek.",
+                        args.model,
+                    )
+    except Exception:
+        # Never fail CLI due to optional convenience logic
+        pass
+    
     # Validate API key
     if not args.api_key:
         print("❌ Error: API key is required. Set OLLAMA_API_KEY environment variable or use --api-key")
@@ -135,6 +180,8 @@ Examples:
             enable_tools=not args.no_tools,
             show_trace=args.show_trace,
             reasoning=args.reasoning,
+            reasoning_mode=args.reasoning_mode,
+            protocol=args.protocol,
             quiet=args.quiet,
             max_output_tokens=args.max_output_tokens,
             ctx_size=args.ctx_size,

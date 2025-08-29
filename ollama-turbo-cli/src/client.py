@@ -9,7 +9,7 @@ import sys
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
 import ollama
 from ollama import Client
 import threading
@@ -31,12 +31,13 @@ from .reliability.retrieval.pipeline import RetrievalPipeline
 from .reliability.grounding.context_builder import ContextBuilder
 from .reliability.guards.validator import Validator
 from .reliability.guards.consensus import run_consensus
+from .protocols import get_adapter
 
 
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None):
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto'):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -56,6 +57,9 @@ class OllamaTurboClient:
         self.show_trace = show_trace
         self.quiet = quiet
         self.reasoning = reasoning if reasoning in {"low", "medium", "high"} else "high"
+        # How to send reasoning effort to provider: 'system' | 'request:top' | 'request:options'
+        rm = str(reasoning_mode or 'system').strip().lower()
+        self.reasoning_mode = rm if rm in {'system', 'request:top', 'request:options'} else 'system'
         self.trace: List[str] = []
         self.logger = logging.getLogger(__name__)
         self.max_output_tokens = max_output_tokens
@@ -150,6 +154,12 @@ class OllamaTurboClient:
         self.prompt = PromptManager(self.reasoning)
         # Harmony parsing/markup processing
         self.harmony = HarmonyProcessor()
+        # Protocol adapter selection (default: auto -> harmony unless detected otherwise)
+        try:
+            self.protocol = str(protocol or os.getenv('OLLAMA_PROTOCOL') or 'auto').strip().lower()
+        except Exception:
+            self.protocol = 'auto'
+        self.adapter = get_adapter(model=self.model, protocol=self.protocol)
         # Initialize conversation history with a system directive
         self.conversation_history = [
             {
@@ -177,10 +187,125 @@ class OllamaTurboClient:
         # Initialize Mem0 memory system (optional)
         self._init_mem0()
 
-        self.logger.info(f"Initialized client with model: {model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, quiet={self.quiet}")
+        self.logger.info(f"Initialized client with model: {model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, mode={self.reasoning_mode}, quiet={self.quiet}")
         # Initial trace state
         if self.show_trace:
-            self.trace.append(f"client:init model={model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} quiet={'on' if self.quiet else 'off'}")
+            self.trace.append(f"client:init model={model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} mode={self.reasoning_mode} quiet={'on' if self.quiet else 'off'}")
+
+    # ---------- Reasoning Injection Helpers ----------
+    def _nested_set(self, d: Dict[str, Any], path: str, value: Any) -> None:
+        try:
+            parts = [p for p in str(path).split('.') if p]
+            cur = d
+            for p in parts[:-1]:
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+            cur[parts[-1]] = value
+        except Exception:
+            # Do not fail request due to optional reasoning injection
+            pass
+
+    def _maybe_inject_reasoning(self, kwargs: Dict[str, Any]) -> None:
+        """Optionally inject request-level reasoning effort based on configuration.
+
+        Controlled by self.reasoning_mode. Field name and style are env-configurable:
+        - REASONING_FIELD_PATH: dot-path for target (default depends on mode)
+        - REASONING_FIELD_STYLE: 'string' (default) or 'object'
+        - REASONING_OBJECT_KEY: key name when style is 'object' (default: 'effort')
+        """
+        try:
+            if self.reasoning_mode == 'system':
+                return
+            # Resolve defaults by mode
+            default_path = 'options.reasoning_effort' if self.reasoning_mode == 'request:options' else 'reasoning'
+            field_path = (os.getenv('REASONING_FIELD_PATH') or default_path).strip()
+            style = (os.getenv('REASONING_FIELD_STYLE') or 'string').strip().lower()
+            obj_key = (os.getenv('REASONING_OBJECT_KEY') or 'effort').strip()
+
+            if style == 'object':
+                value: Any = {obj_key: self.reasoning}
+            else:
+                value = self.reasoning
+
+            self._nested_set(kwargs, field_path, value)
+            self._trace(f"reasoning:inject path={field_path} style={style} val={self.reasoning}")
+        except Exception:
+            # Never raise on optional reasoning injection
+            pass
+
+    def _prepare_initial_messages_for_adapter(self, *, include_tools: bool, adapter_opts: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Prepare initial-turn messages via adapter, merging Mem0 into first system if needed.
+
+        - If Mem0 is already merged into the first system message, pass through.
+        - If Mem0 exists as a separate system block, strip it from the outgoing
+          message list and pass it to the adapter via mem0_block for safe merge.
+        - Returns (normalized_messages, payload_overrides) where overrides may include
+          provider-specific options and tools.
+        """
+        try:
+            msgs: List[Dict[str, Any]] = list(self.conversation_history or [])
+            # Determine Mem0 prefixes
+            try:
+                prefixes = self.prompt.mem0_prefixes()
+            except Exception:
+                prefixes = [
+                    "Previous context from user history (use if relevant):",
+                    "Relevant information:",
+                    "Relevant user memories",
+                ]
+            # Check if first system already contains Mem0
+            mem0_in_first = False
+            if msgs and (msgs[0] or {}).get('role') == 'system':
+                first_c = str((msgs[0] or {}).get('content') or '')
+                mem0_in_first = any((p and (p in first_c)) for p in prefixes)
+
+            mem0_block: Optional[str] = None
+            # Respect env flag: only merge into first system when explicitly enabled
+            prefer_merge = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+            if prefer_merge and (not mem0_in_first):
+                # Find the latest Mem0 system block and extract it
+                latest_idx: Optional[int] = None
+                for i in range(len(msgs) - 1, -1, -1):
+                    m = msgs[i]
+                    if m.get('role') == 'system':
+                        c = str(m.get('content') or '')
+                        if any(c.startswith(p) for p in prefixes):
+                            latest_idx = i
+                            break
+                if latest_idx is not None:
+                    mem0_block = str((msgs[latest_idx] or {}).get('content') or '')
+                    # Remove that block so the adapter can merge into first system
+                    msgs = msgs[:latest_idx] + msgs[latest_idx + 1:]
+
+            # Delegate to adapter for initial formatting
+            norm_msgs, overrides = self.adapter.format_initial_messages(
+                messages=msgs,
+                tools=(self.tools if (include_tools and bool(self.tools)) else None),
+                options=(adapter_opts or None),
+                mem0_block=mem0_block,
+            )
+            return norm_msgs, (overrides or {})
+        except Exception:
+            # Fallback: pass-through and attempt minimal option/tool mapping
+            out_msgs = list(self.conversation_history or [])
+            overrides: Dict[str, Any] = {}
+            try:
+                mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
+                if mapped:
+                    overrides['options'] = mapped
+            except Exception:
+                # Secondary fallback to Ollama-compatible fields
+                opts: Dict[str, Any] = {}
+                if self.max_output_tokens is not None:
+                    opts['num_predict'] = self.max_output_tokens
+                if self.ctx_size is not None:
+                    opts['num_ctx'] = self.ctx_size
+                if opts:
+                    overrides['options'] = opts
+            if include_tools and self.tools:
+                overrides['tools'] = self.tools
+            return out_msgs, overrides
 
     def _trace(self, event: str):
         """Record a structured, non-sensitive trace event."""
@@ -300,57 +425,97 @@ class OllamaTurboClient:
         try:
             # Generation options (reused across rounds)
             options = {}
+            # Prefer adapter options mapping; pass ctx_size via extra.num_ctx
+            adapter_opts: Dict[str, Any] = {}
             if self.max_output_tokens is not None:
-                options['num_predict'] = self.max_output_tokens
+                adapter_opts['max_tokens'] = self.max_output_tokens
             if self.ctx_size is not None:
-                options['num_ctx'] = self.ctx_size
+                adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+            try:
+                mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
+                if mapped:
+                    options.update(mapped)
+            except Exception:
+                # Fallback to direct fields if adapter mapping fails
+                if self.max_output_tokens is not None:
+                    options['num_predict'] = self.max_output_tokens
+                if self.ctx_size is not None:
+                    options['num_ctx'] = self.ctx_size
 
             rounds = 0
             all_tool_results: List[str] = []
             first_content: str = ""
             
             while True:
-                # Build request
+                # Build request (adapter-driven on initial round)
                 kwargs = {
                     'model': self.model,
-                    'messages': self.conversation_history,
                 }
-                # Warm models on server by requesting keep_alive if enabled
-                keep_val = self._resolve_keep_alive()
-                if keep_val is not None:
-                    kwargs['keep_alive'] = keep_val
-                if options:
-                    kwargs['options'] = options
-
-                # For non-streaming, always omit tools on the post-tool call to force
-                # a textual answer (test compatibility). Multi-round behavior is
-                # primarily supported in streaming mode.
                 include_tools = self.enable_tools and bool(self.tools) and (rounds == 0)
-                if include_tools:
-                    kwargs['tools'] = self.tools
+
+                if rounds == 0:
+                    # Prepare initial messages via adapter (may merge Mem0 into first system)
+                    norm_msgs, overrides = self._prepare_initial_messages_for_adapter(
+                        include_tools=include_tools,
+                        adapter_opts=adapter_opts,
+                    )
+                    kwargs['messages'] = norm_msgs
+                    # Save for accurate r0 tracing
+                    try:
+                        self._last_sent_messages = norm_msgs
+                    except Exception:
+                        pass
+                    # Warm models on server by requesting keep_alive if enabled
+                    keep_val = self._resolve_keep_alive()
+                    if keep_val is not None:
+                        kwargs['keep_alive'] = keep_val
+                    if overrides:
+                        kwargs.update(overrides)
+                else:
+                    # Subsequent rounds: pass-through history and mapped options
+                    kwargs['messages'] = self.conversation_history
+                    keep_val = self._resolve_keep_alive()
+                    if keep_val is not None:
+                        kwargs['keep_alive'] = keep_val
+                    if options:
+                        kwargs['options'] = options
+
+                # Optional request-level reasoning injection
+                self._maybe_inject_reasoning(kwargs)
 
                 self._trace(f"request:standard:round={rounds}{' tools' if include_tools else ''}")
-                # Trace Mem0 presence prior to dispatch
+                # Trace Mem0 presence prior to dispatch on the actual sent messages
                 self._trace_mem0_presence(kwargs.get('messages'), f"standard:r{rounds}")
                 response = self.client.chat(**kwargs)
 
-                # Extract message
+                # Normalize via protocol adapter (parses tool calls and strips markup/final)
+                nsr = self.adapter.parse_non_stream_response(response)
                 message = response.get('message', {})
-                content = message.get('content', '')
-                tool_calls = message.get('tool_calls', [])
-
-                # Harmony adapter: if provider didn't canonicalize tool calls, parse from content
-                if self.enable_tools and not tool_calls and content:
-                    cleaned, parsed_calls, final_seg = self._parse_harmony_tokens(content)
-                    # Capture analysis content into trace (if present)
-                    try:
-                        if getattr(self.harmony, 'last_analysis', None):
-                            self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
-                    except Exception:
-                        pass
-                    if parsed_calls:
-                        tool_calls = parsed_calls
-                        content = cleaned  # remove tool-call markup from assistant content
+                content = nsr.get('content') or message.get('content', '') or ''
+                tool_calls_raw = message.get('tool_calls') or []
+                tool_calls = tool_calls_raw
+                if not tool_calls:
+                    # Convert adapter-normalized tool calls into OpenAI-style for execution/history
+                    nsr_calls = nsr.get('tool_calls', []) or []
+                    if nsr_calls:
+                        tool_calls = [
+                            {
+                                'type': 'function',
+                                'id': (tc.get('id') or f"call_{i}"),
+                                'function': {
+                                    'name': tc.get('name') or '',
+                                    'arguments': tc.get('arguments')
+                                }
+                            }
+                            for i, tc in enumerate(nsr_calls, 1)
+                        ]
+                # Trace analysis if the adapter surfaced any (Harmony only)
+                try:
+                    hp = getattr(self.adapter, '_hp', None)
+                    if hp is not None and getattr(hp, 'last_analysis', None):
+                        self._trace(f"analysis:{truncate_text(hp.last_analysis, 180)}")
+                except Exception:
+                    pass
 
                 # On first round, capture any preface content
                 if rounds == 0 and content:
@@ -374,11 +539,20 @@ class OllamaTurboClient:
                     self._trace(f"tools:executed {len(tool_strings)}")
                     all_tool_results.extend(tool_strings)
 
-                    # Add tool results to history
-                    self.conversation_history.append({
-                        'role': 'tool',
-                        'content': '\n'.join(tool_strings)
-                    })
+                    # Adapter-driven tool message formatting (with tool_call_id), then reprompt
+                    try:
+                        new_msgs, _ovr = self.adapter.format_reprompt_after_tools(
+                            self.conversation_history,
+                            tool_results,
+                            options=adapter_opts if isinstance(adapter_opts, dict) else None,
+                        )
+                        self.conversation_history = new_msgs
+                    except Exception:
+                        # Fallback to a single aggregated tool message
+                        self.conversation_history.append({
+                            'role': 'tool',
+                            'content': '\n'.join(tool_strings)
+                        })
 
                     # Reprompt model using details
                     self._trace("reprompt:after-tools")
@@ -391,22 +565,8 @@ class OllamaTurboClient:
                     # Continue loop for potential additional tool rounds
                     continue
                 else:
-                    # Final textual answer (extract Harmony final channel if present; strip markup)
-                    final_out = content
-                    try:
-                        if content:
-                            cleaned, _, final_seg = self._parse_harmony_tokens(content)
-                            # Trace analysis if available
-                            try:
-                                if getattr(self.harmony, 'last_analysis', None):
-                                    self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
-                            except Exception:
-                                pass
-                            final_out = final_seg or cleaned
-                            if not final_out:
-                                final_out = self._strip_harmony_markup(content)
-                    except Exception:
-                        final_out = self._strip_harmony_markup(content)
+                    # Final textual answer (already normalized by adapter)
+                    final_out = content or self._strip_harmony_markup(message.get('content', '') or '')
 
                     # Reliability integrations (non-streaming): consensus and validator
                     try:
@@ -431,6 +591,8 @@ class OllamaTurboClient:
                                 keep_val2 = self._resolve_keep_alive()
                                 if keep_val2 is not None:
                                     kwargs2['keep_alive'] = keep_val2
+                                # Optional request-level reasoning injection
+                                self._maybe_inject_reasoning(kwargs2)
                                 # Do not include tools for consensus finalization
                                 resp2 = self.client.chat(**kwargs2)
                                 msg2 = resp2.get('message', {})
@@ -507,32 +669,39 @@ class OllamaTurboClient:
         try:
             kwargs = {
                 'model': self.model,
-                'messages': self.conversation_history,
-                'stream': True
+                'stream': True,
             }
-            # Generation options
-            options = {}
+            # Prefer adapter options mapping; pass ctx_size via extra.num_ctx
+            adapter_opts: Dict[str, Any] = {}
             if self.max_output_tokens is not None:
-                options['num_predict'] = self.max_output_tokens
+                adapter_opts['max_tokens'] = self.max_output_tokens
             if self.ctx_size is not None:
-                options['num_ctx'] = self.ctx_size
-            if options:
-                kwargs['options'] = options
+                adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+
+            # Use adapter to format initial messages and merge Mem0 if needed
+            norm_msgs, overrides = self._prepare_initial_messages_for_adapter(
+                include_tools=(self.enable_tools and bool(self.tools)),
+                adapter_opts=adapter_opts,
+            )
+            kwargs['messages'] = norm_msgs
+            # Save for accurate r0 tracing in streaming handler
+            try:
+                self._last_sent_messages = norm_msgs
+            except Exception:
+                pass
+            if overrides:
+                kwargs.update(overrides)
+
             keep_val = self._resolve_keep_alive()
             if keep_val is not None:
                 kwargs['keep_alive'] = keep_val
-            
-            if self.enable_tools and self.tools:
-                kwargs['tools'] = self.tools
-            
             self._trace("request:stream:start")
             # Trace Mem0 presence prior to initial streaming dispatch
             self._trace_mem0_presence(kwargs.get('messages'), "stream:init")
+            # Optional request-level reasoning injection
+            self._maybe_inject_reasoning(kwargs)
             return self.client.chat(**kwargs)
         except Exception as e:
-            # Downgrade to DEBUG to avoid noisy CLI output; with_retry will handle retries
-            self.logger.debug(f"Streaming creation error: {e}")
-            self._trace(f"stream:init:error {type(e).__name__}")
             raise RetryableError(f"Failed to create streaming response: {e}")
     
     def handle_streaming_response(self, response_stream, tools_enabled: bool = True) -> str:
@@ -551,27 +720,44 @@ class OllamaTurboClient:
                 # Use provided stream on the first round; create new ones subsequently
                 if rounds == 0:
                     stream = response_stream
-                    # Trace Mem0 presence for the initial streaming round (r0) as well
-                    self._trace_mem0_presence(self.conversation_history, "stream:r0")
+                    # Trace Mem0 presence for the initial streaming round (r0) using actual sent messages if available
+                    try:
+                        sent_msgs = getattr(self, '_last_sent_messages', None) or self.conversation_history
+                    except Exception:
+                        sent_msgs = self.conversation_history
+                    self._trace_mem0_presence(sent_msgs, "stream:r0")
                 else:
                     kwargs = {
                         'model': self.model,
                         'messages': self.conversation_history,
                         'stream': True
                     }
-                    # Generation options
-                    options = {}
+                    # Generation options (via adapter mapping)
+                    adapter_opts: Dict[str, Any] = {}
                     if self.max_output_tokens is not None:
-                        options['num_predict'] = self.max_output_tokens
+                        adapter_opts['max_tokens'] = self.max_output_tokens
                     if self.ctx_size is not None:
-                        options['num_ctx'] = self.ctx_size
-                    if options:
-                        kwargs['options'] = options
+                        adapter_opts['extra'] = {'num_ctx': self.ctx_size}
+                    try:
+                        mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
+                        if mapped:
+                            kwargs['options'] = mapped
+                    except Exception:
+                        # Fallback to direct fields if adapter mapping fails
+                        options = {}
+                        if self.max_output_tokens is not None:
+                            options['num_predict'] = self.max_output_tokens
+                        if self.ctx_size is not None:
+                            options['num_ctx'] = self.ctx_size
+                        if options:
+                            kwargs['options'] = options
                     if include_tools:
                         kwargs['tools'] = self.tools
                     keep_val = self._resolve_keep_alive()
                     if keep_val is not None:
                         kwargs['keep_alive'] = keep_val
+                    # Optional request-level reasoning injection
+                    self._maybe_inject_reasoning(kwargs)
                     # Trace Mem0 presence prior to subsequent streaming round dispatch
                     self._trace_mem0_presence(kwargs.get('messages'), f"stream:r{rounds}")
                     stream = self.client.chat(**kwargs)
@@ -579,12 +765,16 @@ class OllamaTurboClient:
                 self._trace(f"request:stream:round={rounds}{' tools' if include_tools else ''}")
 
                 # Streaming print control: print live on no-tools rounds, and on round 0 until a tool_call is detected
+                # Maintain both cleaned (for printing) and raw (for Harmony tool-call parsing) buffers
                 round_content = ""
+                round_content_clean = ""
+                round_raw = ""
                 # Track already emitted content length to avoid duplicates across reconnects
                 printed_len = 0
                 tool_calls: List[Dict[str, Any]] = []
                 tool_calls_detected = False
                 printed_prefix = False
+                end_round_for_tools = False
 
                 def _iter_stream_chunks(s):
                     # Simple wrapper to let us hook per-chunk accounting
@@ -593,36 +783,345 @@ class OllamaTurboClient:
 
                 try:
                     for chunk in _iter_stream_chunks(stream):
-                        message = chunk.get('message', {})
-                        if message.get('content'):
-                            piece = message['content']
-                            round_content += piece
-                            if not self.quiet:
-                                # Print only the new suffix not yet emitted (handles reconnect duplicates)
-                                # Print live until a tool call is detected in the current round
-                                can_print_live = (not include_tools) or (not tool_calls_detected)
-                                if can_print_live:
-                                    new_segment = round_content[printed_len:]
-                                    if new_segment:
-                                        safe_segment = self._strip_harmony_markup(new_segment)
-                                        if safe_segment:
-                                            if not printed_prefix:
-                                                print("🤖 Assistant: ", end="", flush=True)
-                                                printed_prefix = True
-                                            print(safe_segment, end="", flush=True)
-                                            printed_len = len(round_content)
-                        if message.get('tool_calls') and include_tools:
-                            tool_calls_detected = True
-                            for tool_call in message['tool_calls']:
+                        # Normalize chunk: some providers emit JSON strings/bytes or SSE lines
+                        ck = chunk
+                        # Reset events for each chunk to avoid leaking from previous chunks/rounds
+                        events: List[Dict[str, Any]] = []
+                        raw_str = None
+                        try:
+                            if isinstance(chunk, (bytes, bytearray)):
+                                raw_str = chunk.decode('utf-8', errors='ignore')
+                            elif isinstance(chunk, str):
+                                raw_str = chunk
+                            # Parse JSON string bodies
+                            if raw_str is not None:
+                                s_trim = raw_str.lstrip()
+                                if s_trim.startswith('{'):
+                                    ck = json.loads(s_trim)
+                                else:
+                                    # Try SSE format: lines beginning with 'data:'
+                                    if 'data:' in raw_str:
+                                        events_sse = []
+                                        for ln in raw_str.splitlines():
+                                            if not ln:
+                                                continue
+                                            if ln.startswith('data:'):
+                                                payload = ln[len('data:'):].strip()
+                                                if not payload or payload == '[DONE]':
+                                                    continue
+                                                try:
+                                                    obj = json.loads(payload)
+                                                    # Recurse through adapter for each parsed object
+                                                    for ev in (list(self.adapter.parse_stream_events(obj)) or []):
+                                                        events_sse.append(ev)
+                                                    # Also support simple {type,content}
+                                                    if not events_sse and isinstance(obj, dict) and obj.get('content') is not None:
+                                                        events_sse.append({'type': 'token', 'content': str(obj.get('content') or '')})
+                                                except Exception:
+                                                    # As last resort, treat as a token line
+                                                    events_sse.append({'type': 'token', 'content': payload})
+                                        if events_sse:
+                                            # Fast-path deliver parsed SSE events
+                                            events = events_sse
+                                            # Process events block below
+                                            pass
+                        except Exception:
+                            ck = chunk
+
+                        if not events:
+                            try:
+                                events = list(self.adapter.parse_stream_events(ck)) or []
+                            except Exception:
+                                events = []
+                        # If still no events, coerce non-dict chunk objects and parse `.data` payloads
+                        if not events and (not isinstance(ck, dict)):
+                            try:
+                                coerced = None
+                                # Pydantic v2
+                                if hasattr(ck, 'model_dump') and callable(getattr(ck, 'model_dump', None)):
+                                    coerced = ck.model_dump()
+                                # Pydantic v1 or similar
+                                elif hasattr(ck, 'dict') and callable(getattr(ck, 'dict', None)):
+                                    coerced = ck.dict()
+                                # Simple object with __dict__
+                                elif hasattr(ck, '__dict__'):
+                                    coerced = {k: v for k, v in vars(ck).items() if not str(k).startswith('_')}
+                                if isinstance(coerced, dict):
+                                    ck = coerced
+                                else:
+                                    # Some SSE libraries expose a `.data` attribute containing the JSON payload
+                                    data_payload = getattr(ck, 'data', None)
+                                    if data_payload is not None:
+                                        try:
+                                            if isinstance(data_payload, (bytes, bytearray)):
+                                                ds = data_payload.decode('utf-8', errors='ignore')
+                                            else:
+                                                ds = str(data_payload)
+                                            ds_trim = ds.lstrip()
+                                            if ds_trim.startswith('{'):
+                                                try:
+                                                    ck = json.loads(ds_trim)
+                                                except Exception:
+                                                    pass
+                                            elif 'data:' in ds:
+                                                # SSE-style payload with data: lines
+                                                events_sse2 = []
+                                                for ln in ds.splitlines():
+                                                    if not ln:
+                                                        continue
+                                                    if ln.startswith('data:'):
+                                                        payload = ln[len('data:'):].strip()
+                                                        if not payload or payload == '[DONE]':
+                                                            continue
+                                                        try:
+                                                            obj = json.loads(payload)
+                                                            for ev in (list(self.adapter.parse_stream_events(obj)) or []):
+                                                                events_sse2.append(ev)
+                                                            # Also support simple {type,content}
+                                                            if (not events_sse2) and isinstance(obj, dict) and obj.get('content') is not None:
+                                                                events_sse2.append({'type': 'token', 'content': str(obj.get('content') or '')})
+                                                        except Exception:
+                                                            events_sse2.append({'type': 'token', 'content': payload})
+                                                if events_sse2:
+                                                    events = events_sse2
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        # If we coerced to a dict or still have none, give adapter another chance
+                        if not events and isinstance(ck, dict):
+                            try:
+                                events = list(self.adapter.parse_stream_events(ck)) or []
+                            except Exception:
+                                events = []
+                        # Fallbacks if adapter yields nothing
+                        if not events and isinstance(ck, dict):
+                            # Optional lightweight tracing of chunk keys for diagnostics
+                            try:
+                                if self.show_trace:
+                                    # Only emit occasionally to avoid noise; suppress pure-metrics chunks
+                                    kset = set(ck.keys())
+                                    METRIC_KEYS = {
+                                        "model","created_at","done","done_reason",
+                                        "total_duration","load_duration",
+                                        # Common Ollama metrics
+                                        "prompt_eval_count","prompt_eval_duration",
+                                        "eval_count","eval_duration"
+                                    }
+                                    metrics_only = kset.issubset(METRIC_KEYS)
+                                    if not metrics_only:
+                                        keys = ','.join(list(ck.keys())[:6])
+                                        self._trace(f"stream:chunk:keys={keys}")
+                            except Exception:
+                                pass
+                            # 1) OpenAI-style consolidated message
+                            msg = ck.get('message') or {}
+                            if msg.get('content'):
+                                events.append({'type': 'token', 'content': self._strip_harmony_markup(str(msg.get('content')))} )
+                            for tc in (msg.get('tool_calls') or []) or []:
+                                fn = (tc or {}).get('function') or {}
+                                events.append({
+                                    'type': 'tool_call',
+                                    'id': str(tc.get('id') or ''),
+                                    'name': str(fn.get('name') or ''),
+                                    'arguments': fn.get('arguments')
+                                })
+                            # 1.5) Ollama-style streaming: top-level 'response' token pieces
+                            if not events and (ck.get('response') is not None):
+                                events.append({'type': 'token', 'content': str(ck.get('response') or '')})
+                            # Optional: top-level tool_calls if present
+                            for tc in (ck.get('tool_calls') or []) or []:
+                                fn = (tc or {}).get('function') or {}
+                                events.append({
+                                    'type': 'tool_call',
+                                    'id': str(tc.get('id') or ''),
+                                    'name': str(fn.get('name') or ''),
+                                    'arguments': fn.get('arguments')
+                                })
+                            # 2) SSE-style {type:'token'|'final', content}
+                            t = ck.get('type')
+                            if not events and t in {'token', 'final'} and (ck.get('content') is not None):
+                                events.append({'type': 'token', 'content': str(ck.get('content') or '')})
+                            # 3) Top-level content field
+                            if not events and (ck.get('content') is not None):
+                                events.append({'type': 'token', 'content': str(ck.get('content') or '')})
+                            # 4) choices[0].message.content (non-delta streaming or non-stream-like chunk)
+                            if not events and (ck.get('choices') is not None):
+                                try:
+                                    choices = ck.get('choices') or []
+                                    if choices:
+                                        message0 = (choices[0] or {}).get('message') or {}
+                                        cont0 = message0.get('content')
+                                        if cont0:
+                                            events.append({'type': 'token', 'content': str(cont0)})
+                                        for tc in (message0.get('tool_calls') or []) or []:
+                                            fn = (tc or {}).get('function') or {}
+                                            events.append({
+                                                'type': 'tool_call',
+                                                'id': str(tc.get('id') or ''),
+                                                'name': str(fn.get('name') or ''),
+                                                'arguments': fn.get('arguments')
+                                            })
+                                except Exception:
+                                    pass
+                        # Trace parsed events for diagnostics (types and count) after normalization
+                        try:
+                            if self.show_trace:
+                                types = ','.join([str(ev.get('type')) for ev in (events or [])][:6])
+                                self._trace(f"stream:events n={len(events)} types={types}")
+                                # Also trace chunk type/keys for visibility
+                                try:
+                                    if isinstance(ck, dict):
+                                        # Suppress pure-metrics chunks to reduce noise
+                                        kset = set(ck.keys())
+                                        METRIC_KEYS = {
+                                            "model","created_at","done","done_reason",
+                                            "total_duration","load_duration",
+                                            # Common Ollama metrics
+                                            "prompt_eval_count","prompt_eval_duration",
+                                            "eval_count","eval_duration"
+                                        }
+                                        metrics_only = kset.issubset(METRIC_KEYS)
+                                        if not metrics_only:
+                                            keys = ','.join(list(ck.keys())[:6])
+                                            self._trace(f"stream:chunk:keys={keys}")
+                                    else:
+                                        self._trace(f"stream:chunk:type={type(ck).__name__}")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # If still nothing and we have a raw string, trace prefix for diagnostics
+                        if not events and raw_str is not None and self.show_trace:
+                            try:
+                                preview = raw_str[:80].replace('\n', ' ')
+                                self._trace(f"stream:chunk:raw={preview}")
+                            except Exception:
+                                pass
+
+                        for ev in events:
+                            et = ev.get('type')
+                            # Treat both token and final events as printable/content-bearing
+                            if et in {'token', 'final'}:
+                                piece = str(ev.get('content') or '')
+                                if not piece:
+                                    continue
+                                round_content += piece
+                                # Capture raw content for tool-call parsing when tools are enabled
+                                try:
+                                    if include_tools and isinstance(chunk, dict):
+                                        raw_msg = (chunk.get('message') or {}).get('content')
+                                        if raw_msg:
+                                            round_raw += str(raw_msg)
+                                except Exception:
+                                    pass
+                                # Maintain a cleaned buffer specifically for printing to avoid leaking markup tokens
+                                try:
+                                    clean_piece = self._strip_harmony_markup(piece)
+                                except Exception:
+                                    clean_piece = piece
+                                round_content_clean += clean_piece
+
+                                # Compute the new printable segment before any potential tool-call detection
+                                new_segment_pre = ""
+                                if not self.quiet:
+                                    try:
+                                        new_segment_pre = round_content_clean[printed_len:]
+                                    except Exception:
+                                        new_segment_pre = ""
+
+                                # Early incremental Harmony tool-call detection: parse as the buffer grows
+                                if include_tools and (round_raw or round_content):
+                                    try:
+                                        source_for_parse = round_raw or round_content
+                                        cleaned_inc, parsed_calls_inc, _ = self._parse_harmony_tokens(source_for_parse)
+                                        # Trace analysis if available
+                                        try:
+                                            if getattr(self.harmony, 'last_analysis', None):
+                                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
+                                        except Exception:
+                                            pass
+                                        if parsed_calls_inc:
+                                            tool_calls = parsed_calls_inc
+                                            tool_calls_detected = True
+                                            # Replace round_content with cleaned to remove commentary segments
+                                            round_content = cleaned_inc or round_content
+                                            try:
+                                                round_content_clean = self._strip_harmony_markup(round_content)
+                                            except Exception:
+                                                pass
+                                            # Print any accumulated sanitized content up to detection before aborting
+                                            if not self.quiet:
+                                                try:
+                                                    new_segment = round_content_clean[printed_len:]
+                                                except Exception:
+                                                    new_segment = ""
+                                                if new_segment:
+                                                    if not printed_prefix:
+                                                        print("🤖 Assistant: ", end="", flush=True)
+                                                        printed_prefix = True
+                                                    print(new_segment, end="", flush=True)
+                                                    printed_len = len(round_content_clean)
+                                                    try:
+                                                        if self.show_trace:
+                                                            self._trace(f"stream:print bytes={len(new_segment)} total={printed_len}")
+                                                    except Exception:
+                                                        pass
+                                            # Abort further streaming for this round; execute tools immediately
+                                            end_round_for_tools = True
+                                            break
+                                    except Exception:
+                                        pass
+                                if not self.quiet and not tool_calls_detected:
+                                    # Print only the new suffix not yet emitted (handles reconnect duplicates)
+                                    # Print live until a tool call is detected in the current round
+                                    if new_segment_pre:
+                                        if not printed_prefix:
+                                            print("🤖 Assistant: ", end="", flush=True)
+                                            printed_prefix = True
+                                        # Always print sanitized tokens (no Harmony markup leakage)
+                                        print(new_segment_pre, end="", flush=True)
+                                        printed_len = len(round_content_clean)
+                                        # Trace printing metrics
+                                        try:
+                                            if self.show_trace:
+                                                self._trace(f"stream:print bytes={len(new_segment_pre)} total={printed_len}")
+                                        except Exception:
+                                            pass
+                            elif et == 'tool_call' and include_tools:
+                                tool_calls_detected = True
+                                # Normalize to OpenAI-style for tool executor/history
+                                oc = {
+                                    'type': 'function',
+                                    'id': ev.get('id') or '',
+                                    'function': {
+                                        'name': ev.get('name') or '',
+                                        'arguments': ev.get('arguments')
+                                    }
+                                }
                                 # Merge updates for same id
                                 existing = False
                                 for tc in tool_calls:
-                                    if tc.get('id') == tool_call.get('id'):
-                                        tc.update(tool_call)
+                                    if tc.get('id') == oc.get('id'):
+                                        tc.update(oc)
                                         existing = True
                                         break
                                 if not existing:
-                                    tool_calls.append(tool_call)
+                                    tool_calls.append(oc)
+                                # Trace tool-call delta detection
+                                try:
+                                    if self.show_trace:
+                                        fname = oc.get('function', {}).get('name')
+                                        self._trace(f"tools:delta:detected id={oc.get('id')} name={fname}")
+                                except Exception:
+                                    pass
+                                # End this streaming round immediately; execute tools next
+                                end_round_for_tools = True
+                                break
+                        # If an early tool-call was detected, end chunk consumption for this round
+                        # by breaking out of the for-chunk loop now.
+                        if end_round_for_tools:
+                            break
                 except Exception as se:
                     # Stream interrupted (timeout/connection), attempt reconnects handled by outer retry decorator for init only.
                     # Here we fall back to non-streaming finalization to preserve UX, per user preference.
@@ -652,9 +1151,11 @@ class OllamaTurboClient:
 
                 # If tools were requested and yielded calls, execute them and loop
                 # If no canonical tool_calls but Harmony markup is present, parse it
-                if not tool_calls and include_tools and round_content:
+                if not tool_calls and include_tools and (round_raw or round_content):
                     try:
-                        cleaned, parsed_calls, _ = self._parse_harmony_tokens(round_content)
+                        # Parse Harmony tokens from raw to preserve tool-call markers
+                        source_for_parse = round_raw or round_content
+                        cleaned, parsed_calls, _ = self._parse_harmony_tokens(source_for_parse)
                         # Trace analysis if available
                         try:
                             if getattr(self.harmony, 'last_analysis', None):
@@ -668,7 +1169,7 @@ class OllamaTurboClient:
                         pass
 
                 if tool_calls:
-                    if not self.show_trace and not self.quiet:
+                    if not self.quiet:
                         print("\n🔧 Processing tool calls...")
                     names = [tc.get('function', {}).get('name') for tc in tool_calls]
                     self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
@@ -686,11 +1187,20 @@ class OllamaTurboClient:
                     self._last_tool_results_strings = tool_strings
                     self._trace(f"tools:executed {len(tool_strings)}")
                     aggregated_results.extend(tool_strings)
-                    # Add tool message
-                    self.conversation_history.append({
-                        'role': 'tool',
-                        'content': '\n'.join(tool_strings)
-                    })
+                    # Adapter-driven tool message formatting (with tool_call_id), then reprompt
+                    try:
+                        new_msgs, _ovr = self.adapter.format_reprompt_after_tools(
+                            self.conversation_history,
+                            tool_results,
+                            options=None,
+                        )
+                        self.conversation_history = new_msgs
+                    except Exception:
+                        # Fallback to a single aggregated tool message
+                        self.conversation_history.append({
+                            'role': 'tool',
+                            'content': '\n'.join(tool_strings)
+                        })
                     # Reprompt model to synthesize an answer using tool details
                     self._trace("reprompt:after-tools")
                     self.conversation_history.append({
@@ -1779,88 +2289,15 @@ class OllamaTurboClient:
             print(f"❌ Mem0 command error: {e}")
 
     def _handle_mem0_nlu(self, text: str) -> bool:
-        """Very simple natural-language detection for memory actions.
-        Returns True if handled and chat should be skipped.
-        """
+        """NL memory helper: only respond to 'list memories'. Everything else goes to chat."""
         if not getattr(self, 'mem0_enabled', False) or not self.mem0_client:
             return False
-        lower = text.lower().strip()
         try:
-            # Add memory
-            if lower.startswith("remember that ") or lower.startswith("remember ") or lower.startswith("please remember ") or lower.startswith("save this:"):
-                # Remove leading directive words
-                prefixes = ["remember that ", "remember ", "please remember ", "save this:"]
-                mem_text = text
-                for p in prefixes:
-                    if lower.startswith(p):
-                        mem_text = text[len(p):].strip()
-                        break
-                if mem_text:
-                    # De-duplicate simple repeats using a short hash of normalized fact
-                    try:
-                        h = hashlib.sha1(self._normalize_fact(mem_text).encode('utf-8')).hexdigest()[:10]
-                        if self._last_mem_hash != h:
-                            metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
-                            if getattr(self, 'mem0_app_id', None):
-                                metadata["app_id"] = self.mem0_app_id
-                            if getattr(self, 'mem0_agent_id', None):
-                                metadata["agent_id"] = self.mem0_agent_id
-                            self._mem0_enqueue_add([{"role": "user", "content": mem_text}], metadata)
-                            self._last_mem_hash = h
-                    except Exception:
-                        # Fallback enqueue without dedupe
-                        metadata = {"source": "nlu", "category": "manual", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
-                        if getattr(self, 'mem0_app_id', None):
-                            metadata["app_id"] = self.mem0_app_id
-                        if getattr(self, 'mem0_agent_id', None):
-                            metadata["agent_id"] = self.mem0_agent_id
-                        self._mem0_enqueue_add([{"role": "user", "content": mem_text}], metadata)
-                    print("✅ I'll remember that.")
-                    return True
-            # Forget memory
-            if lower.startswith("forget that ") or lower.startswith("forget "):
-                prefixes = ["forget that ", "forget "]
-                q = text
-                for p in prefixes:
-                    if lower.startswith(p):
-                        q = text[len(p):].strip()
-                        break
-                if q:
-                    filters = {"user_id": self.mem0_user_id}
-                    results = self._mem0_search_api(q, filters=filters)
-                    deleted = 0
-                    for it in results or []:
-                        mem_text = it.get('memory') or (it.get('data') or {}).get('memory') or ''
-                        if q.lower() in mem_text.lower():
-                            try:
-                                self.mem0_client.delete(memory_id=it.get('id'))
-                                deleted += 1
-                            except Exception:
-                                pass
-                    print("🗑️ Forgotten." if deleted else "ℹ️ Nothing to forget matched.")
-                    return True
-            # Update memory (pattern: update <subject> to <new text>)
-            if lower.startswith("update ") and " to " in lower:
-                body = text[7:].strip()
-                parts2 = body.split(" to ", 1)
-                if len(parts2) == 2:
-                    subject, new_text = parts2[0].strip(), parts2[1].strip()
-                    filters = {"user_id": self.mem0_user_id}
-                    results = self._mem0_search_api(subject, filters=filters)
-                    if results:
-                        mem_id = results[0].get('id')
-                        try:
-                            self.mem0_client.update(memory_id=mem_id, text=new_text)
-                        except TypeError:
-                            self.mem0_client.update(memory_id=mem_id, data=new_text)
-                        print("✅ Updated.")
-                    else:
-                        # If no match, add new
-                        self._mem0_execute_add([{"role": "user", "content": new_text}], {"source": "nlu", "category": "manual"})
-                        print("✅ Not found; added as new.")
-                    return True
-            # List memories
-            if lower.startswith("list memories") or lower.startswith("show memories"):
+            import re
+            lower = text.lower()
+            # normalize internal whitespace, trim and strip simple trailing punctuation
+            norm = re.sub(r"\s+", " ", lower).strip().rstrip(".!?")
+            if norm == "list memories":
                 filters = {"user_id": self.mem0_user_id}
                 items = self._mem0_get_all_api(filters=filters)
                 if not items:
@@ -1871,50 +2308,10 @@ class OllamaTurboClient:
                     mem_text = it.get('memory') or (it.get('data') or {}).get('memory')
                     print(f"  {i}. {mem_text}")
                 return True
-            # Link memories (requires IDs)
-            if lower.startswith("link "):
-                parts2 = text.split()
-                if len(parts2) >= 3:
-                    id1 = parts2[1]
-                    id2 = parts2[2] if len(parts2) >= 3 else None
-                    if id1 and id2:
-                        try:
-                            self.mem0_client.link(memory1_id=id1, memory2_id=id2, user_id=self.mem0_user_id)
-                            print("🔗 Linked.")
-                        except Exception:
-                            print("ℹ️ Linking not available in this plan/SDK.")
-                        return True
-            # Search memories (explicit)
-            if lower.startswith("search memories for "):
-                q = text[len("search memories for "):].strip()
-                if q:
-                    filters = {"user_id": self.mem0_user_id}
-                    results = self._mem0_search_api(q, filters=filters)
-                    if not results:
-                        print("🔍 No matching memories.")
-                        return True
-                    print("🔍 Matches:")
-                    for i, it in enumerate(results[:5], 1):
-                        mem_text = it.get('memory') or (it.get('data') or {}).get('memory')
-                        print(f"  {i}. {mem_text}")
-                    return True
-            # Query memories
-            queries = {"what do you know about me", "what did i tell you", "do you remember", "what do you remember about me"}
-            if any(q in lower for q in queries):
-                filters = {"user_id": self.mem0_user_id}
-                results = self._mem0_search_api(text, filters=filters)
-                if not results:
-                    print("🤔 I don't have anything saved yet.")
-                    return True
-                print("🧠 Here's what I recall:")
-                for i, it in enumerate(results[:5], 1):
-                    mem_text = it.get('memory') or (it.get('data') or {}).get('memory')
-                    print(f"  {i}. {mem_text}")
-                return True
-        except Exception as e:
-            self.logger.debug(f"Mem0 NLU handler error: {e}")
             return False
-        return False
+        except Exception as e:
+            self.logger.debug(f"Mem0 NLU list error: {e}")
+            return False
     
     def interactive_mode(self):
         """Run interactive chat mode."""
