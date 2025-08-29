@@ -1,6 +1,6 @@
 # Ollama Turbo CLI
 
-A production-ready CLI application for interacting with gpt-oss:120b model through Ollama Turbo cloud service, featuring advanced tool calling capabilities and streaming responses.
+A production-ready CLI application for interacting with gpt-oss:120b AND deepseek V3.1:671B models through Ollama Turbo cloud service, featuring advanced tool calling capabilities and streaming responses.
 
 ## Features
 
@@ -166,63 +166,6 @@ Fetch specific HTTPS URLs through an allowlist proxy with SSRF protections.
 
 When to use: read a specific page/API without credentials.
 Tips: prefer HTTPS, small timeouts, minimal bytes. Only compact summaries are injected and may be truncated.
-
-### ✅ Reliable Chat (Reliability API)
-
-Grounded and validated answers via the internal Reliability API. Supports non-streaming and SSE streaming with a trailing summary event.
-
-When to use: you want citations, validator checks, or consensus heuristics.
-Flags: `ground`, `k`, `cite`, `check` (`off|warn|enforce`), `consensus` (int|bool; sent as integer), `engine`, `eval_corpus`.
-
-Notes:
-
-- If `consensus` is provided as `true` and `k` is unset, the client sends `consensus=3` by default.
-- `k` controls retrieval breadth; `consensus` controls the number of model votes. They are coupled only for defaults.
-- Fail-closed: if `ground=true` and `cite=true` but no sources resolve, the client returns a clear refusal and sets `summary.status = "no_docs"` with `grounded=false` and empty `citations`.
-- Streaming `summary` contract: `status` ∈ {`ok`,`no_docs`,`timeout`,`http_error`}; `provenance` is `retrieval` when grounded else `none`.
-
-Performance tips:
-
-- When responses are slow: omit `consensus`, set `check="off"`, and leave `k` unset to minimize load.
-- For complex queries, consider running `web_research` first to fetch sources, then ask `reliable_chat` to synthesize with citations.
-
-Example (non-stream):
-
-```python
-from src import plugin_loader
-fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
-out_json = fn(message="Summarize latest Llama 3.2 results; include citations.")
-# out_json is a JSON string with keys: tool, ok, content, summary, inject
-```
-
-Example (streaming aggregation):
-
-```python
-from src import plugin_loader
-fn = plugin_loader.TOOL_FUNCTIONS['reliable_chat']
-out_json = fn(message="Verify the claim and cite sources; aim for consensus, k=3.", stream=True)
-# content aggregates token stream; summary includes validator/consensus info
-```
-
-#### Windows-safe curl (SSE) — quick smoke
-
-```powershell
-$env:BASE = "http://127.0.0.1:8000"
-
-# Happy path (expect tokens + trailing summary with grounded:true when sources found)
-curl.exe --no-buffer $env:BASE/v1/chat/stream -H "content-type: application/json" `
-  -d '{"message":"When did Pearl Street Mall open?","ground":true,"cite":true,"k":4}'
-
-# Fail-closed path (expect refusal text + summary.status=no_docs, grounded:false, citations:[])
-curl.exe --no-buffer $env:BASE/v1/chat/stream -H "content-type: application/json" `
-  -d '{"message":"who won the 2047 denver mayor race","ground":true,"cite":true}'
-```
-
-Notes:
-
-- By default, auto-heuristics infer flags from the message (citations → ground+cite, verify → check=warn, consensus → consensus+k).
-- Configure base URL via `RELIABILITY_API_BASE` (defaults to `http://127.0.0.1:8000`).
-- Requires `API_KEY` if the FastAPI server enforces it; upstream `OLLAMA_API_KEY` is forwarded when present.
 
 ### 🔬 Web Research
 
@@ -660,8 +603,6 @@ pytest -q
 
 ### v1.1.0 (Current)
 
-- Reliability mode: grounding, citations, validator (off|warn|enforce), consensus (k)
-- Streaming reliability with trailing summary (grounded, citations, validator, consensus)
 - Heuristic auto-flags based on message intent; CLI/API flags plumbed end-to-end
 - Hardened plugin validation and None-stripping for tool args
 - Version bump and README/documentation updates
