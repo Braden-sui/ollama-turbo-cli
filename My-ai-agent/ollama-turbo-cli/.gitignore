@@ -73,3 +73,9 @@ tests/test_reliable_chat_tool.py
 tests/test_reliable_chat_plugin.py
 
 .sandbox/webchache/.sandbox/
+
+*.jar
+
+
+*.jar
+
