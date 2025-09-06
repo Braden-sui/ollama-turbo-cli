@@ -34,3 +34,5 @@ test-results/
 !.env.example
 .sandbox/webcache/*.bin
 .sandbox/webcache/*.json
+.sandbox
+*.jar
