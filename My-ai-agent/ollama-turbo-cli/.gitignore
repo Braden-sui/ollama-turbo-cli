@@ -72,4 +72,4 @@ src/plugins/reliable_chat.py
 tests/test_reliable_chat_tool.py
 tests/test_reliable_chat_plugin.py
 
-.sandbox/webchache/
+.sandbox/webchache/.sandbox/
