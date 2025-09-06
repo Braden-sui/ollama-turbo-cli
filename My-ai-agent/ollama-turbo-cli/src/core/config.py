@@ -113,7 +113,7 @@ class Mem0Config:
     vector_port: int = 0
     ollama_url: Optional[str] = None
     llm_model: Optional[str] = None
-    embedder_model: str = "nomic-embed-text"
+    embedder_model: str = "embeddinggemma"
     user_id: str = "cli-user"  # unified default across client and config
     agent_id: Optional[str] = None
     app_id: Optional[str] = None
