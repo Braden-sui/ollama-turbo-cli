@@ -368,7 +368,7 @@ python -m src.cli --message "Research: What are the latest results on Llama 3.2 
 - `MEM0_APP_ID`: Optional app id for tagging
 - `MEM0_ORG_ID`: Optional organization id
 - `MEM0_PROJECT_ID`: Optional project id
-- `MEM0_VERSION`: Preferred Mem0 API version (default: "v2"). The client prefers v2 and gracefully falls back if the SDK doesn't accept the `version` parameter.
+- `MEM0_VERSION`: Preferred Mem0 API version (default: "v2"). The client prefers v2 and gracefully falls back if the SDK doesn't support the `version` parameter.
 
 Mem0 runtime knobs (advanced):
 
@@ -383,6 +383,26 @@ Mem0 runtime knobs (advanced):
 - `MEM0_BREAKER_COOLDOWN_MS`: Breaker cooldown in ms (default: `60000`)
 - `MEM0_SHUTDOWN_FLUSH_MS`: Shutdown flush timeout in ms (default: `3000`)
 - `MEM0_SEARCH_WORKERS`: Tiny thread pool size for Mem0 searches (default: `2`)
+
+Local OSS/OpenMemory mode (no cloud key required):
+
+- `MEM0_USE_LOCAL`: Set to `1` to enable local OpenMemory/Mem0 OSS client
+- Optional config sources (first found wins):
+  - `MEM0_LOCAL_CONFIG_PATH`: Path to a JSON config file
+  - `MEM0_LOCAL_CONFIG_JSON`: Inline JSON string with config
+- If no explicit config is provided, a sensible default is synthesized from env:
+  - `MEM0_OLLAMA_BASE_URL`: Base URL for local Ollama (default: resolved client host)
+  - `MEM0_LLM_PROVIDER`/`MEM0_LLM_MODEL` (default: `ollama` / current model)
+  - `MEM0_EMBEDDER_PROVIDER`/`MEM0_EMBEDDER_MODEL` (default: `ollama` / `nomic-embed-text`)
+  - `MEM0_VECTOR_PROVIDER` (default: `qdrant`)
+  - `MEM0_VECTOR_HOST`/`MEM0_VECTOR_PORT` (default: `127.0.0.1` / `6333`)
+  - `MEM0_HISTORY_DB_PATH` for local SQLite history (optional)
+  - Graph store (optional): `MEM0_GRAPH_PROVIDER`, `MEM0_GRAPH_URL`, `MEM0_GRAPH_USERNAME`, `MEM0_GRAPH_PASSWORD`
+
+Notes:
+
+- Remote/platform mode remains fully supported when `MEM0_API_KEY` is provided.
+- The client auto-detects which Mem0 implementation is present and adapts API call signatures for search/get_all across versions.
 
 ### Command Line Options
 
@@ -410,10 +430,10 @@ While in interactive mode:
 
 ## Mem0 Memory System
 
-Mem0 is integrated as the long-term memory store. It is optional and enabled when `MEM0_API_KEY` is present in your `.env`.
+Mem0 is integrated as the long-term memory store. It is optional and enabled when `MEM0_API_KEY` is present (remote) or `MEM0_USE_LOCAL=1` is set (local OSS).
 
 - **Initialization**: Loaded silently from environment variables. No runtime prompts.
-- **Status banner**: Interactive mode shows `Mem0: enabled (user: <id>)` or `Mem0: disabled (no key)`.
+- **Status banner**: Interactive mode shows `Mem0: enabled (<mode>, user: <id>)` or guidance to enable local/remote.
 - **Injection hygiene**: At most one "Relevant information:" system block is injected per turn before your message; previous injection blocks are removed each turn. Local conversation history is capped at 10 turns.
 - **Natural language intents**: You can type phrases like:
   - "remember ...", "forget ...", "update X to Y", "list/show memories", "link `<id1>` `<id2>`", "search memories for ...", or "what do you know about me".
@@ -464,6 +484,18 @@ See `.env.example` for all variables, including:
 - `SHELL_TOOL_ALLOW`, `SHELL_TOOL_CONFIRM`, `SHELL_TOOL_ALLOWLIST`, `SHELL_TOOL_MAX_OUTPUT`, `SHELL_TOOL_ROOT`
 - `SANDBOX_NET`, `SANDBOX_NET_ALLOW`, `SANDBOX_ALLOW_HTTP`, `SANDBOX_BLOCK_PRIVATE_IPS`, `SANDBOX_MAX_DOWNLOAD_MB`, `SANDBOX_RATE_PER_HOST`, `SANDBOX_HTTP_CACHE_TTL_S`, `SANDBOX_HTTP_CACHE_MB`
 - `TOOL_CONTEXT_MAX_CHARS`
+
+### Tool result payloads
+
+`TOOL_RESULTS_FORMAT` controls how tool outputs are fed back to the model during the reprompt after tool execution. This applies to both streaming and non‑streaming flows.
+
+- `string` (default): adapters receive `list[str]` (stringified tool results). If the adapter raises, the client injects one `'tool'` message per tool call with `tool_call_id` and string content (or a single aggregated `'tool'` message as a last resort). CLI prints remain unchanged.
+
+- `object`: adapters receive `list[dict]` (structured tool results). If the adapter raises, the client falls back to the same string injection behavior described above.
+
+Note: streaming intentionally passes `options=None` to the adapter to preserve behavior, while non‑streaming passes any `adapter_opts` established earlier in the call path.
+
+JSON string arguments for tools: When a tool call provides its `function.arguments` as a JSON string (OpenAI-style), the runtime automatically parses it to a dict before invoking the tool implementation.
 
 ## Error Handling
 

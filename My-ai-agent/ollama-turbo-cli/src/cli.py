@@ -139,9 +139,43 @@ Examples:
                        default=os.getenv('LOG_LEVEL', 'INFO'),
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Set logging level')
+    # Mem0 configuration
+    mem0_group = parser.add_argument_group('Mem0 Configuration', 'Control memory and context settings')
+    mem0_group.add_argument('--mem0', 
+                          action='store_true',
+                          default=os.getenv('MEM0_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on'),
+                          help='Enable Mem0 memory system (default: enabled)')
+    mem0_group.add_argument('--mem0-local', 
+                          action='store_true',
+                          default=os.getenv('MEM0_USE_LOCAL', '0').lower() in ('1', 'true', 'yes', 'on'),
+                          help='Use local Mem0 (OSS) mode instead of cloud')
+    mem0_group.add_argument('--mem0-vector', 
+                          choices=['qdrant', 'chroma'],
+                          default=os.getenv('MEM0_VECTOR_PROVIDER', 'chroma'),
+                          help='Vector store provider for local Mem0 (default: chroma)')
+    mem0_group.add_argument('--mem0-vector-host', 
+                          default=os.getenv('MEM0_VECTOR_HOST', ':memory:'),
+                          help='Vector store host or path (default: :memory: for Chroma)')
+    mem0_group.add_argument('--mem0-vector-port', 
+                          type=int,
+                          default=int(os.getenv('MEM0_VECTOR_PORT', '0') or '0'),
+                          help='Vector store port (if applicable)')
+    mem0_group.add_argument('--mem0-ollama-url', 
+                          default=os.getenv('MEM0_OLLAMA_BASE_URL'),
+                          help='Ollama base URL for local embeddings/LLM')
+    mem0_group.add_argument('--mem0-model', 
+                          default=os.getenv('MEM0_LLM_MODEL'),
+                          help='Model to use for Mem0 (defaults to main model if not set)')
+    mem0_group.add_argument('--mem0-embedder', 
+                          default=os.getenv('MEM0_EMBEDDER_MODEL', 'nomic-embed-text'),
+                          help='Embedding model for Mem0')
+    mem0_group.add_argument('--mem0-user', 
+                          default=os.getenv('MEM0_USER_ID', 'cli-user'),
+                          help='User ID for memory isolation')
+
     parser.add_argument('--version', 
                        action='version', 
-                       version='%(prog)s 1.1.0')
+                       version='%(prog)s 1.2.0')
     
     args = parser.parse_args()
     
@@ -206,6 +240,16 @@ Examples:
             reasoning_mode=args.reasoning_mode,
             protocol=args.protocol,
             quiet=args.quiet,
+            # Mem0 configuration
+            mem0_enabled=args.mem0,
+            mem0_local=args.mem0_local,
+            mem0_vector_provider=args.mem0_vector,
+            mem0_vector_host=args.mem0_vector_host,
+            mem0_vector_port=args.mem0_vector_port if args.mem0_vector_port > 0 else None,
+            mem0_ollama_url=args.mem0_ollama_url,
+            mem0_llm_model=args.mem0_model,
+            mem0_embedder_model=args.mem0_embedder,
+            mem0_user_id=args.mem0_user,
             max_output_tokens=args.max_output_tokens,
             ctx_size=args.ctx_size,
             tool_print_limit=args.tool_print_limit,

@@ -21,16 +21,17 @@ __all__ = [
 # Legacy tool implementations removed — this module now serves as a thin
 # backward-compatibility shim that re-exports dynamic plugin functions.
 
-# Compatibility shim: re-export dynamic plugin aggregates
+# Compatibility shim: re-export dynamic plugin aggregates lazily
 from . import plugin_loader as _plugin_loader
 
-# Expose the plugin-managed tool schemas and functions for backward compatibility
-TOOL_SCHEMAS = _plugin_loader.TOOL_SCHEMAS
-TOOL_FUNCTIONS = _plugin_loader.TOOL_FUNCTIONS
-
-# Convenience re-exports
-reload_plugins = _plugin_loader.reload_plugins
-get_manager = _plugin_loader.get_manager
+def __getattr__(name: str):
+    if name == "TOOL_SCHEMAS":
+        return _plugin_loader.TOOL_SCHEMAS
+    if name == "TOOL_FUNCTIONS":
+        return _plugin_loader.TOOL_FUNCTIONS
+    if name in {"reload_plugins", "get_manager"}:
+        return getattr(_plugin_loader, name)
+    raise AttributeError(name)
 
 def _plugin_fn(name: str):
     funcs = _plugin_loader.TOOL_FUNCTIONS

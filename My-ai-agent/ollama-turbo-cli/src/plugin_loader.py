@@ -151,6 +151,11 @@ class PluginManager:
             raise PluginLoadError(f"Cannot create import spec for {file_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
+        # Helpful debug to locate slow or hanging imports
+        try:
+            self._logger.debug(f"Importing plugin module from '{file_path}' as '{module_name}'")
+        except Exception:
+            pass
         spec.loader.exec_module(module)  # type: ignore[attr-defined]
         return module
 
@@ -352,9 +357,66 @@ class PluginManager:
             return dict(self._functions)
 
 
-# Module-level default manager and aggregates for core usage
+# Module-level default manager and lazy aggregates
 _default_manager = PluginManager()
-TOOL_SCHEMAS, TOOL_FUNCTIONS = _default_manager.load(reset=True)
+
+# Caches (populated on first access unless disabled). Kept private; access via __getattr__
+_CACHED_SCHEMAS: Optional[List[Dict[str, Any]]] = None
+_CACHED_FUNCTIONS: Optional[Dict[str, Callable[..., str]]] = None
+
+def _truthy_env(name: str) -> bool:
+    try:
+        v = os.getenv(name)
+        return v is not None and str(v).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        return False
+
+def _plugins_mode() -> str:
+    """Return 'off' | 'lazy' | 'eager'. Defaults to lazy for safety in tests."""
+    try:
+        if _truthy_env("OLLAMA_DISABLE_PLUGINS"):
+            return "off"
+        mode = (os.getenv("OLLAMA_PLUGINS_MODE") or "").strip().lower()
+        if mode in {"off", "disable", "disabled"}:
+            return "off"
+        if mode in {"eager", "on"} or _truthy_env("OLLAMA_PLUGINS_EAGER"):
+            return "eager"
+        if mode in {"lazy"} or _truthy_env("OLLAMA_PLUGINS_LAZY"):
+            return "lazy"
+    except Exception:
+        pass
+    return "lazy"
+
+def ensure_loaded(reset: bool = False, additional_paths: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., str]]]:
+    """Ensure plugins are loaded into the default manager and caches.
+
+    Honors env modes:
+      - off: returns empty aggregates
+      - lazy: load on first access
+      - eager: callers may invoke this at import-sites to force load
+    """
+    global _CACHED_SCHEMAS, _CACHED_FUNCTIONS
+    mode = _plugins_mode()
+    if mode == "off":
+        _CACHED_SCHEMAS, _CACHED_FUNCTIONS = [], {}
+        return [], {}
+    if reset or _CACHED_SCHEMAS is None or _CACHED_FUNCTIONS is None:
+        schemas, funcs = _default_manager.load(reset=True, additional_paths=additional_paths)
+        _CACHED_SCHEMAS, _CACHED_FUNCTIONS = list(schemas), dict(funcs)
+    return list(_CACHED_SCHEMAS or []), dict(_CACHED_FUNCTIONS or {})
+
+def __getattr__(name: str):
+    """Lazy attribute access for TOOL_SCHEMAS / TOOL_FUNCTIONS.
+
+    Accessing these will trigger a load unless plugins are disabled via env.
+    """
+    if name == "TOOL_SCHEMAS":
+        schemas, _ = ensure_loaded(reset=False)
+        return schemas
+    if name == "TOOL_FUNCTIONS":
+        _, funcs = ensure_loaded(reset=False)
+        return funcs
+    raise AttributeError(name)
 
 
 def get_manager() -> PluginManager:
@@ -362,8 +424,5 @@ def get_manager() -> PluginManager:
 
 
 def reload_plugins(additional_paths: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., str]]]:
-    """Reload plugins into the default manager and update module-level aggregates."""
-    global TOOL_SCHEMAS, TOOL_FUNCTIONS
-    schemas, funcs = _default_manager.load(reset=True, additional_paths=additional_paths)
-    TOOL_SCHEMAS, TOOL_FUNCTIONS = schemas, funcs
-    return schemas, funcs
+    """Reload plugins into the default manager and refresh caches."""
+    return ensure_loaded(reset=True, additional_paths=additional_paths)

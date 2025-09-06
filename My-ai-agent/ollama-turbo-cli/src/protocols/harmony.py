@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import json
 
 from ..harmony_processor import HarmonyProcessor
 from ..types import (
@@ -72,7 +73,41 @@ class HarmonyAdapter(ProtocolAdapter):
         options: Optional[AdapterOptions] = None,
     ) -> Tuple[List[ChatMessage], Dict[str, Any]]:
         out: List[ChatMessage] = list(messages or [])
-        # For Harmony, the caller typically appends a user reprompt already; adapter may pass through
+        # Identify the most recent assistant message that contains tool_calls
+        last_tool_call_msg: Optional[ChatMessage] = None
+        for i in range(len(out) - 1, -1, -1):
+            msg = out[i]
+            if (msg or {}).get("role") == "assistant" and (msg or {}).get("tool_calls"):
+                last_tool_call_msg = msg
+                break
+
+        # If we have tool calls and corresponding results, append 'tool' messages
+        if last_tool_call_msg:
+            calls: List[Dict[str, Any]] = list(last_tool_call_msg.get("tool_calls") or [])
+            for idx, tr in enumerate(tool_results or []):
+                try:
+                    tc = calls[idx] if idx < len(calls) else {}
+                except Exception:
+                    tc = {}
+                tool_call_id = str((tc or {}).get("id") or f"call_h_{idx+1}")
+                tool_name = str(tr.get("tool") or (tc.get("name") if isinstance(tc, dict) else "tool") or "tool")
+                content_obj = tr.get("content")
+                # Ensure content is a string for transport
+                if isinstance(content_obj, (dict, list)):
+                    try:
+                        content_str = json.dumps(content_obj, ensure_ascii=False)
+                    except Exception:
+                        content_str = str(content_obj)
+                else:
+                    content_str = str(content_obj) if content_obj is not None else ""
+                out.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "content": content_str,
+                })
+
+        # Map generation options if provided
         payload_overrides: Dict[str, Any] = {}
         mapped = self.map_options(options)
         if mapped:

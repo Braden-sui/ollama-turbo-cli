@@ -10,34 +10,40 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Union, Tuple
-import ollama
 from ollama import Client
 import threading
 import queue
 import time
 import atexit
-import hashlib
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-import re
 
-from .plugin_loader import TOOL_SCHEMAS, TOOL_FUNCTIONS
+from . import plugin_loader as _plugin_loader
 from .utils import with_retry, RetryableError, OllamaAPIError, truncate_text, format_conversation_history
 from .prompt_manager import PromptManager
 from .harmony_processor import HarmonyProcessor
-from .tool_executor import ToolExecutor
-from .developer_message_builder import DeveloperMessageBuilder
 from .reliability.retrieval.pipeline import RetrievalPipeline
 from .reliability.grounding.context_builder import ContextBuilder
-from .reliability.guards.validator import Validator
-from .reliability.guards.consensus import run_consensus
 from .protocols import get_adapter
+from .transport import networking as _net
+from .streaming import runner as _runner, standard as _standard
+from .tools_runtime.executor import ToolRuntimeExecutor
 
 
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None):
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
+                 # Mem0 configuration
+                 mem0_enabled: bool = True,
+                 mem0_local: bool = False,
+                 mem0_vector_provider: str = 'chroma',
+                 mem0_vector_host: str = ':memory:',
+                 mem0_vector_port: int = 0,
+                 mem0_ollama_url: Optional[str] = None,
+                 mem0_llm_model: Optional[str] = None,
+                 mem0_embedder_model: str = 'nomic-embed-text',
+                 mem0_user_id: str = 'cli-user'):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -94,6 +100,11 @@ class OllamaTurboClient:
         self._mem0_breaker_recovered_logged: bool = False
         self._last_mem_hash: Optional[str] = None
         self._mem0_search_workers = int(os.getenv('MEM0_SEARCH_WORKERS', '2') or '2')
+        # Mem0 search timeout unified here (ms)
+        try:
+            self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
+        except Exception:
+            self.mem0_search_timeout_ms = 500
         # Tool-call iteration controls
         env_mrt = os.getenv('MULTI_ROUND_TOOLS')
         if env_mrt is not None:
@@ -141,6 +152,18 @@ class OllamaTurboClient:
             'consensus': bool(consensus),
             'eval_corpus': eval_corpus,
         }
+        # Split retrieval vs consensus k to avoid coupling
+        try:
+            rag_k_env = os.getenv('RAG_TOPK', '5')
+            cons_k_env = os.getenv('CONSENSUS_K', '')
+            rag_k_val = int(self.reliability.pop('k', None) or (rag_k_env if rag_k_env.isdigit() else 5))
+        except Exception:
+            rag_k_val = 5
+        try:
+            consensus_k_val = int(cons_k_env) if cons_k_env.isdigit() else None
+        except Exception:
+            consensus_k_val = None
+        self.reliability.update({'rag_k': rag_k_val, 'consensus_k': consensus_k_val})
         # Reliability runtime state
         self._last_context_blocks: List[Dict[str, Any]] = []
         self._last_citations_map: Dict[str, Any] = {}
@@ -204,14 +227,29 @@ class OllamaTurboClient:
             parsed_hist = 10
         self.max_history = max(2, min(parsed_hist, 10))
         
-        # Set up tools if enabled (use copies to avoid global mutation leaks)
+        # Set up tools if enabled (use copies to avoid global mutation leaks).
+        # Access plugin aggregates lazily to avoid import-time plugin loading.
         if enable_tools:
-            # Copy lists/dicts so per-client monkeypatching doesn't affect globals/tests
-            self.tools = list(TOOL_SCHEMAS)
-            self.tool_functions = dict(TOOL_FUNCTIONS)
+            schemas = _plugin_loader.TOOL_SCHEMAS  # triggers load only now
+            funcs = _plugin_loader.TOOL_FUNCTIONS
+            self.tools = list(schemas)
+            self.tool_functions = dict(funcs)
         else:
             self.tools = []
             self.tool_functions = {}
+        
+        # Mem0 configuration
+        self.mem0_config = {
+            'enabled': mem0_enabled,
+            'local': mem0_local,
+            'vector_provider': mem0_vector_provider,
+            'vector_host': mem0_vector_host,
+            'vector_port': mem0_vector_port,
+            'ollama_url': mem0_ollama_url or self.host,  # Default to main client's host
+            'llm_model': mem0_llm_model or model,  # Default to main model
+            'embedder_model': mem0_embedder_model,
+            'user_id': mem0_user_id,
+        }
         
         # Initialize Mem0 memory system (optional)
         self._init_mem0()
@@ -448,233 +486,14 @@ class OllamaTurboClient:
             # Clear idempotency header after the turn
             self._clear_idempotency_key()
     
-    @with_retry(max_retries=3)
     def _handle_standard_chat(self, *, _suppress_errors: bool = False) -> str:
-        """Handle non-streaming chat interaction."""
-        try:
-            # Generation options (reused across rounds)
-            options = {}
-            # Prefer adapter options mapping; pass ctx_size via extra.num_ctx
-            adapter_opts: Dict[str, Any] = {}
-            if self.max_output_tokens is not None:
-                adapter_opts['max_tokens'] = self.max_output_tokens
-            if self.ctx_size is not None:
-                adapter_opts['extra'] = {'num_ctx': self.ctx_size}
-            # Sampling parameters
-            if self.temperature is not None:
-                adapter_opts['temperature'] = self.temperature
-            if self.top_p is not None:
-                adapter_opts['top_p'] = self.top_p
-            if self.presence_penalty is not None:
-                adapter_opts['presence_penalty'] = self.presence_penalty
-            if self.frequency_penalty is not None:
-                adapter_opts['frequency_penalty'] = self.frequency_penalty
-            try:
-                mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
-                if mapped:
-                    options.update(mapped)
-            except Exception:
-                # Fallback to direct fields if adapter mapping fails
-                if self.max_output_tokens is not None:
-                    options['num_predict'] = self.max_output_tokens
-                if self.ctx_size is not None:
-                    options['num_ctx'] = self.ctx_size
-
-            rounds = 0
-            all_tool_results: List[str] = []
-            first_content: str = ""
-            
-            while True:
-                # Build request (adapter-driven on initial round)
-                kwargs = {
-                    'model': self.model,
-                }
-                include_tools = self.enable_tools and bool(self.tools) and (rounds == 0)
-
-                if rounds == 0:
-                    # Prepare initial messages via adapter (may merge Mem0 into first system)
-                    norm_msgs, overrides = self._prepare_initial_messages_for_adapter(
-                        include_tools=include_tools,
-                        adapter_opts=adapter_opts,
-                    )
-                    kwargs['messages'] = norm_msgs
-                    # Save for accurate r0 tracing
-                    try:
-                        self._last_sent_messages = norm_msgs
-                    except Exception:
-                        pass
-                    # Warm models on server by requesting keep_alive if enabled
-                    keep_val = self._resolve_keep_alive()
-                    if keep_val is not None:
-                        kwargs['keep_alive'] = keep_val
-                    if overrides:
-                        kwargs.update(overrides)
-                else:
-                    # Subsequent rounds: pass-through history and mapped options
-                    kwargs['messages'] = self.conversation_history
-                    keep_val = self._resolve_keep_alive()
-                    if keep_val is not None:
-                        kwargs['keep_alive'] = keep_val
-                    if options:
-                        kwargs['options'] = options
-
-                # Optional request-level reasoning injection
-                self._maybe_inject_reasoning(kwargs)
-
-                self._trace(f"request:standard:round={rounds}{' tools' if include_tools else ''}")
-                # Trace Mem0 presence prior to dispatch on the actual sent messages
-                self._trace_mem0_presence(kwargs.get('messages'), f"standard:r{rounds}")
-                response = self.client.chat(**kwargs)
-
-                # Normalize via protocol adapter (parses tool calls and strips markup/final)
-                nsr = self.adapter.parse_non_stream_response(response)
-                message = response.get('message', {})
-                content = nsr.get('content') or message.get('content', '') or ''
-                tool_calls_raw = message.get('tool_calls') or []
-                tool_calls = tool_calls_raw
-                if not tool_calls:
-                    # Convert adapter-normalized tool calls into OpenAI-style for execution/history
-                    nsr_calls = nsr.get('tool_calls', []) or []
-                    if nsr_calls:
-                        tool_calls = [
-                            {
-                                'type': 'function',
-                                'id': (tc.get('id') or f"call_{i}"),
-                                'function': {
-                                    'name': tc.get('name') or '',
-                                    'arguments': tc.get('arguments')
-                                }
-                            }
-                            for i, tc in enumerate(nsr_calls, 1)
-                        ]
-                # Trace analysis if the adapter surfaced any (Harmony only)
-                try:
-                    hp = getattr(self.adapter, '_hp', None)
-                    if hp is not None and getattr(hp, 'last_analysis', None):
-                        self._trace(f"analysis:{truncate_text(hp.last_analysis, 180)}")
-                except Exception:
-                    pass
-
-                # On first round, capture any preface content
-                if rounds == 0 and content:
-                    first_content = self._strip_harmony_markup(content)
-
-                if tool_calls and self.enable_tools:
-                    # Add assistant message with tool calls
-                    self.conversation_history.append({
-                        'role': 'assistant',
-                        'content': self._strip_harmony_markup(content),
-                        'tool_calls': tool_calls
-                    })
-                    names = [tc.get('function', {}).get('name') for tc in tool_calls]
-                    self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
-
-                    # Execute tools
-                    tool_results = self._execute_tool_calls(tool_calls)
-                    self._last_tool_results_structured = tool_results  # for future API
-                    tool_strings = [self._serialize_tool_result_to_string(tr) for tr in tool_results]
-                    self._last_tool_results_strings = tool_strings
-                    self._trace(f"tools:executed {len(tool_strings)}")
-                    all_tool_results.extend(tool_strings)
-
-                    # Adapter-driven tool message formatting (with tool_call_id), then reprompt
-                    try:
-                        new_msgs, _ovr = self.adapter.format_reprompt_after_tools(
-                            self.conversation_history,
-                            tool_results,
-                            options=adapter_opts if isinstance(adapter_opts, dict) else None,
-                        )
-                        self.conversation_history = new_msgs
-                    except Exception:
-                        # Fallback to a single aggregated tool message
-                        self.conversation_history.append({
-                            'role': 'tool',
-                            'content': '\n'.join(tool_strings)
-                        })
-
-                    # Reprompt model using details
-                    self._trace("reprompt:after-tools")
-                    self.conversation_history.append({
-                        'role': 'user',
-                        'content': self.prompt.reprompt_after_tools()
-                    })
-
-                    rounds += 1
-                    # Continue loop for potential additional tool rounds
-                    continue
-                else:
-                    # Final textual answer (already normalized by adapter)
-                    final_out = content or self._strip_harmony_markup(message.get('content', '') or '')
-
-                    # Reliability integrations (non-streaming): consensus and validator
-                    try:
-                        # Skip consensus if tools were involved to avoid voting on a different path
-                        tools_used_this_turn = bool(all_tool_results)
-                        if (not tools_used_this_turn) and self.reliability.get('consensus') and isinstance(self.reliability.get('k'), int) and (self.reliability.get('k') or 0) > 1:
-                            def _gen_once():
-                                kwargs2 = {
-                                    'model': self.model,
-                                    'messages': self.conversation_history,
-                                }
-                                options2: Dict[str, Any] = {}
-                                if self.max_output_tokens is not None:
-                                    options2['num_predict'] = self.max_output_tokens
-                                if self.ctx_size is not None:
-                                    options2['num_ctx'] = self.ctx_size
-                                # Deterministic settings for consensus runs
-                                options2['temperature'] = 0
-                                options2['top_p'] = 0
-                                if options2:
-                                    kwargs2['options'] = options2
-                                keep_val2 = self._resolve_keep_alive()
-                                if keep_val2 is not None:
-                                    kwargs2['keep_alive'] = keep_val2
-                                # Optional request-level reasoning injection
-                                self._maybe_inject_reasoning(kwargs2)
-                                # Do not include tools for consensus finalization
-                                resp2 = self.client.chat(**kwargs2)
-                                msg2 = resp2.get('message', {})
-                                cont2 = msg2.get('content', '') or ''
-                                try:
-                                    cleaned2, _, final2 = self._parse_harmony_tokens(cont2)
-                                    return (final2 or cleaned2 or self._strip_harmony_markup(cont2)) or ""
-                                except Exception:
-                                    return self._strip_harmony_markup(cont2)
-                            cns = run_consensus(_gen_once, k=int(self.reliability.get('k') or 1))
-                            if cns.get('final'):
-                                final_out = cns['final']
-                            self._trace(f"consensus:agree_rate={cns.get('agree_rate')}")
-                    except Exception as ce:
-                        self.logger.debug(f"consensus skipped: {ce}")
-
-                    try:
-                        if (self.reliability.get('check') or 'off') != 'off':
-                            report = Validator(mode=str(self.reliability.get('check'))).validate(final_out, getattr(self, '_last_context_blocks', []))
-                            self._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
-                    except Exception as ve:
-                        self.logger.debug(f"validator skipped: {ve}")
-
-                    self.conversation_history.append({
-                        'role': 'assistant',
-                        'content': final_out
-                    })
-                    self._trace("tools:none")
-                    # Persist memory to Mem0
-                    self._mem0_add_after_response(self._last_user_message, final_out)
-
-                    if all_tool_results:
-                        prefix = (first_content + "\n\n") if first_content else ""
-                        return f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{final_out}"
-                    return final_out
-                
-        except Exception as e:
-            # In streaming fallback contexts, avoid noisy error logs
-            if _suppress_errors:
-                self.logger.debug(f"Standard chat error (suppressed): {e}")
-            else:
-                self.logger.error(f"Standard chat error: {e}")
-            self._trace(f"standard:error {type(e).__name__}")
-            raise RetryableError(f"API request failed: {e}")
+        """Handle non-streaming chat interaction (delegated) with dynamic retries."""
+        if not self.cli_retry_enabled:
+            return _standard.handle_standard_chat(self, _suppress_errors=_suppress_errors)
+        @with_retry(max_retries=self.cli_max_retries)
+        def _call():
+            return _standard.handle_standard_chat(self, _suppress_errors=_suppress_errors)
+        return _call()
     
     def _handle_streaming_chat(self) -> str:
         """Handle streaming chat interaction with tool support."""
@@ -701,685 +520,18 @@ class OllamaTurboClient:
             tools_enabled=self.enable_tools
         )
     
-    @with_retry(max_retries=3)
     def _create_streaming_response(self):
-        """Create a streaming response from the API."""
-        try:
-            kwargs = {
-                'model': self.model,
-                'stream': True,
-            }
-            # Prefer adapter options mapping; pass ctx_size via extra.num_ctx
-            adapter_opts: Dict[str, Any] = {}
-            if self.max_output_tokens is not None:
-                adapter_opts['max_tokens'] = self.max_output_tokens
-            if self.ctx_size is not None:
-                adapter_opts['extra'] = {'num_ctx': self.ctx_size}
-            # Sampling parameters
-            if self.temperature is not None:
-                adapter_opts['temperature'] = self.temperature
-            if self.top_p is not None:
-                adapter_opts['top_p'] = self.top_p
-            if self.presence_penalty is not None:
-                adapter_opts['presence_penalty'] = self.presence_penalty
-            if self.frequency_penalty is not None:
-                adapter_opts['frequency_penalty'] = self.frequency_penalty
-
-            # Use adapter to format initial messages and merge Mem0 if needed
-            norm_msgs, overrides = self._prepare_initial_messages_for_adapter(
-                include_tools=(self.enable_tools and bool(self.tools)),
-                adapter_opts=adapter_opts,
-            )
-            kwargs['messages'] = norm_msgs
-            # Save for accurate r0 tracing in streaming handler
-            try:
-                self._last_sent_messages = norm_msgs
-            except Exception:
-                pass
-            if overrides:
-                kwargs.update(overrides)
-
-            keep_val = self._resolve_keep_alive()
-            if keep_val is not None:
-                kwargs['keep_alive'] = keep_val
-            self._trace("request:stream:start")
-            # Trace Mem0 presence prior to initial streaming dispatch
-            self._trace_mem0_presence(kwargs.get('messages'), "stream:init")
-            # Optional request-level reasoning injection
-            self._maybe_inject_reasoning(kwargs)
-            return self.client.chat(**kwargs)
-        except Exception as e:
-            raise RetryableError(f"Failed to create streaming response: {e}")
+        """Create a streaming response from the API with dynamic retries."""
+        if not self.cli_retry_enabled:
+            return _runner.create_streaming_response(self)
+        @with_retry(max_retries=self.cli_max_retries)
+        def _call():
+            return _runner.create_streaming_response(self)
+        return _call()
     
     def handle_streaming_response(self, response_stream, tools_enabled: bool = True) -> str:
-        """Complete streaming response handler with tool call support (multi-round optional)."""
-        rounds = 0
-        aggregated_results: List[str] = []
-        preface_content: str = ""
-        # Keep a buffer for fallback paths
-        full_content: str = ""
-        try:
-            while True:
-                include_tools = tools_enabled and bool(self.tools) and (
-                    rounds == 0 or (self.multi_round_tools and rounds < self.tool_max_rounds)
-                )
-
-                # Use provided stream on the first round; create new ones subsequently
-                if rounds == 0:
-                    stream = response_stream
-                    # Trace Mem0 presence for the initial streaming round (r0) using actual sent messages if available
-                    try:
-                        sent_msgs = getattr(self, '_last_sent_messages', None) or self.conversation_history
-                    except Exception:
-                        sent_msgs = self.conversation_history
-                    self._trace_mem0_presence(sent_msgs, "stream:r0")
-                else:
-                    kwargs = {
-                        'model': self.model,
-                        'messages': self.conversation_history,
-                        'stream': True
-                    }
-                    # Generation options (via adapter mapping)
-                    adapter_opts: Dict[str, Any] = {}
-                    if self.max_output_tokens is not None:
-                        adapter_opts['max_tokens'] = self.max_output_tokens
-                    if self.ctx_size is not None:
-                        adapter_opts['extra'] = {'num_ctx': self.ctx_size}
-                    # Sampling parameters
-                    if self.temperature is not None:
-                        adapter_opts['temperature'] = self.temperature
-                    if self.top_p is not None:
-                        adapter_opts['top_p'] = self.top_p
-                    if self.presence_penalty is not None:
-                        adapter_opts['presence_penalty'] = self.presence_penalty
-                    if self.frequency_penalty is not None:
-                        adapter_opts['frequency_penalty'] = self.frequency_penalty
-                    try:
-                        mapped = self.adapter.map_options(adapter_opts) if adapter_opts else {}
-                        if mapped:
-                            kwargs['options'] = mapped
-                    except Exception:
-                        # Fallback to direct fields if adapter mapping fails
-                        options = {}
-                        if self.max_output_tokens is not None:
-                            options['num_predict'] = self.max_output_tokens
-                        if self.ctx_size is not None:
-                            options['num_ctx'] = self.ctx_size
-                        if options:
-                            kwargs['options'] = options
-                    if include_tools:
-                        kwargs['tools'] = self.tools
-                    keep_val = self._resolve_keep_alive()
-                    if keep_val is not None:
-                        kwargs['keep_alive'] = keep_val
-                    # Optional request-level reasoning injection
-                    self._maybe_inject_reasoning(kwargs)
-                    # Trace Mem0 presence prior to subsequent streaming round dispatch
-                    self._trace_mem0_presence(kwargs.get('messages'), f"stream:r{rounds}")
-                    stream = self.client.chat(**kwargs)
-
-                self._trace(f"request:stream:round={rounds}{' tools' if include_tools else ''}")
-
-                # Streaming print control: print live on no-tools rounds, and on round 0 until a tool_call is detected
-                # Maintain both cleaned (for printing) and raw (for Harmony tool-call parsing) buffers
-                round_content = ""
-                round_content_clean = ""
-                round_raw = ""
-                # Track already emitted content length to avoid duplicates across reconnects
-                printed_len = 0
-                tool_calls: List[Dict[str, Any]] = []
-                tool_calls_detected = False
-                printed_prefix = False
-                end_round_for_tools = False
-
-                def _iter_stream_chunks(s):
-                    # Simple wrapper to let us hook per-chunk accounting
-                    for ch in s:
-                        yield ch
-
-                try:
-                    for chunk in _iter_stream_chunks(stream):
-                        # Normalize chunk: some providers emit JSON strings/bytes or SSE lines
-                        ck = chunk
-                        # Reset events for each chunk to avoid leaking from previous chunks/rounds
-                        events: List[Dict[str, Any]] = []
-                        raw_str = None
-                        try:
-                            if isinstance(chunk, (bytes, bytearray)):
-                                raw_str = chunk.decode('utf-8', errors='ignore')
-                            elif isinstance(chunk, str):
-                                raw_str = chunk
-                            # Parse JSON string bodies
-                            if raw_str is not None:
-                                s_trim = raw_str.lstrip()
-                                if s_trim.startswith('{'):
-                                    ck = json.loads(s_trim)
-                                else:
-                                    # Try SSE format: lines beginning with 'data:'
-                                    if 'data:' in raw_str:
-                                        events_sse = []
-                                        for ln in raw_str.splitlines():
-                                            if not ln:
-                                                continue
-                                            if ln.startswith('data:'):
-                                                payload = ln[len('data:'):].strip()
-                                                if not payload or payload == '[DONE]':
-                                                    continue
-                                                try:
-                                                    obj = json.loads(payload)
-                                                    # Recurse through adapter for each parsed object
-                                                    for ev in (list(self.adapter.parse_stream_events(obj)) or []):
-                                                        events_sse.append(ev)
-                                                    # Also support simple {type,content}
-                                                    if not events_sse and isinstance(obj, dict) and obj.get('content') is not None:
-                                                        events_sse.append({'type': 'token', 'content': str(obj.get('content') or '')})
-                                                except Exception:
-                                                    # As last resort, treat as a token line
-                                                    events_sse.append({'type': 'token', 'content': payload})
-                                        if events_sse:
-                                            # Fast-path deliver parsed SSE events
-                                            events = events_sse
-                                            # Process events block below
-                                            pass
-                        except Exception:
-                            ck = chunk
-
-                        if not events:
-                            try:
-                                events = list(self.adapter.parse_stream_events(ck)) or []
-                            except Exception:
-                                events = []
-                        # If still no events, coerce non-dict chunk objects and parse `.data` payloads
-                        if not events and (not isinstance(ck, dict)):
-                            try:
-                                coerced = None
-                                # Pydantic v2
-                                if hasattr(ck, 'model_dump') and callable(getattr(ck, 'model_dump', None)):
-                                    coerced = ck.model_dump()
-                                # Pydantic v1 or similar
-                                elif hasattr(ck, 'dict') and callable(getattr(ck, 'dict', None)):
-                                    coerced = ck.dict()
-                                # Simple object with __dict__
-                                elif hasattr(ck, '__dict__'):
-                                    coerced = {k: v for k, v in vars(ck).items() if not str(k).startswith('_')}
-                                if isinstance(coerced, dict):
-                                    ck = coerced
-                                else:
-                                    # Some SSE libraries expose a `.data` attribute containing the JSON payload
-                                    data_payload = getattr(ck, 'data', None)
-                                    if data_payload is not None:
-                                        try:
-                                            if isinstance(data_payload, (bytes, bytearray)):
-                                                ds = data_payload.decode('utf-8', errors='ignore')
-                                            else:
-                                                ds = str(data_payload)
-                                            ds_trim = ds.lstrip()
-                                            if ds_trim.startswith('{'):
-                                                try:
-                                                    ck = json.loads(ds_trim)
-                                                except Exception:
-                                                    pass
-                                            elif 'data:' in ds:
-                                                # SSE-style payload with data: lines
-                                                events_sse2 = []
-                                                for ln in ds.splitlines():
-                                                    if not ln:
-                                                        continue
-                                                    if ln.startswith('data:'):
-                                                        payload = ln[len('data:'):].strip()
-                                                        if not payload or payload == '[DONE]':
-                                                            continue
-                                                        try:
-                                                            obj = json.loads(payload)
-                                                            for ev in (list(self.adapter.parse_stream_events(obj)) or []):
-                                                                events_sse2.append(ev)
-                                                            # Also support simple {type,content}
-                                                            if (not events_sse2) and isinstance(obj, dict) and obj.get('content') is not None:
-                                                                events_sse2.append({'type': 'token', 'content': str(obj.get('content') or '')})
-                                                        except Exception:
-                                                            events_sse2.append({'type': 'token', 'content': payload})
-                                                if events_sse2:
-                                                    events = events_sse2
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
-                        # If we coerced to a dict or still have none, give adapter another chance
-                        if not events and isinstance(ck, dict):
-                            try:
-                                events = list(self.adapter.parse_stream_events(ck)) or []
-                            except Exception:
-                                events = []
-                        # Fallbacks if adapter yields nothing
-                        if not events and isinstance(ck, dict):
-                            # Optional lightweight tracing of chunk keys for diagnostics
-                            try:
-                                if self.show_trace:
-                                    # Only emit occasionally to avoid noise; suppress pure-metrics chunks
-                                    kset = set(ck.keys())
-                                    METRIC_KEYS = {
-                                        "model","created_at","done","done_reason",
-                                        "total_duration","load_duration",
-                                        # Common Ollama metrics
-                                        "prompt_eval_count","prompt_eval_duration",
-                                        "eval_count","eval_duration"
-                                    }
-                                    metrics_only = kset.issubset(METRIC_KEYS)
-                                    if not metrics_only:
-                                        keys = ','.join(list(ck.keys())[:6])
-                                        self._trace(f"stream:chunk:keys={keys}")
-                            except Exception:
-                                pass
-                            # 1) OpenAI-style consolidated message
-                            msg = ck.get('message') or {}
-                            if msg.get('content'):
-                                events.append({'type': 'token', 'content': self._strip_harmony_markup(str(msg.get('content')))} )
-                            for tc in (msg.get('tool_calls') or []) or []:
-                                fn = (tc or {}).get('function') or {}
-                                events.append({
-                                    'type': 'tool_call',
-                                    'id': str(tc.get('id') or ''),
-                                    'name': str(fn.get('name') or ''),
-                                    'arguments': fn.get('arguments')
-                                })
-                            # 1.5) Ollama-style streaming: top-level 'response' token pieces
-                            if not events and (ck.get('response') is not None):
-                                events.append({'type': 'token', 'content': str(ck.get('response') or '')})
-                            # Optional: top-level tool_calls if present
-                            for tc in (ck.get('tool_calls') or []) or []:
-                                fn = (tc or {}).get('function') or {}
-                                events.append({
-                                    'type': 'tool_call',
-                                    'id': str(tc.get('id') or ''),
-                                    'name': str(fn.get('name') or ''),
-                                    'arguments': fn.get('arguments')
-                                })
-                            # 2) SSE-style {type:'token'|'final', content}
-                            t = ck.get('type')
-                            if not events and t in {'token', 'final'} and (ck.get('content') is not None):
-                                events.append({'type': 'token', 'content': str(ck.get('content') or '')})
-                            # 3) Top-level content field
-                            if not events and (ck.get('content') is not None):
-                                events.append({'type': 'token', 'content': str(ck.get('content') or '')})
-                            # 4) choices[0].message.content (non-delta streaming or non-stream-like chunk)
-                            if not events and (ck.get('choices') is not None):
-                                try:
-                                    choices = ck.get('choices') or []
-                                    if choices:
-                                        message0 = (choices[0] or {}).get('message') or {}
-                                        cont0 = message0.get('content')
-                                        if cont0:
-                                            events.append({'type': 'token', 'content': str(cont0)})
-                                        for tc in (message0.get('tool_calls') or []) or []:
-                                            fn = (tc or {}).get('function') or {}
-                                            events.append({
-                                                'type': 'tool_call',
-                                                'id': str(tc.get('id') or ''),
-                                                'name': str(fn.get('name') or ''),
-                                                'arguments': fn.get('arguments')
-                                            })
-                                except Exception:
-                                    pass
-                        # Trace parsed events for diagnostics (types and count) after normalization
-                        try:
-                            if self.show_trace:
-                                types = ','.join([str(ev.get('type')) for ev in (events or [])][:6])
-                                self._trace(f"stream:events n={len(events)} types={types}")
-                                # Also trace chunk type/keys for visibility
-                                try:
-                                    if isinstance(ck, dict):
-                                        # Suppress pure-metrics chunks to reduce noise
-                                        kset = set(ck.keys())
-                                        METRIC_KEYS = {
-                                            "model","created_at","done","done_reason",
-                                            "total_duration","load_duration",
-                                            # Common Ollama metrics
-                                            "prompt_eval_count","prompt_eval_duration",
-                                            "eval_count","eval_duration"
-                                        }
-                                        metrics_only = kset.issubset(METRIC_KEYS)
-                                        if not metrics_only:
-                                            keys = ','.join(list(ck.keys())[:6])
-                                            self._trace(f"stream:chunk:keys={keys}")
-                                    else:
-                                        self._trace(f"stream:chunk:type={type(ck).__name__}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        # If still nothing and we have a raw string, trace prefix for diagnostics
-                        if not events and raw_str is not None and self.show_trace:
-                            try:
-                                preview = raw_str[:80].replace('\n', ' ')
-                                self._trace(f"stream:chunk:raw={preview}")
-                            except Exception:
-                                pass
-
-                        for ev in events:
-                            et = ev.get('type')
-                            # Treat both token and final events as printable/content-bearing
-                            if et in {'token', 'final'}:
-                                piece = str(ev.get('content') or '')
-                                if not piece:
-                                    continue
-                                round_content += piece
-                                # Capture raw content for tool-call parsing when tools are enabled
-                                try:
-                                    if include_tools and isinstance(chunk, dict):
-                                        raw_msg = (chunk.get('message') or {}).get('content')
-                                        if raw_msg:
-                                            round_raw += str(raw_msg)
-                                except Exception:
-                                    pass
-                                # Maintain a cleaned buffer specifically for printing to avoid leaking markup tokens
-                                try:
-                                    clean_piece = self._strip_harmony_markup(piece)
-                                except Exception:
-                                    clean_piece = piece
-                                round_content_clean += clean_piece
-
-                                # Compute the new printable segment before any potential tool-call detection
-                                new_segment_pre = ""
-                                if not self.quiet:
-                                    try:
-                                        new_segment_pre = round_content_clean[printed_len:]
-                                    except Exception:
-                                        new_segment_pre = ""
-
-                                # Early incremental Harmony tool-call detection: parse as the buffer grows
-                                if include_tools and (round_raw or round_content):
-                                    try:
-                                        source_for_parse = round_raw or round_content
-                                        cleaned_inc, parsed_calls_inc, _ = self._parse_harmony_tokens(source_for_parse)
-                                        # Trace analysis if available
-                                        try:
-                                            if getattr(self.harmony, 'last_analysis', None):
-                                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
-                                        except Exception:
-                                            pass
-                                        if parsed_calls_inc:
-                                            tool_calls = parsed_calls_inc
-                                            tool_calls_detected = True
-                                            # Replace round_content with cleaned to remove commentary segments
-                                            round_content = cleaned_inc or round_content
-                                            try:
-                                                round_content_clean = self._strip_harmony_markup(round_content)
-                                            except Exception:
-                                                pass
-                                            # Print any accumulated sanitized content up to detection before aborting
-                                            if not self.quiet:
-                                                try:
-                                                    new_segment = round_content_clean[printed_len:]
-                                                except Exception:
-                                                    new_segment = ""
-                                                if new_segment:
-                                                    if not printed_prefix:
-                                                        print("🤖 Assistant: ", end="", flush=True)
-                                                        printed_prefix = True
-                                                    print(new_segment, end="", flush=True)
-                                                    printed_len = len(round_content_clean)
-                                                    try:
-                                                        if self.show_trace:
-                                                            self._trace(f"stream:print bytes={len(new_segment)} total={printed_len}")
-                                                    except Exception:
-                                                        pass
-                                            # Abort further streaming for this round; execute tools immediately
-                                            end_round_for_tools = True
-                                            break
-                                    except Exception:
-                                        pass
-                                if not self.quiet and not tool_calls_detected:
-                                    # Print only the new suffix not yet emitted (handles reconnect duplicates)
-                                    # Print live until a tool call is detected in the current round
-                                    if new_segment_pre:
-                                        if not printed_prefix:
-                                            print("🤖 Assistant: ", end="", flush=True)
-                                            printed_prefix = True
-                                        # Always print sanitized tokens (no Harmony markup leakage)
-                                        print(new_segment_pre, end="", flush=True)
-                                        printed_len = len(round_content_clean)
-                                        # Trace printing metrics
-                                        try:
-                                            if self.show_trace:
-                                                self._trace(f"stream:print bytes={len(new_segment_pre)} total={printed_len}")
-                                        except Exception:
-                                            pass
-                            elif et == 'tool_call' and include_tools:
-                                tool_calls_detected = True
-                                # Normalize to OpenAI-style for tool executor/history
-                                oc = {
-                                    'type': 'function',
-                                    'id': ev.get('id') or '',
-                                    'function': {
-                                        'name': ev.get('name') or '',
-                                        'arguments': ev.get('arguments')
-                                    }
-                                }
-                                # Merge updates for same id
-                                existing = False
-                                for tc in tool_calls:
-                                    if tc.get('id') == oc.get('id'):
-                                        tc.update(oc)
-                                        existing = True
-                                        break
-                                if not existing:
-                                    tool_calls.append(oc)
-                                # Trace tool-call delta detection
-                                try:
-                                    if self.show_trace:
-                                        fname = oc.get('function', {}).get('name')
-                                        self._trace(f"tools:delta:detected id={oc.get('id')} name={fname}")
-                                except Exception:
-                                    pass
-                                # End this streaming round immediately; execute tools next
-                                end_round_for_tools = True
-                                break
-                        # If an early tool-call was detected, end chunk consumption for this round
-                        # by breaking out of the for-chunk loop now.
-                        if end_round_for_tools:
-                            break
-                except Exception as se:
-                    # Stream interrupted (timeout/connection), attempt reconnects handled by outer retry decorator for init only.
-                    # Here we fall back to non-streaming finalization to preserve UX, per user preference.
-                    self.logger.debug(f"Streaming read error; falling back to non-streaming: {se}")
-                    self._trace("stream:read:error -> fallback")
-                    try:
-                        final = self._handle_standard_chat(_suppress_errors=True)
-                        # Suppress printing raw error text returned by non-streaming fallback
-                        if final and not str(final).startswith("Error during chat:") and not self.quiet:
-                            print(final)
-                        self._trace("fallback:success")
-                        if final and not str(final).startswith("Error during chat:"):
-                            return (round_content + "\n" + final) if round_content else final
-                        # If fallback failed or returned error text, suppress to avoid leaking in stream
-                        return round_content or ""
-                    except Exception as e2:
-                        self.logger.debug(f"Non-streaming fallback also failed: {e2}")
-                        self._trace("fallback:error")
-                        return round_content or ""
-
-                # Update outer buffer for fallback usage
-                full_content = round_content
-
-                # Capture first round content as a preface (not printed yet)
-                if rounds == 0 and round_content:
-                    preface_content = self._strip_harmony_markup(round_content)
-
-                # If tools were requested and yielded calls, execute them and loop
-                # If no canonical tool_calls but Harmony markup is present, parse it
-                if not tool_calls and include_tools and (round_raw or round_content):
-                    try:
-                        # Parse Harmony tokens from raw to preserve tool-call markers
-                        source_for_parse = round_raw or round_content
-                        cleaned, parsed_calls, _ = self._parse_harmony_tokens(source_for_parse)
-                        # Trace analysis if available
-                        try:
-                            if getattr(self.harmony, 'last_analysis', None):
-                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
-                        except Exception:
-                            pass
-                        if parsed_calls:
-                            tool_calls = parsed_calls
-                            round_content = cleaned
-                    except Exception:
-                        pass
-
-                if tool_calls:
-                    if not self.quiet:
-                        print("\n🔧 Processing tool calls...")
-                    names = [tc.get('function', {}).get('name') for tc in tool_calls]
-                    self._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")
-
-                    # Add assistant message with tool calls
-                    self.conversation_history.append({
-                        'role': 'assistant',
-                        'content': self._strip_harmony_markup(round_content),
-                        'tool_calls': tool_calls
-                    })
-                    # Execute tools
-                    tool_results = self._execute_tool_calls(tool_calls)
-                    self._last_tool_results_structured = tool_results  # for future API
-                    tool_strings = [self._serialize_tool_result_to_string(tr) for tr in tool_results]
-                    self._last_tool_results_strings = tool_strings
-                    self._trace(f"tools:executed {len(tool_strings)}")
-                    aggregated_results.extend(tool_strings)
-                    # Adapter-driven tool message formatting (with tool_call_id), then reprompt
-                    try:
-                        new_msgs, _ovr = self.adapter.format_reprompt_after_tools(
-                            self.conversation_history,
-                            tool_results,
-                            options=None,
-                        )
-                        self.conversation_history = new_msgs
-                    except Exception:
-                        # Fallback to a single aggregated tool message
-                        self.conversation_history.append({
-                            'role': 'tool',
-                            'content': '\n'.join(tool_strings)
-                        })
-                    # Reprompt model to synthesize an answer using tool details
-                    self._trace("reprompt:after-tools")
-                    self.conversation_history.append({
-                        'role': 'user',
-                        'content': self.prompt.reprompt_after_tools()
-                    })
-                    rounds += 1
-                    # Next loop iteration may include tools again if multi-round enabled
-                    continue
-
-                # No tool calls -> final textual answer for this turn
-                if printed_prefix and not self.quiet:
-                    print()  # newline after final streamed content
-                # Extract final-channel text if present; otherwise strip markup
-                final_out = round_content
-                found_final = False
-                try:
-                    if round_content:
-                        cleaned, _, final_seg = self._parse_harmony_tokens(round_content)
-                        # Trace analysis if available
-                        try:
-                            if getattr(self.harmony, 'last_analysis', None):
-                                self._trace(f"analysis:{truncate_text(self.harmony.last_analysis, 180)}")
-                        except Exception:
-                            pass
-                        found_final = bool(final_seg)
-                        final_out = final_seg or cleaned
-                        if not final_out:
-                            final_out = self._strip_harmony_markup(round_content)
-                except Exception:
-                    final_out = self._strip_harmony_markup(round_content)
-
-                # Reliability integrations (streaming): trace consensus and validator without altering streamed text
-                try:
-                    # Skip consensus if tools were involved during streaming rounds
-                    tools_used_stream = bool(aggregated_results)
-                    if (not tools_used_stream) and self.reliability.get('consensus') and isinstance(self.reliability.get('k'), int) and (self.reliability.get('k') or 0) > 1:
-                        def _gen_once_stream():
-                            kwargs2 = {
-                                'model': self.model,
-                                'messages': self.conversation_history,
-                            }
-                            options2: Dict[str, Any] = {}
-                            if self.max_output_tokens is not None:
-                                options2['num_predict'] = self.max_output_tokens
-                            if self.ctx_size is not None:
-                                options2['num_ctx'] = self.ctx_size
-                            # Deterministic settings for consensus runs
-                            options2['temperature'] = 0
-                            options2['top_p'] = 0
-                            if options2:
-                                kwargs2['options'] = options2
-                            keep_val2 = self._resolve_keep_alive()
-                            if keep_val2 is not None:
-                                kwargs2['keep_alive'] = keep_val2
-                            resp2 = self.client.chat(**kwargs2)
-                            msg2 = resp2.get('message', {})
-                            cont2 = msg2.get('content', '') or ''
-                            try:
-                                cleaned2, _, final2 = self._parse_harmony_tokens(cont2)
-                                return (final2 or cleaned2 or self._strip_harmony_markup(cont2)) or ""
-                            except Exception:
-                                return self._strip_harmony_markup(cont2)
-                        cns = run_consensus(_gen_once_stream, k=int(self.reliability.get('k') or 1))
-                        self._trace(f"consensus:agree_rate={cns.get('agree_rate')}")
-                except Exception as ce:
-                    self.logger.debug(f"consensus skipped: {ce}")
-                try:
-                    if (self.reliability.get('check') or 'off') != 'off':
-                        report = Validator(mode=str(self.reliability.get('check'))).validate(final_out, getattr(self, '_last_context_blocks', []))
-                        self._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
-                except Exception as ve:
-                    self.logger.debug(f"validator skipped: {ve}")
-
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': final_out
-                })
-                self._trace("tools:none")
-                # Persist memory to Mem0
-                self._mem0_add_after_response(self._last_user_message, final_out)
-
-                # Optional compliance nudge: if tools were used but no explicit <|channel|>final was detected, nudge once
-                try:
-                    if aggregated_results and (not found_final):
-                        self.conversation_history.append({
-                            "role": "user",
-                            "content": "Please conclude with <|channel|>final and a single <|message|>…<|end|>."
-                        })
-                except Exception:
-                    pass
-
-                # If nothing was printed live this round (e.g., post-tool synthesis), print the final once
-                if (not printed_prefix) and (not self.quiet) and final_out:
-                    print("🤖 Assistant: ", end="", flush=True)
-                    print(self._strip_harmony_markup(final_out), flush=True)
-
-                if aggregated_results:
-                    combined = (preface_content + "\n\n" if preface_content else "") + "[Tool Results]\n" + '\n'.join(aggregated_results) + "\n\n" + final_out
-                    return combined
-                return final_out
-
-        except KeyboardInterrupt:
-            print("\n⚠️ Streaming interrupted by user")
-            self._trace("stream:interrupted")
-            return full_content + "\n[Interrupted]"
-        except Exception as e:
-            # Fallback: if streaming fails (e.g., validation errors from client),
-            # degrade gracefully to non-streaming standard chat without noisy CLI output.
-            self.logger.debug(f"Streaming error encountered; falling back to non-streaming: {e}")
-            self._trace("stream:error -> fallback")
-            try:
-                final = self._handle_standard_chat()
-                # Print only the final response so the user still sees a complete answer
-                if final and not self.quiet:
-                    print(final)
-                self._trace("fallback:success")
-                return (full_content + "\n" + final) if full_content else final
-            except Exception as e2:
-                # Silent CLI per preference; log details at DEBUG only
-                self.logger.debug(f"Non-streaming fallback also failed: {e2}")
-                self._trace("fallback:error")
-                return full_content or ""
+        """Complete streaming response handler with tool call support (delegated)."""
+        return _runner.handle_streaming_response(self, response_stream, tools_enabled=tools_enabled)
 
     # ------------------ Harmony parsing helpers ------------------
     def _strip_harmony_markup(self, text: str) -> str:
@@ -1406,29 +558,18 @@ class OllamaTurboClient:
     def _set_idempotency_key(self, key: Optional[str]) -> None:
         """Set Idempotency-Key header on both clients for this turn."""
         try:
-            if not key:
-                return
-            try:
-                # Defensive: _client may not exist depending on ollama version
-                if getattr(self.client, '_client', None) and getattr(self.client._client, 'headers', None):  # type: ignore[attr-defined]
-                    self.client._client.headers['Idempotency-Key'] = key  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            self._trace(f"idempotency:set {key}")
+            _net.set_idempotency_key(self.client, key, trace_hook=self._trace)
         except Exception:
+            # Never fail request due to optional header injection
             pass
 
     def _clear_idempotency_key(self) -> None:
         """Remove Idempotency-Key header after request completion."""
         try:
-            c = getattr(self, 'client', None)
-            try:
-                if c and getattr(c, '_client', None):
-                    c._client.headers.pop('Idempotency-Key', None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            _net.clear_idempotency_key(getattr(self, 'client', None))
             self._current_idempotency_key = None
         except Exception:
+            # Never fail cleanup
             pass
 
     def _resolve_host(self, engine: Optional[str]) -> str:
@@ -1443,24 +584,7 @@ class OllamaTurboClient:
         2) OLLAMA_HOST env var
         3) Default https://ollama.com
         """
-        try:
-            if engine:
-                e = engine.strip()
-                el = e.lower()
-                if el in {"cloud", "default"}:
-                    return "https://ollama.com"
-                if el == "local":
-                    return "http://localhost:11434"
-                if e.startswith("http://") or e.startswith("https://"):
-                    return e
-                # Fallback: treat as hostname
-                return f"https://{e}"
-            host = os.getenv('OLLAMA_HOST')
-            if host and str(host).strip() != "":
-                return str(host).strip()
-            return "https://ollama.com"
-        except Exception:
-            return "https://ollama.com"
+        return _net.resolve_host(engine)
 
     def _resolve_keep_alive(self) -> Optional[Union[float, str]]:
         """Resolve a valid keep_alive value or None.
@@ -1470,183 +594,62 @@ class OllamaTurboClient:
         If unset and warming is enabled, defaults to '10m'.
         """
         try:
-            if not self.warm_models:
-                return None
-            # Suppress keep_alive when using Ollama Cloud to avoid upstream 502s
-            # Cloud balancers can respond poorly to persistent keep-alive warming.
-            try:
-                if 'ollama.com' in (self.host or ''):
-                    return None
-            except Exception:
-                pass
-            raw = self.ollama_keep_alive_raw
-            if raw is None or str(raw).strip() == "":
-                return '10m'  # safe default
-            s = str(raw).strip()
-            # If purely numeric (int/float), treat as seconds
-            if re.fullmatch(r"\d+(?:\.\d+)?", s):
-                # Avoid passing floats like '10.0s' unless necessary
-                if '.' in s:
-                    return f"{float(s)}s"
-                return f"{int(s)}s"
-            # If duration with unit
-            if re.fullmatch(r"\d+(?:\.\d+)?[smhdw]", s, flags=0):
-                return s
-            # Unknown/invalid -> log and fallback
-            self.logger.debug(f"Invalid OLLAMA_KEEP_ALIVE '{s}', falling back to 10m")
-            return '10m'
+            return _net.resolve_keep_alive(
+                warm_models=bool(getattr(self, 'warm_models', True)),
+                host=getattr(self, 'host', None),
+                keep_alive_raw=getattr(self, 'ollama_keep_alive_raw', None),
+                logger=getattr(self, 'logger', None),
+            )
         except Exception:
-            return '10m'
+            # match docstring + avoid cold starts when warming is on
+            return '10m' if bool(getattr(self, 'warm_models', True)) else None
     
     def _execute_tool_calls(self, tool_calls: List[Dict]) -> List[Dict[str, Any]]:
-        """Execute tool calls and return results.
-        
-        Args:
-            tool_calls: List of tool call dictionaries with function name and arguments.
-        Returns:
-            List of structured tool results objects with shape:
-            { tool: str, status: 'ok'|'error', content: Any|None, metadata: dict, error: Optional[...]}.
-        """
-        tool_results: List[Dict[str, Any]] = []
-        injected_chunks: List[str] = []
-        try:
-            for i, tc in enumerate(tool_calls, 1):
-                function = tc.get('function', {})
-                function_name = function.get('name')
-                function_args = function.get('arguments', {})
-                if not isinstance(function_args, dict):
-                    function_args = {}
-                if not function_name:
-                    tool_results.append({
-                        'tool': 'unknown',
-                        'status': 'error',
-                        'content': None,
-                        'metadata': {'index': i},
-                        'error': {'code': 'invalid_call', 'message': 'Missing function name'}
-                    })
-                    continue
-                if not self.quiet:
-                    print(f"   {i}. Executing {function_name}({', '.join(f'{k}={v}' for k, v in function_args.items())})")
-                self._trace(f"tool:exec {function_name}")
-                
-                if function_name in self.tool_functions:
-                    try:
-                        # Confirm execute_shell in TTY if required
-                        if function_name == 'execute_shell':
-                            preview = function_args.get('command') or ''
-                            if os.getenv('CONFIRM_EXECUTE_SHELL', '1').strip().lower() not in {'0', 'false', 'no', 'off'} and sys.stdin.isatty():
-                                print(f"   ⚠️ execute_shell preview: {preview}")
-                                ans = input("   Proceed? [y/N]: ").strip().lower()
-                                if ans not in {'y', 'yes'}:
-                                    aborted_msg = f"Execution aborted by user for execute_shell({truncate_text(preview, 120)})"
-                                    tool_results.append({
-                                        'tool': function_name,
-                                        'status': 'error',
-                                        'content': None,
-                                        'metadata': {'aborted': True, 'preview': truncate_text(preview, 120)},
-                                        'error': {'code': 'aborted', 'message': aborted_msg}
-                                    })
-                                    injected_chunks.append("execute_shell: aborted by user")
-                                    self._skip_mem0_after_turn = True
-                                    continue
-
-                        result = self.tool_functions[function_name](**function_args)
-                        # Try parse JSON contracts from secure tools
-                        injected = None
-                        sensitive = False
-                        log_path = None
-                        try:
-                            if isinstance(result, str):
-                                parsed = json.loads(result)
-                            else:
-                                parsed = result  # may already be dict
-                            if isinstance(parsed, dict):
-                                injected = parsed.get('inject')
-                                sensitive = bool(parsed.get('sensitive'))
-                                log_path = parsed.get('log_path')
-                        except Exception:
-                            pass
-
-                        # Determine injection chunk
-                        display = result if injected is None else injected
-                        if len(display) > self.tool_context_cap:
-                            display = truncate_text(display, self.tool_context_cap)
-                            if log_path:
-                                display += f"\n[truncated; full logs stored at {log_path} (not shared with the model)]"
-
-                        if sensitive or function_name == 'execute_shell' or len(display) > self.tool_context_cap:
-                            self._skip_mem0_after_turn = True
-                        if not self.show_trace and not self.quiet:
-                            print(f"      ✅ Result: {truncate_text(display, self.tool_print_limit)}")
-                        self._trace(f"tool:ok {function_name}")
-                        structured: Dict[str, Any] = {
-                            'tool': function_name,
-                            'status': 'ok',
-                            'content': display,
-                            'metadata': {
-                                'args': function_args,
-                                **({'log_path': log_path} if log_path else {})
-                            },
-                            'error': None
-                        }
-                        tool_results.append(structured)
-                        injected_chunks.append(str(display))
-                    except Exception as e:
-                        error_result = f"Error executing {function_name}: {str(e)}"
-                        tool_results.append({
-                            'tool': function_name,
-                            'status': 'error',
-                            'content': None,
-                            'metadata': {'args': function_args},
-                            'error': {'code': 'execution_error', 'message': error_result}
-                        })
-                        injected_chunks.append(error_result)
-                        self._trace(f"tool:error {function_name}")
-                else:
-                    tool_results.append({
-                        'tool': function_name or 'unknown',
-                        'status': 'error',
-                        'content': None,
-                        'metadata': {},
-                        'error': {'code': 'unknown_tool', 'message': f"Unknown tool: {function_name}"}
-                    })
-                    injected_chunks.append(f"Unknown tool: {function_name}")
- 
-            return tool_results
-        except Exception as e:
-            self._trace(f"tools:failed {type(e).__name__}")
-            return [{
-                'tool': 'tools_batch',
-                'status': 'error',
-                'content': None,
-                'metadata': {},
-                'error': {'code': 'batch_failure', 'message': f"Tools execution failed: {str(e)}"}
-            }]
+        """Execute tool calls and return results (delegated to ToolRuntimeExecutor)."""
+        return ToolRuntimeExecutor.execute(self, tool_calls)
     
     def _serialize_tool_result_to_string(self, tr: Dict[str, Any]) -> str:
-        """Serialize a structured tool result to a safe string for model context/CLI output.
-        
-        Default v1 behavior remains string output; this function centralizes the representation.
+        """Serialize a structured tool result to a safe string (delegated)."""
+        return ToolRuntimeExecutor.serialize_to_string(self, tr)
+    
+    def _payload_for_tools(self, tool_results: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]]):
         """
+        Returns a tuple (payload_for_adapter, prebuilt_tool_messages_or_None) based on self.tool_results_format.
+        - If 'object': (tool_results, None) — adapters receive list[dict].
+        - If 'string': (tool_strings, prebuilt_msgs) — adapters receive list[str]; fallback always uses strings.
+          prebuilt_msgs is a list of {'role': 'tool', 'tool_call_id': <matching id if available>, 'content': <string>}
+          one per tool call/result (mapped by position when present).
+        Also updates:
+          - self._last_tool_results_structured
+          - self._last_tool_results_strings
+        """
+        tool_strings = [self._serialize_tool_result_to_string(tr) for tr in tool_results]
+        # Bookkeep both views for diagnostics/tests
         try:
-            tool = tr.get('tool', 'tool')
-            status = tr.get('status', 'ok')
-            content = tr.get('content')
-            if status == 'error' and tr.get('error'):
-                err = tr.get('error') or {}
-                msg = err.get('message') or 'error'
-                return f"{tool}: ERROR - {msg}"
-            # content may be non-string JSON; stringify safely
-            if isinstance(content, (dict, list)):
-                try:
-                    content_str = json.dumps(content, ensure_ascii=False)
-                except Exception:
-                    content_str = str(content)
-            else:
-                content_str = str(content) if content is not None else ''
-            return f"{tool}: {content_str}"
+            self._last_tool_results_structured = tool_results
+            self._last_tool_results_strings = tool_strings
         except Exception:
-            return "tool: (unserializable result)"
+            pass
+        fmt = getattr(self, 'tool_results_format', 'string')
+        if fmt == 'object':
+            return tool_results, None
+        # Build per-call tool messages with tool_call_id mapping by position
+        prebuilt_msgs: List[Dict[str, Any]] = []
+        for i, s in enumerate(tool_strings):
+            tc_id = None
+            try:
+                if i < len(tool_calls):
+                    tc = tool_calls[i] or {}
+                    raw = tc.get('id') or ((tc.get('function') or {}).get('id'))
+                    # Coerce to string for strict adapters; treat empty string as None
+                    tc_id = (str(raw).strip() or None) if raw is not None else None
+            except Exception:
+                tc_id = None
+            msg: Dict[str, Any] = {'role': 'tool', 'content': s}
+            if tc_id:
+                msg['tool_call_id'] = tc_id
+            prebuilt_msgs.append(msg)
+        return tool_strings, prebuilt_msgs
     
     def _trim_history(self):
         """Trim conversation history while preserving key system blocks.
@@ -1685,11 +688,36 @@ class OllamaTurboClient:
                 new_hist.append(mem_msg)
         # Extend with last N (may include the memory block already)
         new_hist.extend(last_N)
-        # De-duplicate while preserving order
+        # De-duplicate while preserving order. For Mem0 system blocks, dedupe by content.
         seen = set()
         deduped: List[Dict[str, Any]] = []
+        # Prepare optional Mem0 prefixes
+        mem0_prefixes: List[str] = []
+        try:
+            mem0_prefixes = self.prompt.mem0_prefixes()
+        except Exception:
+            mem0_prefixes = [
+                "Previous context from user history (use if relevant):",
+                "Relevant information:",
+                "Relevant user memories",
+            ]
+        def _is_mem0_block(msg: Dict[str, Any]) -> bool:
+            try:
+                if msg.get('role') != 'system':
+                    return False
+                c = str(msg.get('content') or '')
+                return any(c.startswith(p) for p in mem0_prefixes if p)
+            except Exception:
+                return False
         for m in new_hist:
-            key = id(m)
+            try:
+                if _is_mem0_block(m):
+                    c = str(m.get('content') or '')
+                    key = ("mem0_block", hash(c))
+                else:
+                    key = ("id", id(m))
+            except Exception:
+                key = ("id", id(m))
             if key in seen:
                 continue
             seen.add(key)
@@ -1698,11 +726,16 @@ class OllamaTurboClient:
     
     def clear_history(self):
         """Clear conversation history."""
-        # Preserve the system directive when clearing
+        # Preserve the system directive when clearing, respecting adapter-specific defaults
+        try:
+            adapter_name = getattr(self.adapter, 'name', '')
+        except Exception:
+            adapter_name = ''
+        sys_prompt = self.prompt.deepseek_system_prompt() if adapter_name == 'deepseek' else self.prompt.initial_system_prompt()
         self.conversation_history = [
             {
                 'role': 'system',
-                'content': self.prompt.initial_system_prompt()
+                'content': sys_prompt
             }
         ]
         self.logger.info("Conversation history cleared")
@@ -1738,7 +771,7 @@ class OllamaTurboClient:
         try:
             rp = RetrievalPipeline()
             try:
-                topk = int(self.reliability.get('k') or int(os.getenv('RAG_TOPK', '5') or '5'))
+                topk = int(self.reliability.get('rag_k') or int(os.getenv('RAG_TOPK', '5') or '5'))
             except Exception:
                 topk = 5
             docs = rp.run(user_message, k=topk)
@@ -1769,69 +802,193 @@ class OllamaTurboClient:
     
     # ------------------ Mem0 Integration ------------------
     def _init_mem0(self) -> None:
-        """Initialize Mem0 client and runtime settings from environment variables if available."""
+        """Initialize Mem0 client and runtime settings from configuration."""
         self.mem0_client = None
         self.mem0_enabled = False
+        
+        if not self.mem0_config.get('enabled', True):
+            self.logger.debug("Mem0 is disabled via configuration")
+            return
+            
         try:
             # Lazy import to avoid hard crash if package isn't installed yet
             try:
-                from mem0 import MemoryClient  # type: ignore
+                if self.mem0_config.get('local', False):
+                    # OpenMemory MCP / OSS client
+                    from mem0 import Memory as _Mem0Impl  # type: ignore
+                else:
+                    # Mem0 Platform client
+                    from mem0 import MemoryClient as _Mem0Impl  # type: ignore
             except Exception as ie:
-                self.logger.debug(f"Mem0 client import skipped: {ie}")
-                return
-            # Feature flags and config
-            mem0_enabled_flag = os.getenv('MEM0_ENABLED', '1').strip()
-            if mem0_enabled_flag in {'0', 'false', 'False'}:
+                self.logger.debug(f"Mem0 import skipped: {ie}")
+                # One-time user-visible notice so users know why Mem0 is disabled
+                try:
+                    if not getattr(self, '_mem0_notice_shown', False) and not self.quiet:
+                        mode = "local" if self.mem0_config.get('local', False) else "cloud"
+                        if mode == "local":
+                            print("Mem0 disabled: mem0 package not installed for local mode. Install with: pip install mem0 chromadb or qdrant-client; set MEM0_USE_LOCAL=1")
+                        else:
+                            print("Mem0 disabled: mem0 package not installed. For cloud, set MEM0_API_KEY or install mem0.")
+                        self._mem0_notice_shown = True
+                except Exception:
+                    pass
                 return
 
-            api_key = os.getenv('MEM0_API_KEY')
-            if not api_key:
-                # Mem0 is optional; proceed without it
-                return
-            # Runtime knobs
-            self.mem0_debug = os.getenv('MEM0_DEBUG', '0').strip() in {'1', 'true', 'True'}
-            self.mem0_max_hits = int(os.getenv('MEM0_MAX_HITS', '3') or '3')
-            self.mem0_search_timeout_ms = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
-            self.mem0_timeout_connect_ms = int(os.getenv('MEM0_TIMEOUT_CONNECT_MS', '1000') or '1000')
-            self.mem0_timeout_read_ms = int(os.getenv('MEM0_TIMEOUT_READ_MS', '2000') or '2000')
-            self.mem0_add_queue_max = int(os.getenv('MEM0_ADD_QUEUE_MAX', '256') or '256')
-            self._mem0_breaker_threshold = int(os.getenv('MEM0_BREAKER_THRESHOLD', '3') or '3')
-            self._mem0_breaker_cooldown_ms = int(os.getenv('MEM0_BREAKER_COOLDOWN_MS', '60000') or '60000')
-            self._mem0_shutdown_flush_ms = int(os.getenv('MEM0_SHUTDOWN_FLUSH_MS', '3000') or '3000')
+            # Runtime knobs with defaults
+            self.mem0_debug = False
+            self.mem0_max_hits = 3
+            # mem0_search_timeout_ms is configured at init from MEM0_SEARCH_TIMEOUT_MS
+            self.mem0_timeout_connect_ms = 1000
+            self.mem0_timeout_read_ms = 2000
+            self.mem0_add_queue_max = 256
+            self._mem0_breaker_threshold = 3
+            self._mem0_breaker_cooldown_ms = 60000
+            self._mem0_shutdown_flush_ms = 3000
 
             # API version preference and capability flags
-            self._mem0_api_version_pref = (os.getenv('MEM0_VERSION', 'v2') or 'v2').strip() or 'v2'
+            self._mem0_api_version_pref = 'v2'
             self._mem0_supports_version_kw = True
 
-            org_id = os.getenv('MEM0_ORG_ID')
-            project_id = os.getenv('MEM0_PROJECT_ID')
-            if org_id or project_id:
-                self.mem0_client = MemoryClient(api_key=api_key, org_id=org_id, project_id=project_id)
-            else:
-                self.mem0_client = MemoryClient(api_key=api_key)
-            self.mem0_user_id = os.getenv('MEM0_USER_ID', 'Braden')
-            self.mem0_agent_id = os.getenv('MEM0_AGENT_ID')
-            self.mem0_app_id = os.getenv('MEM0_APP_ID')
-            self.mem0_enabled = True
-            self.logger.info("Mem0 initialized and enabled")
+            # Optional: use an internal proxy LLM (e.g., gpt-oss:20b) for reranking Mem0 search results
+            try:
+                self.mem0_proxy_model = os.getenv('MEM0_PROXY_MODEL') or None
+                self.mem0_proxy_timeout_ms = int(str(os.getenv('MEM0_PROXY_TIMEOUT_MS', '1200')).strip())
+                self._mem0_proxy_enabled = bool(self.mem0_proxy_model)
+            except Exception:
+                self.mem0_proxy_model = None
+                self.mem0_proxy_timeout_ms = 1200
+                self._mem0_proxy_enabled = False
 
-            # Initialize background worker for async adds
+            if self.mem0_config.get('local', False):
+                # Build configuration from provided parameters
+                cfg = {
+                    "vector_store": {
+                        "provider": self.mem0_config['vector_provider'],
+                        "config": {
+                            "host": self.mem0_config['vector_host'],
+                            "port": self.mem0_config['vector_port'],
+                        },
+                    },
+                    "llm": {
+                        "provider": "ollama",
+                        "config": {
+                            "model": self.mem0_config['llm_model'],
+                            "ollama_base_url": self.mem0_config['ollama_url']
+                        },
+                    },
+                    "embedder": {
+                        "provider": "ollama",
+                        "config": {
+                            "model": self.mem0_config['embedder_model'],
+                            "ollama_base_url": self.mem0_config['ollama_url']
+                        },
+                    },
+                    "version": self._mem0_api_version_pref,
+                }
+                
+                # Only add port to config if it's non-zero
+                if not self.mem0_config['vector_port']:
+                    del cfg["vector_store"]["config"]["port"]
+                    
+                # Use in-memory storage if host is ':memory:'
+                if self.mem0_config['vector_host'] == ':memory:':
+                    cfg["vector_store"]["config"]["in_memory"] = True
+                    
+                # Set user ID for memory isolation
+                if 'user_id' in self.mem0_config:
+                    cfg["user_id"] = self.mem0_config['user_id']
+
+                # Instantiate local Memory client
+                try:
+                    if hasattr(_Mem0Impl, 'from_config'):
+                        self.mem0_client = _Mem0Impl.from_config(cfg)  # type: ignore[arg-type]
+                    else:
+                        self.mem0_client = _Mem0Impl()  # type: ignore[call-arg]
+                    self.mem0_mode = 'local'
+                    self.mem0_enabled = True
+                    self.logger.info(f"Initialized local Mem0 with config: {json.dumps(cfg, indent=2, default=str)}")
+                except Exception as e:
+                    self.logger.error(f"Mem0 local initialization failed: {e}")
+                    try:
+                        if not getattr(self, '_mem0_notice_shown', False) and not self.quiet:
+                            print(f"Mem0 local initialization failed: {e}")
+                            self._mem0_notice_shown = True
+                    except Exception:
+                        pass
+                    return
+            else:
+                # Remote Mem0 client (cloud)
+                try:
+                    api_key = os.getenv('MEM0_API_KEY')
+                    if not api_key:
+                        self.logger.warning("MEM0_API_KEY not set, disabling Mem0")
+                        try:
+                            if not getattr(self, '_mem0_notice_shown', False) and not self.quiet:
+                                print("Mem0 disabled: MEM0_API_KEY not set. Export MEM0_API_KEY or use --mem0-local for OSS mode.")
+                                self._mem0_notice_shown = True
+                        except Exception:
+                            pass
+                        return
+                    
+                    # Check for org and project IDs for cloud version
+                    org_id = os.getenv('MEM0_ORG_ID')
+                    project_id = os.getenv('MEM0_PROJECT_ID')
+                    
+                    if org_id or project_id:
+                        self.mem0_client = _Mem0Impl(api_key=api_key, org_id=org_id, project_id=project_id)  # type: ignore[call-arg]
+                    else:
+                        self.mem0_client = _Mem0Impl(api_key=api_key)  # type: ignore[call-arg]
+                        
+                    self.mem0_mode = 'cloud'
+                    self.mem0_enabled = True
+                    self.logger.info("Initialized Mem0 cloud client")
+                except Exception as e:
+                    self.logger.error(f"Mem0 cloud initialization failed: {e}")
+                    try:
+                        if not getattr(self, '_mem0_notice_shown', False) and not self.quiet:
+                            print(f"Mem0 cloud initialization failed: {e}")
+                            self._mem0_notice_shown = True
+                    except Exception:
+                        pass
+                    return
+
+            # Initialize background worker for async operations
             self._mem0_add_queue = queue.Queue(maxsize=max(1, self.mem0_add_queue_max))
             self._mem0_worker_stop = threading.Event()
-            self._mem0_worker = threading.Thread(target=self._mem0_worker_loop, name="mem0-add-worker", daemon=True)
+            self._mem0_worker = threading.Thread(
+                target=self._mem0_worker_loop,
+                name="mem0-worker",
+                daemon=True
+            )
             self._mem0_worker.start()
-            # Ensure graceful shutdown
             atexit.register(self._mem0_shutdown)
-            # Create tiny pool for Mem0 searches
+            
+            # Initialize search thread pool
             self._mem0_search_pool = ThreadPoolExecutor(
                 max_workers=max(1, self._mem0_search_workers),
                 thread_name_prefix="mem0-search"
             )
             atexit.register(lambda: self._mem0_search_pool.shutdown(wait=False) if self._mem0_search_pool else None)
+            
+            # Set common fields
+            self.mem0_user_id = os.getenv('MEM0_USER_ID', str(self.mem0_config.get('user_id', 'cli-user')))
+            self.mem0_agent_id = os.getenv('MEM0_AGENT_ID')
+            self.mem0_app_id = os.getenv('MEM0_APP_ID')
+            
+            # Log successful initialization
+            mode_str = getattr(self, 'mem0_mode', 'unknown')
+            self.logger.info(f"Mem0 initialized and enabled in {mode_str} mode")
+            
         except Exception as e:
             self.logger.error(f"Mem0 initialization failed: {e}")
             self.mem0_client = None
             self.mem0_enabled = False
+            try:
+                if not getattr(self, '_mem0_notice_shown', False) and not self.quiet:
+                    print(f"Mem0 initialization failed: {e}")
+                    self._mem0_notice_shown = True
+            except Exception:
+                pass
 
     def _inject_mem0_context(self, user_message: str) -> None:
         """Search Mem0 for relevant memories and inject as a system message.
@@ -1885,9 +1042,17 @@ class OllamaTurboClient:
                 pass
 
             # Minimal filter: just user_id
-            filters = {"user_id": getattr(self, 'mem0_user_id', 'Braden')}
+            filters = {"user_id": getattr(self, 'mem0_user_id', str(self.mem0_config.get('user_id', 'cli-user')))}
             def _do_search():
-                return self._mem0_search_api(user_message, filters=filters, limit=self.mem0_max_hits)
+                # If reranker is enabled, pull a larger candidate set first
+                search_limit = self.mem0_max_hits
+                try:
+                    if getattr(self, '_mem0_proxy_enabled', False) and self.mem0_proxy_model:
+                        # Default 10; overridable via MEM0_RERANK_SEARCH_LIMIT
+                        search_limit = max(self.mem0_max_hits, int(str(os.getenv('MEM0_RERANK_SEARCH_LIMIT', '10')).strip() or '10'))
+                except Exception:
+                    pass
+                return self._mem0_search_api(user_message, filters=filters, limit=search_limit)
 
             try:
                 if self._mem0_search_pool:
@@ -1918,15 +1083,40 @@ class OllamaTurboClient:
                     or (m.get('content') if isinstance(m, dict) else None)
                     or str(m)
                 )
-            texts = []
+            texts: List[str] = []
+            aug_texts: List[str] = []
             for m in related or []:
                 try:
                     txt = _memtxt(m)
                     if txt:
-                        texts.append(str(txt))
+                        s_txt = str(txt)
+                        texts.append(s_txt)
+                        # Build a compact metadata suffix purely for reranker signal; not injected to user
+                        try:
+                            md = (m.get('metadata') if isinstance(m, dict) else None) or {}
+                            ts = str(md.get('timestamp') or md.get('ts') or '')
+                            src = str(md.get('source') or md.get('app_id') or md.get('agent_id') or '')
+                            cat = str(md.get('category') or '')
+                            conf = str(md.get('confidence') or '')
+                            meta_suffix = f"\n[meta: ts={ts} src={src} cat={cat} conf={conf}]".rstrip()
+                        except Exception:
+                            meta_suffix = ''
+                        aug_texts.append((s_txt + meta_suffix) if meta_suffix else s_txt)
                 except Exception:
                     continue
+            # Optionally rerank with proxy model if configured
             top_texts = texts[: max(1, self.mem0_max_hits)]
+            try:
+                if getattr(self, '_mem0_proxy_enabled', False) and self.mem0_proxy_model and texts:
+                    order = self._mem0_rerank_with_proxy(user_message, aug_texts or texts, model=self.mem0_proxy_model, k=self.mem0_max_hits)
+                    if order:
+                        # Map back to original, un-augmented texts
+                        top_texts = [texts[i] for i in order if 0 <= int(i) < len(texts)]
+                        # Safety cap to K
+                        top_texts = top_texts[: max(1, self.mem0_max_hits)]
+            except Exception as _re:
+                # Non-fatal: fall back to original order on any rerank error
+                pass
             # Truncate to ~800 chars total
             budget = 800
             acc = []
@@ -1969,6 +1159,7 @@ class OllamaTurboClient:
                 self.logger.info("Mem0 recovered; resuming calls")
                 self._mem0_breaker_recovered_logged = True
                 self._mem0_breaker_tripped_logged = False
+            # Reset failure counters and emit debug timing
             self._mem0_fail_count = 0
             self._mem0_down_until_ms = 0
             dt_ms = int((time.time() - start) * 1000)
@@ -1988,6 +1179,121 @@ class OllamaTurboClient:
             if not self._mem0_notice_shown and not self.quiet:
                 print("⚠️ Mem0 unavailable; continuing without memory for this session.")
                 self._mem0_notice_shown = True
+
+    def _mem0_llm_generate(self, *, model: str, system: str, user: str) -> str:
+        """Internal low-level generation that bypasses our higher-level chat to avoid recursion.
+
+        Always sends a Harmony-compliant system message so gpt-oss operates properly.
+        """
+        try:
+            # Build a Harmony-compliant system prompt. Start from the standard one and
+            # append a brief reranker instruction that constrains output to JSON in <|final|>.
+            try:
+                base_sys = self.prompt.initial_system_prompt()
+            except Exception:
+                base_sys = (
+                    "You are GPT-OSS running with Harmony channels.\n\n"
+                    "— Harmony I/O Protocol —\n"
+                    "• Always end with: <|channel|>final then <|message|>...<|end|>\n"
+                )
+            rerank_sys = (
+                "\nFor this task, return only a JSON array of 0-based indices for the most relevant items, "
+                "inside the Harmony final channel exactly as:\n"
+                "<|channel|>final\n"
+                "<|message|>[1,0]\n"
+                "<|end|>\n"
+                "No other channels or text."
+            )
+            msgs = [
+                {'role': 'system', 'content': (base_sys + rerank_sys)},
+                {'role': 'user', 'content': user},
+            ]
+            kwargs: Dict[str, Any] = {
+                'model': model,
+                'messages': msgs,
+            }
+            # Deterministic, short, and cheap
+            options: Dict[str, Any] = {'temperature': 0, 'top_p': 0}
+            if options:
+                kwargs['options'] = options
+            keep_val = self._resolve_keep_alive()
+            if keep_val is not None:
+                kwargs['keep_alive'] = keep_val
+            # Do not inject reasoning or tools; call provider directly
+            self._trace('mem0:proxy:call')
+            # Apply a coarse timeout by using underlying retry wrapper at a higher level if present
+            resp = self.client.chat(**kwargs)
+            msg = resp.get('message', {}) if isinstance(resp, dict) else {}
+            content = msg.get('content') or ''
+            try:
+                cleaned, _, final = self._parse_harmony_tokens(content)
+                return (final or cleaned or self._strip_harmony_markup(content)) or ''
+            except Exception:
+                return self._strip_harmony_markup(content)
+        except Exception as e:
+            self.logger.debug(f"mem0 proxy generate failed: {e}")
+            return ''
+
+    def _mem0_rerank_with_proxy(self, query: str, candidates: List[str], *, model: str, k: Optional[int] = None) -> List[int]:
+        """Rerank candidate memory snippets for the current query using a proxy LLM.
+
+        Returns an ordered list of candidate indices (subset of range(N)). Empty list on failure.
+        """
+        try:
+            N = len(candidates)
+            if N == 0:
+                return []
+            K = max(1, int(k) if k is not None else int(self.mem0_max_hits))
+
+            # Build user instructions with stronger criteria
+            items = "\n".join(f"[{i}] {c}" for i, c in enumerate(candidates))
+            usr_prompt = (
+                "Rerank the candidates for the query. Criteria (in order):\n"
+                "1) Semantic relevance to the query intent.\n"
+                "2) Specificity and user-identifying detail over generic content.\n"
+                "3) Recency if a timestamp is present in [meta: ts=...].\n"
+                "4) De-duplicate near-identical content; pick the best representative.\n"
+                "5) If candidates contradict, prefer the more specific or recent one.\n\n"
+                f"Query: {query}\n\n"
+                f"Candidates:\n{items}\n\n"
+                f"Return a JSON array of unique 0-based indices, sorted by relevance, length <= {K}."
+            )
+
+            # Enforce timeout on the proxy call
+            raw: str = ''
+            try:
+                with ThreadPoolExecutor(max_workers=1) as _ex:
+                    fut = _ex.submit(self._mem0_llm_generate, model=model, system="rerank", user=usr_prompt)
+                    raw = fut.result(timeout=max(0.1, (getattr(self, 'mem0_proxy_timeout_ms', 1200) or 1200) / 1000.0))
+            except FuturesTimeout:
+                self.logger.debug("mem0 rerank proxy timeout")
+                return []
+
+            # Extract JSON array of indices
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start == -1 or end == -1 or end <= start:
+                return []
+            try:
+                arr = json.loads(raw[start:end+1])
+            except Exception:
+                return []
+            picked = [int(i) for i in arr if isinstance(i, (int, float)) and 0 <= int(i) < N]
+            if not picked:
+                return []
+            # Deduplicate and cap to K
+            seen: set = set()
+            order: List[int] = []
+            for i in picked:
+                if i not in seen:
+                    seen.add(i)
+                    order.append(i)
+                if len(order) >= K:
+                    break
+            return order
+        except Exception as e:
+            self.logger.debug(f"mem0 proxy rerank failed: {e}")
+            return []
 
     def _mem0_add_after_response(self, user_message: Optional[str], assistant_message: Optional[str]) -> None:
         """Queue the interaction to Mem0 for persistence (fire-and-forget)."""
@@ -2080,7 +1386,7 @@ class OllamaTurboClient:
     def _mem0_execute_add(self, messages: List[Dict[str, str]], metadata: Dict[str, Any]) -> List[str]:
         if not self.mem0_client:
             return []
-        user_id = getattr(self, 'mem0_user_id', 'Braden')
+        user_id = getattr(self, 'mem0_user_id', str(self.mem0_config.get('user_id', 'cli-user')))
 
         # First attempt: full-feature call
         kwargs = {"messages": messages, "user_id": user_id, "version": getattr(self, '_mem0_api_version_pref', 'v2'), "metadata": metadata}
@@ -2172,31 +1478,63 @@ class OllamaTurboClient:
         """Search wrapper that prefers v2 and falls back if the SDK doesn't accept the 'version' kwarg."""
         if not self.mem0_client:
             return []
+        user_id = None
         try:
-            if getattr(self, '_mem0_supports_version_kw', True):
-                try:
-                    return self.mem0_client.search(query, version=self._mem0_api_version_pref, filters=filters, limit=limit)
-                except TypeError:
-                    # Older SDK without 'version' kwarg; cache and retry without it
-                    self._mem0_supports_version_kw = False
-            # Fallback path (no version kwarg)
-            return self.mem0_client.search(query, filters=filters, limit=limit)
+            user_id = (filters or {}).get('user_id') if isinstance(filters, dict) else None
         except Exception:
-            raise
+            user_id = None
+        # Try a series of signatures to support both Platform and OSS
+        attempts = []
+        if getattr(self, '_mem0_supports_version_kw', True):
+            attempts.append(lambda: self.mem0_client.search(query, version=self._mem0_api_version_pref, filters=filters, limit=limit))
+        attempts.append(lambda: self.mem0_client.search(query, filters=filters, limit=limit))
+        if user_id is not None:
+            if getattr(self, '_mem0_supports_version_kw', True):
+                attempts.append(lambda: self.mem0_client.search(query=query, user_id=user_id, version=self._mem0_api_version_pref))
+            attempts.append(lambda: self.mem0_client.search(query=query, user_id=user_id))
+            if limit is not None:
+                attempts.append(lambda: self.mem0_client.search(query=query, user_id=user_id, limit=limit))
+        # Last resort: minimal
+        attempts.append(lambda: self.mem0_client.search(query))
+        last_type_error: Optional[Exception] = None
+        for call in attempts:
+            try:
+                return call()
+            except TypeError as te:
+                # Signature mismatch; try next
+                last_type_error = te
+                self._mem0_supports_version_kw = False
+                continue
+        # If all attempts failed due to signature mismatches, raise one for outer handler
+        if last_type_error is not None:
+            raise last_type_error
+        # Otherwise, generic failure
+        raise RuntimeError("Mem0 search failed with all known signatures")
 
     def _mem0_get_all_api(self, filters: Optional[Dict[str, Any]] = None):
         """get_all wrapper that prefers v2 and falls back if the SDK doesn't accept the 'version' kwarg."""
         if not self.mem0_client:
             return []
+        user_id = None
         try:
-            if getattr(self, '_mem0_supports_version_kw', True):
-                try:
-                    return self.mem0_client.get_all(filters=filters, version=self._mem0_api_version_pref)
-                except TypeError:
-                    self._mem0_supports_version_kw = False
-            return self.mem0_client.get_all(filters=filters)
+            user_id = (filters or {}).get('user_id') if isinstance(filters, dict) else None
         except Exception:
-            raise
+            user_id = None
+        attempts = []
+        if getattr(self, '_mem0_supports_version_kw', True):
+            attempts.append(lambda: self.mem0_client.get_all(filters=filters, version=self._mem0_api_version_pref))
+        attempts.append(lambda: self.mem0_client.get_all(filters=filters))
+        if user_id is not None:
+            if getattr(self, '_mem0_supports_version_kw', True):
+                attempts.append(lambda: self.mem0_client.get_all(user_id=user_id, version=self._mem0_api_version_pref))
+            attempts.append(lambda: self.mem0_client.get_all(user_id=user_id))
+        for call in attempts:
+            try:
+                return call()
+            except TypeError:
+                self._mem0_supports_version_kw = False
+                continue
+        raise RuntimeError("Mem0 get_all failed with all known signatures")
 
     def _normalize_fact(self, text: str) -> str:
         t = ' '.join(text.strip().split())
@@ -2211,7 +1549,7 @@ class OllamaTurboClient:
             print("ℹ️ Usage: /mem [list|search|add|get|update|delete|clear|link|export|import] ...")
             return
         if not getattr(self, 'mem0_enabled', False) or not self.mem0_client:
-            print("⚠️ Mem0 is not configured. Set MEM0_API_KEY to enable.")
+            print("⚠️ Mem0 is not configured. Enable with MEM0_USE_LOCAL=1 (local OSS) or set MEM0_API_KEY (remote platform).")
             return
         sub = parts[1].lower()
         try:
@@ -2377,9 +1715,10 @@ class OllamaTurboClient:
             print(f"🔧 Tools: {'Enabled' if self.enable_tools else 'Disabled'}")
             print("💡 Commands: 'quit'/'exit' to exit, 'clear' to clear history, 'history' to show history, '/mem ...' for memory ops")
             if not getattr(self, 'mem0_enabled', False):
-                print("Mem0: disabled (no key)")
+                print("Mem0: disabled (set MEM0_USE_LOCAL=1 for local OSS or provide MEM0_API_KEY for remote)")
             else:
-                print(f"Mem0: enabled (user: {self.mem0_user_id})")
+                mode = getattr(self, 'mem0_mode', 'unknown')
+                print(f"Mem0: enabled ({mode}, user: {self.mem0_user_id})")
             print("-" * 60)
         
         while True:
