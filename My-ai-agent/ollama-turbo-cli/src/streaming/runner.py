@@ -466,6 +466,12 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                     # by breaking out of the for-chunk loop now.
                     if end_round_for_tools:
                         break
+                    # Respect provider 'done' flag strictly when True (do not stop merely on presence)
+                    try:
+                        if isinstance(ck, dict) and (ck.get('done') is True):
+                            break
+                    except Exception:
+                        pass
             except Exception as se:
                 # Stream interrupted (timeout/connection), attempt reconnects handled by outer retry decorator for init only.
                 # Here we fall back to non-streaming finalization to preserve UX, per user preference.

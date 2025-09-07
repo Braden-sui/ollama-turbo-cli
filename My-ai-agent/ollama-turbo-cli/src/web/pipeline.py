@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import WebConfig
 from . import progress as _progress
-from .search import search
-from .fetch import fetch_url
+from .search import search, SearchResult
+from .fetch import fetch_url, _httpx_client
 from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
@@ -68,6 +68,134 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     except Exception:
         pass
 
+    simplified_used = False
+    emergency_used = False
+    # Debug counters (exposed only if cfg.debug_metrics)
+    base_count = len(results)
+    simplified_count = 0
+    variant_count = 0
+    emergency_count = 0
+    if not results:
+        # Heuristic: simplify long/narrow queries and retry once
+        try:
+            import re as _re
+            toks = _re.findall(r"[A-Za-z0-9]+", query)
+            stop = {
+                'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
+                'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
+                '2023','2024','2025'
+            }
+            key_toks = [t for t in toks if t.lower() not in stop]
+            short_q = " ".join(key_toks[:6]) or query[:80]
+        except Exception:
+            short_q = query[:80]
+        if short_q and short_q.strip().lower() != query.strip().lower():
+            try:
+                _progress.emit_current({"stage": "search", "status": "retry", "query": short_q})
+            except Exception:
+                pass
+            results = search(short_q, cfg=cfg, site=site_include, freshness_days=freshness_days)
+            simplified_used = True
+            simplified_count = len(results)
+
+    if not results:
+        # Final variant fallback: try "<ProperNoun> political makeup 2024" style seed
+        try:
+            import re as _re
+            toks = _re.findall(r"[A-Za-z][A-Za-z0-9-]*", query)
+            proper = None
+            for t in toks:
+                if t[0].isupper():
+                    proper = t
+                    break
+            core = proper or (toks[0] if toks else "")
+            if core:
+                variant_q = f"{core} political makeup 2024"
+                try:
+                    _progress.emit_current({"stage": "search", "status": "variant", "query": variant_q})
+                except Exception:
+                    pass
+                results = search(variant_q, cfg=cfg, site=site_include, freshness_days=freshness_days)
+                variant_count = len(results)
+        except Exception:
+            pass
+
+    if not results and cfg.emergency_bootstrap:
+        # Emergency: call providers directly here to bootstrap candidates
+        try:
+            def _dedup_add(acc: list[SearchResult], seen: set[str], title: str, url: str, snippet: str, source: str):
+                if url and url not in seen and url.startswith('http'):
+                    seen.add(url)
+                    acc.append(SearchResult(title=title or '', url=url, snippet=snippet or '', source=source, published=None))
+            # choose a concise query for emergency path
+            em_q = query
+            try:
+                import re as _re
+                toks = _re.findall(r"[A-Za-z0-9]+", query)
+                stop = {'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as','is','are','was','were','be','being','been','this','that','these','those','it','its','into','2023','2024','2025'}
+                em_q2 = " ".join([t for t in toks if t.lower() not in stop][:6])
+                if em_q2:
+                    em_q = em_q2
+            except Exception:
+                pass
+            tmp: list[SearchResult] = []
+            seen_urls: set[str] = set()
+            with _httpx_client(cfg) as c:
+                # Brave
+                if getattr(cfg, 'brave_key', None):
+                    try:
+                        headers = {"X-Subscription-Token": cfg.brave_key, "Accept": "application/json", "User-Agent": cfg.user_agent}
+                        r = c.get("https://api.search.brave.com/res/v1/web/search", params={"q": em_q, "count": 10}, headers=headers, timeout=cfg.timeout_read)
+                        if r.status_code == 200:
+                            data = r.json()
+                            for d in ((data.get('web') or {}).get('results') or []):
+                                _dedup_add(tmp, seen_urls, d.get('title',''), d.get('url',''), d.get('description',''), 'brave')
+                            # generic crawl fallback
+                            if not tmp:
+                                def _walk(v):
+                                    if isinstance(v, dict):
+                                        u = v.get('url') or v.get('link') or v.get('href')
+                                        t = v.get('title') or v.get('name') or ''
+                                        s = v.get('description') or v.get('snippet') or ''
+                                        if isinstance(u, str) and u.startswith('http'):
+                                            _dedup_add(tmp, seen_urls, t, u, s, 'brave')
+                                        for vv in v.values():
+                                            _walk(vv)
+                                    elif isinstance(v, list):
+                                        for it in v:
+                                            _walk(it)
+                                _walk(data)
+                    except Exception:
+                        pass
+                # Tavily
+                if not tmp and getattr(cfg, 'tavily_key', None):
+                    try:
+                        headers = {"Authorization": f"Bearer {cfg.tavily_key}", "Content-Type":"application/json"}
+                        r = c.post("https://api.tavily.com/search", json={"query": em_q, "search_depth":"basic", "max_results": 10}, headers=headers, timeout=cfg.timeout_read)
+                        if r.status_code == 200:
+                            data = r.json()
+                            for d in data.get('results', []) or []:
+                                _dedup_add(tmp, seen_urls, d.get('title',''), d.get('url',''), d.get('content',''), 'tavily')
+                    except Exception:
+                        pass
+                # Exa
+                if not tmp and getattr(cfg, 'exa_key', None):
+                    try:
+                        headers = {"x-api-key": cfg.exa_key, "Content-Type":"application/json"}
+                        r = c.post("https://api.exa.ai/search", json={"query": em_q, "numResults": 10}, headers=headers, timeout=cfg.timeout_read)
+                        if r.status_code == 200:
+                            data = r.json()
+                            for d in data.get('results', []) or []:
+                                _dedup_add(tmp, seen_urls, d.get('title',''), d.get('url',''), d.get('snippet',''), 'exa')
+                    except Exception:
+                        pass
+            if tmp:
+                results = tmp
+                emergency_used = True
+                emergency_count = len(tmp)
+        except Exception:
+            pass
+
     citations: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
     # Dedupe across URLs and content bodies
@@ -76,6 +204,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     seen_hashes: set[str] = set(hash_to_url.keys())
     dedupe_lock = threading.Lock()
 
+    dedup_skips = 0
     def _build_citation(sr) -> Optional[Dict[str, Any]]:
         if site_exclude and site_exclude in (sr.url or ''):
             return None
@@ -115,6 +244,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         body_hash = hashlib.sha256((ex.markdown or '').encode('utf-8', 'ignore')).hexdigest()
         with dedupe_lock:
             if f.final_url in seen_urls or body_hash in seen_hashes or body_hash in hash_to_url:
+                nonlocal dedup_skips
+                dedup_skips += 1
                 return None
             seen_urls.add(f.final_url)
             seen_hashes.add(body_hash)
@@ -218,8 +349,29 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'respect_robots': cfg.respect_robots,
             'allow_browser': cfg.allow_browser,
             'cache_ttl_seconds': cfg.cache_ttl_seconds,
+            'simplified_query_used': simplified_used,
+            'emergency_search_used': emergency_used,
         },
     }
+
+    if cfg.debug_metrics:
+        try:
+            answer['debug'] = {
+                'search': {
+                    'initial_count': base_count,
+                    'simplified_count': simplified_count,
+                    'variant_count': variant_count,
+                    'emergency_count': emergency_count,
+                },
+                'fetch': {
+                    'attempted': len(candidates),
+                    'ok': len(citations[:top_k]),
+                    'failed': len([it for it in items if not it.get('ok')]),
+                    'dedupe_skips': dedup_skips,
+                },
+            }
+        except Exception:
+            pass
 
     # Persist updated dedupe index (best-effort)
     try:

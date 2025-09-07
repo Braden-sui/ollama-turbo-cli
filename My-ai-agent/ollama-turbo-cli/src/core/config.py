@@ -96,7 +96,7 @@ class SamplingConfig:
 @dataclass
 class ToolingConfig:
     enabled: bool = True
-    print_limit: int = 200
+    print_limit: int = 2000
     context_cap: int = field(default_factory=lambda: _env_int("TOOL_CONTEXT_MAX_CHARS", 4000))
     multi_round: bool = field(default_factory=lambda: _env_bool("MULTI_ROUND_TOOLS", True))
     max_rounds: int = field(default_factory=lambda: max(1, _env_int("TOOL_MAX_ROUNDS", 6)))
@@ -125,8 +125,8 @@ class Mem0Config:
     project_id: Optional[str] = None
     # Runtime knobs
     debug: bool = False
-    max_hits: int = 3
-    search_timeout_ms: int = 200
+    max_hits: int = 10
+    search_timeout_ms: int = 700
     timeout_connect_ms: int = 1000
     timeout_read_ms: int = 2000
     add_queue_max: int = 256
@@ -139,7 +139,7 @@ class Mem0Config:
     proxy_timeout_ms: int = 1200      # MEM0_PROXY_TIMEOUT_MS
     rerank_search_limit: int = 10     # MEM0_RERANK_SEARCH_LIMIT
     # Context construction
-    context_budget_chars: int = 800   # MEM0_CONTEXT_BUDGET_CHARS
+    context_budget_chars: int = 1200   # MEM0_CONTEXT_BUDGET_CHARS
 
 
 @dataclass
@@ -155,6 +155,15 @@ class ReliabilityConfig:
 @dataclass
 class HistoryConfig:
     max_history: int = field(default_factory=lambda: max(2, min(_env_int("MAX_CONVERSATION_HISTORY", 10), 10)))
+
+
+@dataclass
+class RerankProviderSpec:
+    name: str = "cohere"  # cohere|voyage
+    model: str = ""
+    base_url: Optional[str] = None
+    top_n: int = 20
+    weight: float = 1.0
 
 
 @dataclass
@@ -192,9 +201,22 @@ class WebConfig:
     # Rerank
     cohere_key: Optional[str] = field(default_factory=lambda: os.getenv("COHERE_API_KEY"))
     voyage_key: Optional[str] = field(default_factory=lambda: os.getenv("VOYAGE_API_KEY"))
+    rerank_enabled: bool = field(default_factory=lambda: _env_bool("WEB_RERANK_ENABLED", True))
+    rerank_mode: str = field(default_factory=lambda: os.getenv("WEB_RERANK_MODE", "sdk"))  # sdk|rest
+    rerank_timeout_ms: int = field(default_factory=lambda: _env_int("WEB_RERANK_TIMEOUT_MS", 2000, min_value=100))
+    rerank_cache_ttl_s: int = field(default_factory=lambda: _env_int("WEB_RERANK_CACHE_TTL_S", 300, min_value=0))
+    rerank_breaker_threshold: int = field(default_factory=lambda: _env_int("WEB_RERANK_BREAKER_THRESHOLD", 3, min_value=1))
+    rerank_breaker_cooldown_ms: int = field(default_factory=lambda: _env_int("WEB_RERANK_BREAKER_COOLDOWN_MS", 60000, min_value=1000))
+    rerank_providers: list[RerankProviderSpec] = field(default_factory=lambda: [
+        RerankProviderSpec(name="cohere", model="rerank-english-v3.0"),
+        RerankProviderSpec(name="voyage", model="rerank-2"),
+    ])
     # Policies
     respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
     allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
+    # Debugging / fallbacks
+    emergency_bootstrap: bool = field(default_factory=lambda: _env_bool("WEB_EMERGENCY_BOOTSTRAP", True))
+    debug_metrics: bool = field(default_factory=lambda: _env_bool("WEB_DEBUG_METRICS", False))
     # Rate limiting
     rate_tokens_per_host: int = field(default_factory=lambda: _env_int("WEB_RATE_TOKENS_PER_HOST", 4, min_value=1))
     rate_refill_per_sec: float = field(default_factory=lambda: _env_float("WEB_RATE_REFILL_PER_SEC", 0.5, min_value=0.01))
@@ -218,6 +240,8 @@ class WebConfig:
     browser_wait_ms: int = field(default_factory=lambda: _env_int("WEB_BROWSER_WAIT_MS", 1200, min_value=0))
     browser_block_resources: str = field(default_factory=lambda: os.getenv("WEB_BROWSER_BLOCK_RESOURCES", "image,font,media"))
     browser_stealth_light: bool = field(default_factory=lambda: _env_bool("WEB_BROWSER_STEALTH_LIGHT", False))
+    # Content post-processing toggles
+    clean_wiki_edit_anchors: bool = field(default_factory=lambda: _env_bool("WEB_CLEAN_WIKI_EDIT_ANCHORS", True))
     # Sitemaps
     sitemap_enabled: bool = field(default_factory=lambda: _env_bool("WEB_SITEMAP_ENABLED", False))
     sitemap_max_urls: int = field(default_factory=lambda: _env_int("WEB_SITEMAP_MAX_URLS", 50, min_value=1))
@@ -365,6 +389,11 @@ class ClientRuntimeConfig:
         cfg.mem0.llm_model = os.getenv("MEM0_LLM_MODEL") or cfg.mem0.llm_model
         cfg.mem0.embedder_model = os.getenv("MEM0_EMBEDDER_MODEL", cfg.mem0.embedder_model)
         cfg.mem0.search_workers = _env_int("MEM0_SEARCH_WORKERS", 2)
+        # Mem0 search timeout (ms)
+        try:
+            cfg.mem0.search_timeout_ms = _env_int("MEM0_SEARCH_TIMEOUT_MS", cfg.mem0.search_timeout_ms, min_value=50)
+        except Exception:
+            pass
         cfg.mem0.in_first_system = _env_bool("MEM0_IN_FIRST_SYSTEM", False)
         cfg.mem0.user_id = os.getenv("MEM0_USER_ID", cfg.mem0.user_id)
         cfg.mem0.agent_id = os.getenv("MEM0_AGENT_ID") or None

@@ -19,10 +19,9 @@ def get_memento(url: str, *, cfg: Optional[WebConfig] = None) -> Dict[str, str]:
     api = f"https://archive.org/wayback/available?url={quote(url, safe='')}"
     out = {'archive_url': '', 'timestamp': ''}
     try:
-        timeout = cfg.timeout_read
         headers = {'User-Agent': cfg.user_agent, 'Accept': 'application/json'}
         with _httpx_client(cfg) as c:
-            r = c.get(api, headers=headers, timeout=timeout)
+            r = c.get(api, headers=headers, timeout=cfg.timeout_read)
             if r.status_code == 200:
                 data = r.json()
                 closest = (data.get('archived_snapshots') or {}).get('closest') or {}
@@ -45,7 +44,7 @@ def save_page_now(url: str, *, cfg: Optional[WebConfig] = None) -> Dict[str, str
         for i in range(attempts):
             try:
                 with _httpx_client(cfg) as client:
-                    resp = client.post(api_url, headers={'User-Agent': cfg.user_agent}, timeout=cfg.timeout_read)
+                    resp = client.post(api_url, headers={'User-Agent': cfg.user_agent}, timeout=cfg.timeout_read, follow_redirects=True)
                 # Parse headers
                 arch = resp.headers.get('content-location', '') or resp.headers.get('Content-Location', '')
                 if arch and arch.startswith('/'):

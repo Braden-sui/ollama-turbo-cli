@@ -6,7 +6,7 @@ import json
 import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any
-from urllib.parse import quote_plus, urlparse, urljoin
+from urllib.parse import quote_plus, urlparse, urljoin, parse_qs, unquote
 import xml.etree.ElementTree as ET
 import gzip
 
@@ -210,6 +210,106 @@ def _sitemap_search(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         return []
 
 
+def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
+    """Keyless fallback using DuckDuckGo Instant Answer API with HTML fallback.
+
+    This avoids external API keys and keeps network policy centralized via WebConfig.
+    """
+    try:
+        qtext = f"site:{q.site} {q.query}" if q.site else q.query
+        headers_json = {"Accept": "application/json", "User-Agent": cfg.user_agent}
+        params = {"q": qtext, "format": "json", "no_html": "1", "no_redirect": "1", "t": "ollama-turbo-cli"}
+        results: List[SearchResult] = []
+        with _httpx_client(cfg) as c:
+            try:
+                r = c.get("https://api.duckduckgo.com/", params=params, headers=headers_json, timeout=cfg.timeout_read)
+                if r.status_code == 200:
+                    data = r.json()
+                    # Prefer Abstract if present
+                    abstract = (data.get("AbstractText") or data.get("Abstract") or "").strip()
+                    abstract_url = (data.get("AbstractURL") or "").strip()
+                    if abstract and abstract_url:
+                        results.append(_norm({"title": data.get("Heading") or "Instant Answer", "url": abstract_url, "snippet": abstract}, "duckduckgo"))
+                    # RelatedTopics (flatten minimal subset)
+                    def _flatten(items):
+                        out = []
+                        for it in items or []:
+                            if isinstance(it, dict) and it.get("FirstURL"):
+                                out.append({
+                                    "title": (it.get("Text") or "").split(" - ")[0][:120],
+                                    "url": it.get("FirstURL"),
+                                    "snippet": it.get("Text") or "",
+                                })
+                            elif isinstance(it, dict) and it.get("Topics"):
+                                out.extend(_flatten(it.get("Topics")))
+                        return out
+                    for it in _flatten(data.get("RelatedTopics")):
+                        results.append(_norm(it, "duckduckgo"))
+            except Exception:
+                results = []
+            if results:
+                # Deduplicate by URL
+                seen = set()
+                uniq: List[SearchResult] = []
+                for r0 in results:
+                    if r0.url and r0.url not in seen:
+                        seen.add(r0.url)
+                        uniq.append(r0)
+                return uniq[:10]
+            # HTML fallback
+            headers_html = {
+                "Accept": "text/html",
+                "User-Agent": cfg.user_agent,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://duckduckgo.com/",
+            }
+            collected: List[SearchResult] = []
+            for base in ("https://duckduckgo.com/lite/", "https://html.duckduckgo.com/html/"):
+                try:
+                    r2 = c.get(base, params={"q": qtext}, headers=headers_html, timeout=cfg.timeout_read)
+                except Exception:
+                    continue
+                if r2.status_code != 200:
+                    continue
+                html = r2.text or ""
+                links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I)
+                for href, text in links:
+                    try:
+                        absolute = href if href.lower().startswith("http") else urljoin(base, href)
+                        parsed = urlparse(absolute)
+                        netloc = parsed.netloc or ""
+                    except Exception:
+                        continue
+                    resolved_url = None
+                    if netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                        # decode external URL from uddg param
+                        try:
+                            qs = parse_qs(parsed.query or "")
+                            uddg = (qs.get("uddg") or [None])[0]
+                            if uddg:
+                                resolved_url = unquote(uddg)
+                        except Exception:
+                            pass
+                    elif netloc.endswith("duckduckgo.com") or netloc.endswith("duck.com"):
+                        continue
+                    else:
+                        resolved_url = absolute if absolute.lower().startswith("http") else None
+                    if not resolved_url:
+                        continue
+                    title_text = re.sub(r"<[^>]+>", "", text)[:120].strip() or "(no title)"
+                    snippet = re.sub(r"<[^>]+>", "", text)[:160].strip()
+                    sr = SearchResult(title=title_text, url=resolved_url, snippet=snippet, source="duckduckgo", published=None)
+                    if sr.url not in [c.url for c in collected]:
+                        collected.append(sr)
+                    if len(collected) >= 10:
+                        break
+                if collected:
+                    break
+            return collected[:10]
+    except Exception:
+        return []
+
+
 def _search_brave(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     key = cfg.brave_key
     if not key:
@@ -221,10 +321,43 @@ def _search_brave(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         headers = {"X-Subscription-Token": key, "Accept": "application/json", "User-Agent": cfg.user_agent}
         with _httpx_client(cfg) as c:
             r = c.get("https://api.search.brave.com/res/v1/web/search", params=params, headers=headers, timeout=cfg.timeout_read)
-            data = r.json()
-            items = []
-            for d in data.get('web', {}).get('results', []):
-                items.append(_norm({'title': d.get('title'), 'url': d.get('url'), 'snippet': d.get('description'), 'published': d.get('page_age')}, 'brave'))
+            try:
+                data = r.json()
+            except Exception:
+                return []
+            items: List[SearchResult] = []
+            # Normal, typed mapping
+            try:
+                for d in (data.get('web', {}) or {}).get('results', []) or []:
+                    items.append(_norm({'title': d.get('title'), 'url': d.get('url'), 'snippet': d.get('description'), 'published': d.get('page_age')}, 'brave'))
+            except Exception:
+                items = []
+            # Fallback: generic crawl for url/title pairs anywhere in the payload
+            if not items:
+                try:
+                    def _walk(v, out: List[SearchResult]):
+                        if isinstance(v, dict):
+                            u = v.get('url') or v.get('link') or v.get('href')
+                            t = v.get('title') or v.get('name') or v.get('heading') or ''
+                            s = v.get('description') or v.get('snippet') or ''
+                            if isinstance(u, str) and u.startswith('http'):
+                                out.append(_norm({'title': t, 'url': u, 'snippet': s}, 'brave'))
+                            for vv in v.values():
+                                _walk(vv, out)
+                        elif isinstance(v, list):
+                            for it in v:
+                                _walk(it, out)
+                    tmp: List[SearchResult] = []
+                    _walk(data, tmp)
+                    # Deduplicate by URL preserving order
+                    seen: set[str] = set()
+                    items = []
+                    for it in tmp:
+                        if it.url and it.url not in seen:
+                            seen.add(it.url)
+                            items.append(it)
+                except Exception:
+                    pass
             return items
     except Exception:
         return []
@@ -299,6 +432,36 @@ def search(query: str, *, cfg: Optional[WebConfig] = None, site: Optional[str] =
             candidates.extend(_search_exa(q, cfg))
     if not candidates:
         candidates.extend(_search_google_pse(q, cfg))
+    # Keyless fallback to DuckDuckGo if no API-backed engines succeeded
+    if not candidates:
+        candidates.extend(_search_duckduckgo_fallback(q, cfg))
+    # Heuristic fallback: simplify long/narrow queries and retry
+    if not candidates:
+        try:
+            toks = re.findall(r"[A-Za-z0-9]+", query)
+            stop = {
+                'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
+                'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
+                '2023','2024','2025'
+            }
+            key_toks = [t for t in toks if t.lower() not in stop]
+            short_q = " ".join(key_toks[:6]) or query[:80]
+        except Exception:
+            short_q = query[:80]
+        if short_q and short_q.strip().lower() != query.strip().lower():
+            q2 = SearchQuery(query=short_q, site=site, freshness_days=freshness_days)
+            # Retry full rotation
+            items2: List[SearchResult] = []
+            items2.extend(_search_brave(q2, cfg))
+            if not items2:
+                items2.extend(_search_tavily(q2, cfg))
+                if not items2:
+                    items2.extend(_search_exa(q2, cfg))
+            if not items2:
+                items2.extend(_search_google_pse(q2, cfg))
+            if not items2:
+                items2.extend(_search_duckduckgo_fallback(q2, cfg))
+            candidates.extend(items2)
     # Optional sitemap ingestion (augment results for site-restricted queries)
     if cfg.sitemap_enabled and q.site:
         try:

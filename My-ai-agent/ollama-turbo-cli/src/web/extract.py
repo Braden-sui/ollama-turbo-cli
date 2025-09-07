@@ -60,7 +60,7 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     markdown = ""
     # Try trafilatura
     try:
-        import trafilatura
+        import trafilatura  # type: ignore
         art = trafilatura.extract(html, include_formatting=True, include_links=True, output_format='markdown')
         if art:
             markdown = art
@@ -71,7 +71,7 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     # Fallback readability-lxml
     if not markdown:
         try:
-            from readability import Document
+            from readability import Document  # type: ignore
             doc = Document(html)
             title = doc.short_title() or ''
             content_html = doc.summary()
@@ -106,7 +106,7 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
     # Fallback to pdfminer if PyMuPDF failed or yielded empty
     if not text:
         try:
-            from pdfminer.high_level import extract_text
+            from pdfminer.high_level import extract_text  # type: ignore
             with io.BytesIO(bin_data) as fp:
                 text = extract_text(fp) or ""
             used["pdfminer"] = True
@@ -127,7 +127,7 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
                     subprocess.run(['ocrmypdf', '--skip-text', in_path, out_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     # Re-extract
                     try:
-                        from pdfminer.high_level import extract_text as ex2
+                        from pdfminer.high_level import extract_text as ex2  # type: ignore
                         with open(out_path, 'rb') as f:
                             text = ex2(f) or text
                     except Exception:
@@ -199,6 +199,20 @@ def extract_content(fetch_meta: Dict[str, Any], *, cfg: Optional[WebConfig] = No
         else:
             markdown = ''
             kind = 'binary'
+
+    # Optional cleanup for common wiki artifacts such as "[edit]" anchors
+    try:
+        if cfg.clean_wiki_edit_anchors and markdown:
+            # Remove markdown links whose visible text is exactly 'edit' (case-insensitive)
+            markdown = re.sub(r"\[\s*edit\s*\]\([^)]+\)", "", markdown, flags=re.I)
+            # Occasionally appears as nested brackets from HTML → markdown conversions
+            markdown = re.sub(r"\[\s*\[?\s*edit\s*\]?\s*\]\([^)]+\)", "", markdown, flags=re.I)
+            # Remove stray '[edit]' tokens
+            markdown = re.sub(r"\[\s*edit\s*\]", "", markdown, flags=re.I)
+            # Trim leftover excess whitespace before newlines
+            markdown = re.sub(r"[ \t]+\n", "\n", markdown)
+    except Exception:
+        pass
 
     risk, reasons = _assess_risk((markdown or '')[:10000])
     return ExtractResult(

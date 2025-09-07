@@ -90,11 +90,11 @@ pip install -r requirements.txt
 
 2) Get a key
 
-Go to https://ollama.com/turbo
+Go to <https://ollama.com/turbo>
 
 Subscribe (from $20/month)
 
-Create an API key: https://ollama.com/settings/keys
+Create an API key: <https://ollama.com/settings/keys>
 
 3) Configure
 cp .env.example .env
@@ -212,7 +212,7 @@ Windows PowerShell example included in the original README (works unchanged).
 Configuration
 Core env vars
 
-OLLAMA_API_KEY, OLLAMA_MODEL (default: gpt-oss:120b), OLLAMA_HOST (default: https://ollama.com)
+OLLAMA_API_KEY, OLLAMA_MODEL (default: gpt-oss:120b), OLLAMA_HOST (default: <https://ollama.com>)
 
 MAX_CONVERSATION_HISTORY (default: 10)
 
@@ -227,6 +227,23 @@ Prompt flags: PROMPT_VERSION, PROMPT_INCLUDE_TOOL_GUIDE, PROMPT_FEWSHOTS
 Tools: MULTI_ROUND_TOOLS (default: true), TOOL_MAX_ROUNDS (default: 6)
 
 Tool results: TOOL_RESULTS_FORMAT (string|object, default: string)
+
+Web research env vars
+
+- BRAVE_API_KEY — Brave Search (recommended)
+- TAVILY_API_KEY — Tavily Search
+- EXA_API_KEY — Exa Search
+- GOOGLE_PSE_KEY and GOOGLE_PSE_CX — both required for Google Programmable Search Engine
+- WEB_RESPECT_ROBOTS — respect robots.txt (default: 1)
+- WEB_ALLOW_BROWSER — allow headless browser fallback when needed (default: 1)
+- SANDBOX_ALLOW_PROXIES — allow outbound via proxies if HTTP(S)_PROXY is set (default: 0)
+- HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY — proxy URLs; strings like "None", "null", "false", or "0" are treated as unset
+- WEB_TIMEOUT_CONNECT / WEB_TIMEOUT_READ / WEB_TIMEOUT_WRITE — httpx timeouts (seconds)
+- WEB_MAX_CONNECTIONS / WEB_PER_HOST_CONCURRENCY — httpx connection limits
+- WEB_EMERGENCY_BOOTSTRAP — enable emergency provider bootstrap inside pipeline when search finds zero (default: 1)
+- WEB_DEBUG_METRICS — include search/fetch/dedupe counters in result (default: 0)
+- WEB_CLEAN_WIKI_EDIT_ANCHORS — remove "[edit]" artifacts from Wikipedia extracts (default: 1)
+- WEB_SITEMAP_ENABLED / WEB_SITEMAP_MAX_URLS / WEB_SITEMAP_INCLUDE_SUBS — optional sitemap augmentation for site-restricted queries
 
 Mem0 (optional)
 
@@ -257,6 +274,12 @@ Confirmations (TTY): preview prompt unless SHELL_TOOL_CONFIRM=0.
 Sandbox: CPU/mem/pids/disk/time caps; read-only project mount; tmpfs workspace; no host env. Windows requires Docker Desktop/WSL2.
 
 Web fetch: HTTPS-only (by default), allowlist via SANDBOX_NET_ALLOW, SSRF-safe client, caching + per-host rate limits.
+
+Proxies & egress
+
+- If your network requires an egress proxy, set SANDBOX_ALLOW_PROXIES=1 and configure HTTPS_PROXY (and optionally HTTP_PROXY/ALL_PROXY)
+- Example: HTTPS_PROXY=http://proxy-host:8080 and NO_PROXY=localhost,127.0.0.1
+- The client ignores proxy envs that are set to literal strings like "None"/"null"/"false"/"0"
 
 Summarize before injection: outputs are summarized and capped by TOOL_CONTEXT_MAX_CHARS (default 4000). Full logs live under .sandbox/.
 
@@ -298,6 +321,13 @@ Connectivity: check network & service status; try --log-level DEBUG.
 Tools: some need extra deps/permissions (e.g., psutil for system info).
 
 Performance: streaming improves perceived latency; multi-round tools add real latency.
+
+Web research troubleshooting
+
+- Verify keys are loaded (BRAVE/TAVILY/EXA; PSE requires both KEY and CX)
+- Enable debug metrics for one run: WEB_DEBUG_METRICS=1 (result.debug.search/fetch counters)
+- If outbound is blocked, set SANDBOX_ALLOW_PROXIES=1 and HTTPS_PROXY/HTTP_PROXY
+- If zero results for long queries, the pipeline will simplify/variant/boostrap automatically; you can disable bootstrap via WEB_EMERGENCY_BOOTSTRAP=0
 
 Development
 Project layout
@@ -345,6 +375,20 @@ Params: top_k, site_include, site_exclude, freshness_days, force_refresh.
 
 Output: compact JSON (results + citations + archives).
 
+Provider rotation & fallbacks
+
+- Primary engines (keys optional but recommended): Brave → Tavily → Exa → Google PSE
+- If none return results, use keyless DuckDuckGo fallback
+- If still empty, simplify the query (drop stopwords, keep ≤6 salient tokens) and retry rotation
+- If still empty, try a variant like "&lt;ProperNoun&gt; political makeup 2024"
+- If still empty and WEB_EMERGENCY_BOOTSTRAP=1, the pipeline directly calls providers via httpx to bootstrap candidates
+
+HTTP client & proxies
+
+- Uses httpx with HTTP/1.1 (http2 disabled) for compatibility
+- Proxies are honored only when SANDBOX_ALLOW_PROXIES=1 and proxy envs are set
+- Strings like "None", "null", "false", or "0" in proxy envs are treated as unset
+
 Tests
 pytest -q
 
@@ -370,7 +414,17 @@ Contributing
 Please include tests for new functionality.
 
 Version history
-v1.1.0 (current)
+v1.1.1 (current)
+
+Web research fallbacks (simplify/variant) and emergency bootstrap path
+
+Debug metrics (WEB_DEBUG_METRICS) for search/fetch/dedupe counters
+
+Extractor cleanup to remove Wikipedia "[edit]" artifacts (WEB_CLEAN_WIKI_EDIT_ANCHORS)
+
+HTTP client compatibility: HTTP/1.1 and robust proxy handling
+
+v1.1.0
 
 Heuristic auto-flags; flags plumbed end-to-end
 

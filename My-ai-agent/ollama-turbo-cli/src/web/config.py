@@ -1,3 +1,3 @@
-from ..core.config import WebConfig
+from ..core.config import WebConfig, RerankProviderSpec
 
-__all__ = ["WebConfig"]
+__all__ = ["WebConfig", "RerankProviderSpec"]

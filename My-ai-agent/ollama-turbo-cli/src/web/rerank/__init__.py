@@ -2,8 +2,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
-from .config import WebConfig
-from .rerank_adapter_router import rerank as _adapter_rerank
+
+from ..config import WebConfig
+from .router import rerank as _adapter_rerank
 
 
 @dataclass
@@ -65,20 +66,25 @@ def rerank_chunks(query: str, chunks: List[Chunk], *, cfg: Optional[WebConfig] =
     if not chunks:
         return []
 
+    # Build doc list and ask adapter for best indices
     docs = [ch.text for ch in chunks]
-    indices: List[int] = []
+    indices: List[int]
     try:
         indices = _adapter_rerank(cfg, query, docs, top_n=min(top_k, len(docs)))
     except Exception:
         indices = []
 
     results: List[Tuple[Chunk, float]] = []
+    used = "adapter"
     if indices:
+        # Assign descending scores by rank if provider didn't return explicit scores
         for rank, idx in enumerate(indices):
             if 0 <= idx < len(chunks):
                 results.append((chunks[idx], float(len(indices) - rank)))
     else:
+        # fallback
         results = _simple_rerank(query, chunks)[:top_k]
+        used = "simple"
 
     out: List[Dict[str, Any]] = []
     for ch, score in results[:top_k]:

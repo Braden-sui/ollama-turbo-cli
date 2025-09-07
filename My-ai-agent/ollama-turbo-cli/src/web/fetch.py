@@ -151,10 +151,23 @@ def _httpx_client(cfg: WebConfig):
     limits = httpx.Limits(max_connections=cfg.max_connections, max_keepalive_connections=cfg.max_keepalive)
     # Build proxies from centralized cfg (do not read env here)
     proxies = None
+    def _norm_proxy(u: Optional[str]) -> Optional[str]:
+        try:
+            if not u:
+                return None
+            s = str(u).strip()
+            if s.lower() in {"none", "null", "false", "0"}:
+                return None
+            # Basic URL shape check; accept http(s) and socks schemes
+            if not (s.startswith("http://") or s.startswith("https://") or s.startswith("socks")):
+                return None
+            return s
+        except Exception:
+            return None
     try:
         if cfg.sandbox_allow_proxies:
-            http_p = cfg.http_proxy or cfg.all_proxy
-            https_p = cfg.https_proxy or cfg.all_proxy
+            http_p = _norm_proxy(cfg.http_proxy) or _norm_proxy(cfg.all_proxy)
+            https_p = _norm_proxy(cfg.https_proxy) or _norm_proxy(cfg.all_proxy)
             if http_p or https_p:
                 proxies = {}
                 if http_p:
@@ -165,7 +178,7 @@ def _httpx_client(cfg: WebConfig):
         proxies = None
     # Always disable trust_env so only cfg drives behavior
     return httpx.Client(
-        http2=True,
+        http2=False,
         timeout=timeout,
         limits=limits,
         headers={"User-Agent": cfg.user_agent},
