@@ -111,7 +111,10 @@ class Mem0Config:
     vector_provider: str = "chroma"
     vector_host: str = ":memory:"
     vector_port: int = 0
-    ollama_url: Optional[str] = None
+    ollama_url: Optional[str] = None  # embedder base (compat)
+    # Optional explicit bases
+    llm_base_url: Optional[str] = None
+    embedder_base_url: Optional[str] = None
     llm_model: Optional[str] = None
     embedder_model: str = "embeddinggemma"
     user_id: str = "cli-user"  # unified default across client and config
@@ -135,6 +138,8 @@ class Mem0Config:
     proxy_model: Optional[str] = None  # MEM0_PROXY_MODEL
     proxy_timeout_ms: int = 1200      # MEM0_PROXY_TIMEOUT_MS
     rerank_search_limit: int = 10     # MEM0_RERANK_SEARCH_LIMIT
+    # Context construction
+    context_budget_chars: int = 800   # MEM0_CONTEXT_BUDGET_CHARS
 
 
 @dataclass
@@ -153,6 +158,73 @@ class HistoryConfig:
 
 
 @dataclass
+class WebConfig:
+    # Identity
+    user_agent: str = field(default_factory=lambda: os.getenv("WEB_UA", "ollama-turbo-cli-web/1.0 (+https://github.com)"))
+    # Timeouts (seconds)
+    timeout_connect: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_CONNECT", 5.0))
+    timeout_read: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_READ", 15.0))
+    timeout_write: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_WRITE", 10.0))
+    # Retries
+    retry_attempts: int = field(default_factory=lambda: _env_int("WEB_RETRY_ATTEMPTS", 3, min_value=0))
+    retry_backoff_base: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_BASE", 0.4))
+    retry_backoff_max: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_MAX", 6.0))
+    # Concurrency
+    max_connections: int = field(default_factory=lambda: _env_int("WEB_MAX_CONNECTIONS", 20, min_value=1))
+    max_keepalive: int = field(default_factory=lambda: _env_int("WEB_MAX_KEEPALIVE", 10, min_value=0))
+    per_host_concurrency: int = field(default_factory=lambda: _env_int("WEB_PER_HOST_CONCURRENCY", 4, min_value=1))
+    # Fetch behavior
+    follow_redirects: bool = field(default_factory=lambda: _env_bool("WEB_FOLLOW_REDIRECTS", True))
+    head_gating_enabled: bool = field(default_factory=lambda: _env_bool("WEB_HEAD_GATING", True))
+    max_download_bytes: int = field(default_factory=lambda: _env_int("WEB_MAX_DOWNLOAD_BYTES", 10 * 1024 * 1024, min_value=1024))
+    accept_header_override: str = field(default_factory=lambda: os.getenv("WEB_ACCEPT_HEADER", ""))
+    client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 16, min_value=1))
+    # Caching and robots
+    cache_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SECONDS", 86400, min_value=0))
+    robots_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_ROBOTS_TTL_SECONDS", 3600, min_value=0))
+    max_crawl_delay_s: int = field(default_factory=lambda: _env_int("WEB_MAX_CRAWL_DELAY_S", 20, min_value=0))
+    # Provider keys
+    brave_key: Optional[str] = field(default_factory=lambda: os.getenv("BRAVE_API_KEY"))
+    tavily_key: Optional[str] = field(default_factory=lambda: os.getenv("TAVILY_API_KEY"))
+    exa_key: Optional[str] = field(default_factory=lambda: os.getenv("EXA_API_KEY"))
+    google_pse_cx: Optional[str] = field(default_factory=lambda: os.getenv("GOOGLE_PSE_CX"))
+    google_pse_key: Optional[str] = field(default_factory=lambda: os.getenv("GOOGLE_PSE_KEY"))
+    # Rerank
+    cohere_key: Optional[str] = field(default_factory=lambda: os.getenv("COHERE_API_KEY"))
+    voyage_key: Optional[str] = field(default_factory=lambda: os.getenv("VOYAGE_API_KEY"))
+    # Policies
+    respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
+    allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
+    # Rate limiting
+    rate_tokens_per_host: int = field(default_factory=lambda: _env_int("WEB_RATE_TOKENS_PER_HOST", 4, min_value=1))
+    rate_refill_per_sec: float = field(default_factory=lambda: _env_float("WEB_RATE_REFILL_PER_SEC", 0.5, min_value=0.01))
+    respect_retry_after: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_RETRY_AFTER", True))
+    # Allowlist integration (reuse sandbox policy)
+    sandbox_allow: Optional[str] = field(default_factory=lambda: os.getenv("SANDBOX_NET_ALLOW", ""))
+    sandbox_allow_http: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_HTTP", False))
+    sandbox_allow_proxies: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_PROXIES", False))
+    # Proxy environment (centralized)
+    http_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("HTTP_PROXY") or os.getenv("http_proxy")))
+    https_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")))
+    all_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("ALL_PROXY") or os.getenv("all_proxy")))
+    no_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("NO_PROXY") or os.getenv("no_proxy")))
+    # Storage locationsq
+    cache_root: str = field(default_factory=lambda: os.getenv("WEB_CACHE_ROOT", ".sandbox/webcache"))
+    archive_enabled: bool = field(default_factory=lambda: _env_bool("WEB_ARCHIVE_ENABLED", True))
+    archive_check_memento_first: bool = field(default_factory=lambda: _env_bool("WEB_ARCHIVE_CHECK_FIRST", False))
+    archive_retry_on_429: bool = field(default_factory=lambda: _env_bool("WEB_ARCHIVE_RETRY_ON_429", True))
+    # Browser limits
+    browser_max_pages: int = field(default_factory=lambda: _env_int("WEB_BROWSER_MAX_PAGES", 10, min_value=1))
+    browser_wait_ms: int = field(default_factory=lambda: _env_int("WEB_BROWSER_WAIT_MS", 1200, min_value=0))
+    browser_block_resources: str = field(default_factory=lambda: os.getenv("WEB_BROWSER_BLOCK_RESOURCES", "image,font,media"))
+    browser_stealth_light: bool = field(default_factory=lambda: _env_bool("WEB_BROWSER_STEALTH_LIGHT", False))
+    # Sitemaps
+    sitemap_enabled: bool = field(default_factory=lambda: _env_bool("WEB_SITEMAP_ENABLED", False))
+    sitemap_max_urls: int = field(default_factory=lambda: _env_int("WEB_SITEMAP_MAX_URLS", 50, min_value=1))
+    sitemap_timeout_s: float = field(default_factory=lambda: _env_float("WEB_SITEMAP_TIMEOUT_S", 5.0, min_value=1.0))
+    sitemap_include_subs: bool = field(default_factory=lambda: _env_bool("WEB_SITEMAP_INCLUDE_SUBS", True))
+
+@dataclass
 class ClientRuntimeConfig:
     model: str = "gpt-oss:120b"
     protocol: str = "auto"
@@ -167,6 +239,7 @@ class ClientRuntimeConfig:
     mem0: Mem0Config = field(default_factory=Mem0Config)
     reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 
     @classmethod
     def from_env(
@@ -183,10 +256,15 @@ class ClientRuntimeConfig:
         the defaults used by the current `OllamaTurboClient`.
         """
         cfg = cls()
+        # Model and protocol: CLI overrides first, then env, then defaults
         if model is not None:
             cfg.model = model
+        else:
+            cfg.model = os.getenv("OLLAMA_MODEL", cfg.model)
         if protocol is not None:
             cfg.protocol = protocol
+        else:
+            cfg.protocol = os.getenv("OLLAMA_PROTOCOL", cfg.protocol)
         if quiet is not None:
             cfg.quiet = quiet
         if show_trace is not None:
@@ -214,9 +292,78 @@ class ClientRuntimeConfig:
         trf = (os.getenv("TOOL_RESULTS_FORMAT") or "string").strip().lower()
         cfg.tooling.results_format = "object" if trf == "object" else "string"
 
+        # Sampling: reasoning, mode, caps, and penalties
+        try:
+            r_env = os.getenv("REASONING")
+            if r_env:
+                r = r_env.strip().lower()
+                if r in {"low", "medium", "high"}:
+                    cfg.sampling.reasoning = r
+        except Exception:
+            pass
+        try:
+            rm_env = os.getenv("REASONING_MODE")
+            if rm_env:
+                rm = rm_env.strip().lower()
+                if rm in {"system", "request:top", "request:options"}:
+                    cfg.sampling.reasoning_mode = rm
+        except Exception:
+            pass
+        # Numeric sampling envs (optional)
+        try:
+            v = os.getenv("MAX_OUTPUT_TOKENS")
+            if v and v.strip().isdigit():
+                cfg.sampling.max_output_tokens = int(v)
+        except Exception:
+            pass
+        try:
+            v = os.getenv("CTX_SIZE")
+            if v and v.strip().isdigit():
+                cfg.sampling.ctx_size = int(v)
+        except Exception:
+            pass
+        try:
+            v = os.getenv("TEMPERATURE")
+            if v not in (None, ""):
+                cfg.sampling.temperature = float(v)
+        except Exception:
+            pass
+        try:
+            v = os.getenv("TOP_P")
+            if v not in (None, ""):
+                cfg.sampling.top_p = float(v)
+        except Exception:
+            pass
+        try:
+            v = os.getenv("PRESENCE_PENALTY")
+            if v not in (None, ""):
+                cfg.sampling.presence_penalty = float(v)
+        except Exception:
+            pass
+        try:
+            v = os.getenv("FREQUENCY_PENALTY")
+            if v not in (None, ""):
+                cfg.sampling.frequency_penalty = float(v)
+        except Exception:
+            pass
+
         # Mem0
         cfg.mem0.enabled = _env_bool("MEM0_ENABLED", cfg.mem0.enabled)
         cfg.mem0.local = _env_bool("MEM0_USE_LOCAL", cfg.mem0.local)
+        # Static/local embeddings bases
+        cfg.mem0.ollama_url = os.getenv("MEM0_OLLAMA_URL") or os.getenv("MEM0_OLLAMA_BASE_URL") or cfg.mem0.ollama_url
+        cfg.mem0.llm_base_url = os.getenv("MEM0_LLM_OLLAMA_URL") or cfg.mem0.llm_base_url
+        cfg.mem0.embedder_base_url = os.getenv("MEM0_EMBEDDER_OLLAMA_URL") or cfg.mem0.embedder_base_url
+        # Vector store settings
+        cfg.mem0.vector_provider = os.getenv("MEM0_VECTOR_PROVIDER", cfg.mem0.vector_provider)
+        cfg.mem0.vector_host = os.getenv("MEM0_VECTOR_HOST", cfg.mem0.vector_host)
+        try:
+            cfg.mem0.vector_port = _env_int("MEM0_VECTOR_PORT", cfg.mem0.vector_port)
+        except Exception:
+            pass
+        # Models and identity
+        cfg.mem0.llm_model = os.getenv("MEM0_LLM_MODEL") or cfg.mem0.llm_model
+        cfg.mem0.embedder_model = os.getenv("MEM0_EMBEDDER_MODEL", cfg.mem0.embedder_model)
         cfg.mem0.search_workers = _env_int("MEM0_SEARCH_WORKERS", 2)
         cfg.mem0.in_first_system = _env_bool("MEM0_IN_FIRST_SYSTEM", False)
         cfg.mem0.user_id = os.getenv("MEM0_USER_ID", cfg.mem0.user_id)
@@ -232,6 +379,10 @@ class ClientRuntimeConfig:
             pass
         try:
             cfg.mem0.rerank_search_limit = _env_int("MEM0_RERANK_SEARCH_LIMIT", cfg.mem0.rerank_search_limit, min_value=1)
+        except Exception:
+            pass
+        try:
+            cfg.mem0.context_budget_chars = _env_int("MEM0_CONTEXT_BUDGET_CHARS", cfg.mem0.context_budget_chars, min_value=100)
         except Exception:
             pass
 

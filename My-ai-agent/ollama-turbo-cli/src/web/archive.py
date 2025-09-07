@@ -6,6 +6,7 @@ from typing import Optional, Dict
 from urllib.parse import quote
 
 from .config import WebConfig
+from .fetch import _httpx_client
 
 
 def get_memento(url: str, *, cfg: Optional[WebConfig] = None) -> Dict[str, str]:
@@ -18,11 +19,10 @@ def get_memento(url: str, *, cfg: Optional[WebConfig] = None) -> Dict[str, str]:
     api = f"https://archive.org/wayback/available?url={quote(url, safe='')}"
     out = {'archive_url': '', 'timestamp': ''}
     try:
-        import httpx  # type: ignore
         timeout = cfg.timeout_read
         headers = {'User-Agent': cfg.user_agent, 'Accept': 'application/json'}
-        with httpx.Client(timeout=timeout, headers=headers) as c:
-            r = c.get(api)
+        with _httpx_client(cfg) as c:
+            r = c.get(api, headers=headers, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
                 closest = (data.get('archived_snapshots') or {}).get('closest') or {}
@@ -42,11 +42,10 @@ def save_page_now(url: str, *, cfg: Optional[WebConfig] = None) -> Dict[str, str
     backoff = max(0.0, cfg.retry_backoff_base)
     out = {'archive_url': '', 'timestamp': ''}
     try:
-        import httpx  # type: ignore
         for i in range(attempts):
             try:
-                with httpx.Client(headers={'User-Agent': cfg.user_agent}, timeout=cfg.timeout_read, follow_redirects=True) as client:
-                    resp = client.post(api_url)
+                with _httpx_client(cfg) as client:
+                    resp = client.post(api_url, headers={'User-Agent': cfg.user_agent}, timeout=cfg.timeout_read)
                 # Parse headers
                 arch = resp.headers.get('content-location', '') or resp.headers.get('Content-Location', '')
                 if arch and arch.startswith('/'):

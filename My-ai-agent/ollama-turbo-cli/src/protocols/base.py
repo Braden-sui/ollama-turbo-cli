@@ -18,9 +18,10 @@ from ..types import (
     ProtocolName,
     ToolSpec,
 )
+from .abc import ChatAdapter
 
 
-class ProtocolAdapter(ABC):
+class ProtocolAdapter(ChatAdapter, ABC):
     """Strategy interface for model protocol handling.
 
     Responsibilities:

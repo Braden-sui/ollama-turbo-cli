@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 from .config import WebConfig
+from .fetch import _httpx_client
 
 
 @dataclass
@@ -59,7 +60,7 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     markdown = ""
     # Try trafilatura
     try:
-        import trafilatura  # type: ignore
+        import trafilatura
         art = trafilatura.extract(html, include_formatting=True, include_links=True, output_format='markdown')
         if art:
             markdown = art
@@ -70,7 +71,7 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     # Fallback readability-lxml
     if not markdown:
         try:
-            from readability import Document  # type: ignore
+            from readability import Document
             doc = Document(html)
             title = doc.short_title() or ''
             content_html = doc.summary()
@@ -105,7 +106,7 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
     # Fallback to pdfminer if PyMuPDF failed or yielded empty
     if not text:
         try:
-            from pdfminer.high_level import extract_text  # type: ignore
+            from pdfminer.high_level import extract_text
             with io.BytesIO(bin_data) as fp:
                 text = extract_text(fp) or ""
             used["pdfminer"] = True
@@ -126,7 +127,7 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
                     subprocess.run(['ocrmypdf', '--skip-text', in_path, out_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     # Re-extract
                     try:
-                        from pdfminer.high_level import extract_text as ex2  # type: ignore
+                        from pdfminer.high_level import extract_text as ex2
                         with open(out_path, 'rb') as f:
                             text = ex2(f) or text
                     except Exception:
@@ -179,10 +180,8 @@ def extract_content(fetch_meta: Dict[str, Any], *, cfg: Optional[WebConfig] = No
         if not markdown:
             try:
                 reader_url = f"https://r.jina.ai/{fetch_meta.get('final_url') or fetch_meta.get('url')}"
-                # Lazy import to avoid dependency bloat
-                import httpx  # type: ignore
-                with httpx.Client(timeout=cfg.timeout_read) as client:
-                    jr = client.get(reader_url)
+                with _httpx_client(cfg) as client:
+                    jr = client.get(reader_url, timeout=cfg.timeout_read)
                     if jr.status_code == 200:
                         markdown = jr.text
                         used["jina"] = True

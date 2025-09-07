@@ -24,6 +24,7 @@ except Exception:
 
 # Import after loading env vars to ensure proper configuration
 from .client import OllamaTurboClient
+from .config import from_env as build_config, merge_cli_overrides
 from .utils import setup_logging, validate_api_key
 
 
@@ -45,13 +46,13 @@ Examples:
                        default=os.getenv('OLLAMA_API_KEY'),
                        help='Ollama API key (or set OLLAMA_API_KEY env var)')
     parser.add_argument('--model', 
-                       default=os.getenv('OLLAMA_MODEL', 'gpt-oss:120b'),
-                       help='Model name (default: gpt-oss:120b)')
+                       default=None,
+                       help='Model name (default from env OLLAMA_MODEL or config)')
     parser.add_argument('--message', 
                        help='Single message mode (non-interactive)')
     parser.add_argument('--stream', 
                        action='store_true',
-                       default=os.getenv('STREAM_BY_DEFAULT', 'false').lower() == 'true',
+                       default=False,
                        help='Enable streaming responses')
     parser.add_argument('--no-tools', 
                        action='store_true',
@@ -63,34 +64,32 @@ Examples:
                        action='store_true',
                        help='Reduce CLI output (suppress helper prints)')
     parser.add_argument('--reasoning', 
-                       default=os.getenv('REASONING', 'high'),
+                       default=None,
                        choices=['low', 'medium', 'high'],
                        help='Set reasoning effort (low, medium, high). Default: high')
     parser.add_argument('--reasoning-mode',
-                       default=(os.getenv('REASONING_MODE') or 'system'),
+                       default=None,
                        choices=['system', 'request:top', 'request:options'],
                        help='How to send reasoning effort to the provider: system (system message directive), request:top (top-level payload), request:options (under options). Default: system')
     # Protocol selection
     parser.add_argument('--protocol',
-                       default=(os.getenv('OLLAMA_PROTOCOL') or 'auto'),
+                       default=None,
                        choices=['auto', 'harmony', 'deepseek'],
                        help='Model protocol to use: auto (detect), harmony, deepseek. Default: auto')
-    # Generation and display controls
-    env_max_out = os.getenv('MAX_OUTPUT_TOKENS')
-    env_ctx = os.getenv('CTX_SIZE')
-    env_tool_print = os.getenv('TOOL_PRINT_LIMIT', '200')
+    # Generation and display controls (defaults resolved by central config)
+    env_tool_print = os.getenv('TOOL_PRINT_LIMIT', '')
     parser.add_argument('--max-output-tokens',
                        type=int,
-                       default=int(env_max_out) if env_max_out and env_max_out.isdigit() else None,
+                       default=None,
                        help='Max output tokens to generate (mapped to Ollama options.num_predict). Default: API default')
     parser.add_argument('--ctx-size',
                        type=int,
-                       default=int(env_ctx) if env_ctx and env_ctx.isdigit() else None,
+                       default=None,
                        help='Context window size (mapped to Ollama options.num_ctx). Default: API default')
     parser.add_argument('--tool-print-limit',
                        type=int,
-                       default=int(env_tool_print) if env_tool_print.isdigit() else 200,
-                       help='Character limit when printing tool results inline in CLI (does not affect tool messages sent to the model).')
+                       default=None,
+                       help='Character limit when printing tool results inline in CLI (defaults from config).')
     # Reliability mode flags (no-op until pipeline is wired)
     parser.add_argument('--ground',
                        action='store_true',
@@ -114,26 +113,22 @@ Examples:
                        help='Path to a JSONL corpus for micro-evaluation (optional).')
     # Sampling parameters
     # Generic env defaults (apply to any protocol)
-    env_temp = os.getenv('TEMPERATURE')
-    env_topp = os.getenv('TOP_P')
-    env_pp = os.getenv('PRESENCE_PENALTY')
-    env_fp = os.getenv('FREQUENCY_PENALTY')
     parser.add_argument('--temperature',
                        type=float,
-                       default=(float(env_temp) if env_temp not in (None, '') else None),
+                       default=None,
                        help='Sampling temperature (0..2). Overrides protocol defaults if provided.')
     parser.add_argument('--top-p',
                        dest='top_p',
                        type=float,
-                       default=(float(env_topp) if env_topp not in (None, '') else None),
+                       default=None,
                        help='Top-p nucleus sampling (0..1). Overrides protocol defaults if provided.')
     parser.add_argument('--presence-penalty',
                        type=float,
-                       default=(float(env_pp) if env_pp not in (None, '') else None),
+                       default=None,
                        help='Presence penalty to reduce repetition. Overrides protocol defaults if provided.')
     parser.add_argument('--frequency-penalty',
                        type=float,
-                       default=(float(env_fp) if env_fp not in (None, '') else None),
+                       default=None,
                        help='Frequency penalty to reduce token repetition. Overrides protocol defaults if provided.')
     parser.add_argument('--log-level', 
                        default=os.getenv('LOG_LEVEL', 'INFO'),
@@ -142,35 +137,35 @@ Examples:
     # Mem0 configuration
     mem0_group = parser.add_argument_group('Mem0 Configuration', 'Control memory and context settings')
     mem0_group.add_argument('--mem0', 
-                          action='store_true',
-                          default=os.getenv('MEM0_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on'),
-                          help='Enable Mem0 memory system (default: enabled)')
+                          action=argparse.BooleanOptionalAction,
+                          default=None,
+                          help='Enable/disable Mem0 memory system (default from env/config)')
     mem0_group.add_argument('--mem0-local', 
-                          action='store_true',
-                          default=os.getenv('MEM0_USE_LOCAL', '0').lower() in ('1', 'true', 'yes', 'on'),
+                          action=argparse.BooleanOptionalAction,
+                          default=None,
                           help='Use local Mem0 (OSS) mode instead of cloud')
     mem0_group.add_argument('--mem0-vector', 
                           choices=['qdrant', 'chroma'],
-                          default=os.getenv('MEM0_VECTOR_PROVIDER', 'chroma'),
-                          help='Vector store provider for local Mem0 (default: chroma)')
+                          default=None,
+                          help='Vector store provider for local Mem0')
     mem0_group.add_argument('--mem0-vector-host', 
-                          default=os.getenv('MEM0_VECTOR_HOST', ':memory:'),
-                          help='Vector store host or path (default: :memory: for Chroma)')
+                          default=None,
+                          help='Vector store host or path')
     mem0_group.add_argument('--mem0-vector-port', 
                           type=int,
-                          default=int(os.getenv('MEM0_VECTOR_PORT', '0') or '0'),
+                          default=None,
                           help='Vector store port (if applicable)')
     mem0_group.add_argument('--mem0-ollama-url', 
-                          default=os.getenv('MEM0_OLLAMA_BASE_URL'),
+                          default=None,
                           help='Ollama base URL for local embeddings/LLM')
     mem0_group.add_argument('--mem0-model', 
-                          default=os.getenv('MEM0_LLM_MODEL'),
+                          default=None,
                           help='Model to use for Mem0 (defaults to main model if not set)')
     mem0_group.add_argument('--mem0-embedder', 
-                          default=os.getenv('MEM0_EMBEDDER_MODEL', 'nomic-embed-text'),
+                          default=None,
                           help='Embedding model for Mem0')
     mem0_group.add_argument('--mem0-user', 
-                          default=os.getenv('MEM0_USER_ID', 'cli-user'),
+                          default=None,
                           help='User ID for memory isolation')
 
     parser.add_argument('--version', 
@@ -230,7 +225,17 @@ Examples:
         sys.exit(1)
     
     try:
-        # Initialize client
+        # Centralized config: from env then overlay CLI flags
+        cfg = build_config(
+            model=args.model,
+            protocol=args.protocol,
+            quiet=args.quiet,
+            show_trace=args.show_trace,
+            engine=args.engine,
+        )
+        cfg = merge_cli_overrides(cfg, args)
+
+        # Initialize client (inject cfg)
         client = OllamaTurboClient(
             api_key=args.api_key,
             model=args.model,
@@ -240,12 +245,12 @@ Examples:
             reasoning_mode=args.reasoning_mode,
             protocol=args.protocol,
             quiet=args.quiet,
-            # Mem0 configuration
+            # Mem0 configuration (kept for backwards compat; cfg takes precedence)
             mem0_enabled=args.mem0,
             mem0_local=args.mem0_local,
             mem0_vector_provider=args.mem0_vector,
             mem0_vector_host=args.mem0_vector_host,
-            mem0_vector_port=args.mem0_vector_port if args.mem0_vector_port > 0 else None,
+            mem0_vector_port=(args.mem0_vector_port if (args.mem0_vector_port is not None and args.mem0_vector_port > 0) else None),
             mem0_ollama_url=args.mem0_ollama_url,
             mem0_llm_model=args.mem0_model,
             mem0_embedder_model=args.mem0_embedder,
@@ -264,15 +269,16 @@ Examples:
             check=args.check,
             consensus=args.consensus,
             engine=args.engine,
-            eval_corpus=args.eval
+            eval_corpus=args.eval,
+            cfg=cfg,
         )
         
-        logger.info(f"Initialized Ollama Turbo client with model: {args.model}")
+        logger.info(f"Initialized Ollama Turbo client with model: {getattr(client, 'model', args.model)}")
         
         if args.message:
             # Single message mode
             if not args.quiet:
-                print(f"🔄 Sending message to {args.model}...")
+                print(f"🔄 Sending message to {getattr(client, 'model', args.model)}...")
             response = client.chat(args.message, stream=args.stream)
             if not args.stream:
                 # In quiet mode, print only the response body

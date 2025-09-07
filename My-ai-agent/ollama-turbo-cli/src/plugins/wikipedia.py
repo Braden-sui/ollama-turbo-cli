@@ -26,15 +26,19 @@ TOOL_SCHEMA = {
     }
 }
 
-def wikipedia_search(query: str, limit: int = 3) -> str:
-    """Search Wikipedia (MediaWiki API) and return formatted results."""
+def wikipedia_search(query: str, limit: int = 3):
+    """Search Wikipedia (MediaWiki API) and return JSON.
+
+    Shape:
+      { ok: bool, query: str, results: [{rank,title,url,snippet}], engine: 'wikipedia', error?: {message}}
+    """
     try:
         if not requests:
-            return "Error: Python 'requests' library is not installed. Install it to use wikipedia_search."
+            return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": "requests not installed"}}
 
         query = (query or "").strip()
         if not query:
-            return "Error: query must be provided"
+            return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": "query must be provided"}}
 
         try:
             limit = int(limit)
@@ -57,19 +61,19 @@ def wikipedia_search(query: str, limit: int = 3) -> str:
         try:
             resp = requests.get("https://en.wikipedia.org/w/api.php", params=params, headers=headers, timeout=8)
         except Exception as e:
-            return f"Error performing Wikipedia search: network error: {e}"
+            return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": f"network error: {e}"}}
 
         if resp.status_code != 200:
-            return f"Error performing Wikipedia search: HTTP {resp.status_code}"
+            return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": f"HTTP {resp.status_code}"}}
 
         try:
             data = resp.json()
         except json.JSONDecodeError:
-            return "Error performing Wikipedia search: invalid JSON response"
+            return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": "invalid JSON response"}}
 
         search_results = (data.get("query") or {}).get("search") or []
         if not search_results:
-            return f"Wikipedia: No results for '{query}'"
+            return {"ok": True, "query": query, "engine": "wikipedia", "results": []}
 
         def _strip_html(s: str) -> str:
             try:
@@ -77,18 +81,16 @@ def wikipedia_search(query: str, limit: int = 3) -> str:
             except Exception:
                 return s
 
-        lines = [f"Wikipedia: Top {min(len(search_results), limit)} results for '{query}':"]
+        results = []
         for i, item in enumerate(search_results[:limit], 1):
             title = item.get("title") or "(no title)"
             pageid = item.get("pageid")
             url = f"https://en.wikipedia.org/?curid={pageid}" if pageid else ""
             snippet = _strip_html(item.get("snippet") or "").replace("\n", " ")
-            lines.append(f"{i}. {title} - {url}")
-            if snippet:
-                lines.append(f"   {snippet}")
-        return "\n".join(lines)
+            results.append({"rank": i, "title": title, "url": url, "snippet": snippet})
+        return {"ok": True, "query": query, "engine": "wikipedia", "results": results}
     except Exception as e:
-        return f"Error performing Wikipedia search: {str(e)}"
+        return {"ok": False, "query": query, "engine": "wikipedia", "results": [], "error": {"message": str(e)}}
 
 
 TOOL_IMPLEMENTATION = wikipedia_search

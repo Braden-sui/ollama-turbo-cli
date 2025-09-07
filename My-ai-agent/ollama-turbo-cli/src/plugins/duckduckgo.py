@@ -28,18 +28,19 @@ TOOL_SCHEMA = {
     }
 }
 
-def duckduckgo_search(query: str, max_results: int = 3) -> str:
+def duckduckgo_search(query: str, max_results: int = 3):
     """Search using DuckDuckGo Instant Answer API (no API key required).
 
-    Returns top results with title, URL, and snippet when available.
+    Returns JSON with fields:
+      { ok: bool, query: str, results: [{rank,title,url,snippet}], engine: 'duckduckgo', error?: {message}}
     """
     try:
         if not requests:
-            return "Error: Python 'requests' library is not installed. Install it to use duckduckgo_search."
+            return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "requests not installed"}}
 
         query = (query or "").strip()
         if not query:
-            return "Error: query must be provided"
+            return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "query must be provided"}}
 
         try:
             max_results = int(max_results)
@@ -69,7 +70,7 @@ def duckduckgo_search(query: str, max_results: int = 3) -> str:
                 resp = requests.get("https://api.duckduckgo.com/", params=params, headers=headers, timeout=8)
             except Exception as e:
                 if attempt == 4:
-                    return f"Error performing DuckDuckGo search: network error: {e}"
+                    return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": f"network error: {e}"}}
                 time.sleep(0.5 * (2 ** attempt))
                 continue
             if resp.status_code == 200:
@@ -149,18 +150,16 @@ def duckduckgo_search(query: str, max_results: int = 3) -> str:
                     break
 
             if collected:
-                out_lines = [f"DuckDuckGo (HTML fallback): Top {len(collected)} results for '{query}':"]
+                results = []
                 for i, r in enumerate(collected[:max_results], 1):
                     title = re.sub(r"<[^>]+>", "", r.get("title") or "(no title)")
                     url = r.get("url") or ""
-                    snippet = r.get("snippet") or ""
-                    out_lines.append(f"{i}. {title} - {url}")
-                    if snippet:
-                        out_lines.append(f"   {snippet}")
-                return "\n".join(out_lines)
+                    snippet = (r.get("snippet") or "").strip()
+                    results.append({"rank": i, "title": title, "url": url, "snippet": snippet})
+                return {"ok": True, "query": query, "engine": "duckduckgo", "results": results}
             # If still nothing useful, report the last status
             code = resp.status_code if (resp is not None and hasattr(resp, 'status_code')) else 'unknown'
-            return f"Error performing DuckDuckGo search: HTTP {code} and no fallback results"
+            return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": f"HTTP {code} and no fallback results"}}
 
         results = []
 
@@ -198,19 +197,17 @@ def duckduckgo_search(query: str, max_results: int = 3) -> str:
                 break
 
         if not unique:
-            return f"DuckDuckGo: No results for '{query}'"
+            return {"ok": True, "query": query, "engine": "duckduckgo", "results": []}
 
-        out_lines = [f"DuckDuckGo: Top {len(unique)} results for '{query}':"]
+        results = []
         for i, r in enumerate(unique, 1):
             title = r.get("title") or "(no title)"
             url = r.get("url") or ""
-            snippet = r.get("snippet") or ""
-            out_lines.append(f"{i}. {title} - {url}")
-            if snippet:
-                out_lines.append(f"   {snippet}")
-        return "\n".join(out_lines)
+            snippet = (r.get("snippet") or "").strip()
+            results.append({"rank": i, "title": title, "url": url, "snippet": snippet})
+        return {"ok": True, "query": query, "engine": "duckduckgo", "results": results}
     except Exception as e:
-        return f"Error performing DuckDuckGo search: {str(e)}"
+        return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": str(e)}}
 
 
 TOOL_IMPLEMENTATION = duckduckgo_search

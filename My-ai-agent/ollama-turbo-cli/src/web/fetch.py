@@ -71,7 +71,8 @@ def _canonicalize_url(url: str) -> str:
 
 
 def _host_allowed(cfg: WebConfig, host: str) -> bool:
-    allow = os.getenv('SANDBOX_NET_ALLOW', cfg.sandbox_allow or '')
+    # Single source of truth: use cfg.sandbox_allow only (no env fallback here)
+    allow = cfg.sandbox_allow or ''
     if not allow:
         return True  # if no allowlist defined, default allow
     for pat in (p.strip() for p in allow.split(',') if p.strip()):
@@ -86,12 +87,13 @@ def _check_ip_blocks(host: str) -> None:
     raw = (host or '').strip('[]')
     infos = socket.getaddrinfo(raw, None)
     for info in infos:
-        ip = info[4][0]
-        ip_obj = ipaddress.ip_address(ip)
+        ip_any = info[4][0]
+        ip_str = str(ip_any)
+        ip_obj = ipaddress.ip_address(ip_str)
         if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved:
-            raise ValueError(f"Blocked private/loopback IP: {ip}")
-        if ip.startswith('169.254.169.254'):
-            raise ValueError(f"Blocked metadata IP: {ip}")
+            raise ValueError(f"Blocked private/loopback IP: {ip_str}")
+        if ip_str.startswith('169.254.169.254'):
+            raise ValueError(f"Blocked metadata IP: {ip_str}")
 
 
 def _cache_paths(cfg: WebConfig, url: str) -> Tuple[str, str]:
@@ -132,32 +134,44 @@ def _bypass_proxy(host: str, no_proxy: str) -> bool:
     return False
 
 
-def _env_proxy_for_scheme(scheme: str) -> Optional[str]:
-    keys = [
-        f"{scheme.upper()}_PROXY",
-        f"{scheme.lower()}_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    for k in keys:
-        v = os.getenv(k)
-        if v:
-            return v
-    return None
+def _cfg_proxy_for_scheme(cfg: WebConfig, scheme: str) -> Optional[str]:
+    try:
+        if scheme.lower() == 'https':
+            return cfg.https_proxy or cfg.all_proxy or None
+        if scheme.lower() == 'http':
+            return cfg.http_proxy or cfg.all_proxy or None
+        return cfg.all_proxy or None
+    except Exception:
+        return None
 
 
 def _httpx_client(cfg: WebConfig):
-    import httpx  # type: ignore
+    import httpx
     timeout = httpx.Timeout(connect=cfg.timeout_connect, read=cfg.timeout_read, write=cfg.timeout_write)
     limits = httpx.Limits(max_connections=cfg.max_connections, max_keepalive_connections=cfg.max_keepalive)
-    # Disable environment proxies unless explicitly allowed via SANDBOX_ALLOW_PROXIES
+    # Build proxies from centralized cfg (do not read env here)
+    proxies = None
+    try:
+        if cfg.sandbox_allow_proxies:
+            http_p = cfg.http_proxy or cfg.all_proxy
+            https_p = cfg.https_proxy or cfg.all_proxy
+            if http_p or https_p:
+                proxies = {}
+                if http_p:
+                    proxies["http"] = http_p
+                if https_p:
+                    proxies["https"] = https_p
+    except Exception:
+        proxies = None
+    # Always disable trust_env so only cfg drives behavior
     return httpx.Client(
         http2=True,
         timeout=timeout,
         limits=limits,
         headers={"User-Agent": cfg.user_agent},
         follow_redirects=cfg.follow_redirects,
-        trust_env=bool(cfg.sandbox_allow_proxies),
+        trust_env=False,
+        proxies=proxies,
     )
 
 
@@ -302,10 +316,9 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
         use_proxy = False
         try:
             if cfg.sandbox_allow_proxies:
-                proxy_url = _env_proxy_for_scheme(parsed.scheme) or _env_proxy_for_scheme('http')
+                proxy_url = _cfg_proxy_for_scheme(cfg, parsed.scheme) or _cfg_proxy_for_scheme(cfg, 'http')
                 if proxy_url:
-                    no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
-                    use_proxy = not _bypass_proxy(a_host, no_proxy)
+                    use_proxy = not _bypass_proxy(a_host, cfg.no_proxy or '')
         except Exception:
             use_proxy = False
         if _is_ip_literal(a_host):
@@ -471,10 +484,9 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             use_proxy_f = False
             try:
                 if cfg.sandbox_allow_proxies:
-                    purl = _env_proxy_for_scheme(f_parsed.scheme) or _env_proxy_for_scheme('http')
+                    purl = _cfg_proxy_for_scheme(cfg, f_parsed.scheme) or _cfg_proxy_for_scheme(cfg, 'http')
                     if purl:
-                        no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
-                        use_proxy_f = not _bypass_proxy(f_host, no_proxy)
+                        use_proxy_f = not _bypass_proxy(f_host, cfg.no_proxy or '')
             except Exception:
                 use_proxy_f = False
             if _is_ip_literal(f_host):

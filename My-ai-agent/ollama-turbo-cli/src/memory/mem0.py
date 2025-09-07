@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from ..utils import truncate_text
 
 
+
 class Mem0Service:
     def __init__(self, config: Any) -> None:
         self.config = config
@@ -68,22 +69,17 @@ class Mem0Service:
                     pass
                 return
 
-            # Runtime knobs
-            ctx.mem0_debug = False
-            ctx.mem0_max_hits = 3
-            ctx.mem0_timeout_connect_ms = 1000
-            ctx.mem0_timeout_read_ms = 2000
-            ctx.mem0_add_queue_max = 256
-            ctx._mem0_breaker_threshold = 3
-            ctx._mem0_breaker_cooldown_ms = 60000
+            # Runtime knobs (prefer centralized config values if present)
+            mc = getattr(ctx, 'mem0_config', {}) or {}
+            ctx.mem0_debug = bool(mc.get('debug', False))
+            ctx.mem0_max_hits = int(mc.get('max_hits', 3))
+            ctx.mem0_timeout_connect_ms = int(mc.get('timeout_connect_ms', 1000))
+            ctx.mem0_timeout_read_ms = int(mc.get('timeout_read_ms', 2000))
+            ctx.mem0_add_queue_max = int(mc.get('add_queue_max', 256))
+            ctx._mem0_breaker_threshold = int(mc.get('breaker_threshold', 3))
+            ctx._mem0_breaker_cooldown_ms = int(mc.get('breaker_cooldown_ms', 60000))
             ctx._mem0_shutdown_flush_ms = 3000
-            # Clamp and env overrides for safety
-            try:
-                mh_env = os.getenv('MEM0_MAX_HITS')
-                if mh_env is not None and str(mh_env).strip() != '':
-                    ctx.mem0_max_hits = int(mh_env)
-            except Exception:
-                pass
+            # Clamp for safety
             try:
                 ctx.mem0_max_hits = max(1, min(int(ctx.mem0_max_hits), 10))
             except Exception:
@@ -105,11 +101,13 @@ class Mem0Service:
             ctx._mem0_api_version_pref = 'v2'
             ctx._mem0_supports_version_kw = True
 
-            # Proxy reranker
+            # Proxy reranker (prefer centralized config)
             try:
-                raw_pm = os.getenv('MEM0_PROXY_MODEL')
-                ctx.mem0_proxy_model = (raw_pm.strip() if raw_pm and raw_pm.strip() else None)
-                ctx.mem0_proxy_timeout_ms = int(str(os.getenv('MEM0_PROXY_TIMEOUT_MS', '1200')).strip())
+                ctx.mem0_proxy_model = mc.get('proxy_model') or None
+                try:
+                    ctx.mem0_proxy_timeout_ms = int(mc.get('proxy_timeout_ms', 1200))
+                except Exception:
+                    ctx.mem0_proxy_timeout_ms = 1200
                 ctx._mem0_proxy_enabled = bool(ctx.mem0_proxy_model)
             except Exception:
                 ctx.mem0_proxy_model = None
@@ -120,9 +118,9 @@ class Mem0Service:
                 # Derive separate bases for Mem0 local mode:
                 # - llm_base defaults to main chat host (Turbo Cloud) unless overridden
                 # - embedder_base defaults to Mem0 embedder base or local when unset
-                llm_base = os.getenv('MEM0_LLM_OLLAMA_URL') or ctx.mem0_config.get('ollama_url') or ctx.host
-                # Intentionally do not use ctx.mem0_config['ollama_url'] here; default to local
-                embedder_base = os.getenv('MEM0_EMBEDDER_OLLAMA_URL') or 'http://localhost:11434'
+                llm_base = ctx.mem0_config.get('llm_base_url') or ctx.mem0_config.get('ollama_url') or ctx.host
+                # Intentionally do not use ctx.mem0_config['ollama_url'] here; default to local unless explicitly set
+                embedder_base = ctx.mem0_config.get('embedder_base_url') or 'http://localhost:11434'
                 # Stash for reranker client selection later
                 self._mem0_llm_base = llm_base
                 cfg = {
@@ -174,7 +172,7 @@ class Mem0Service:
                     return
             else:
                 try:
-                    api_key = os.getenv('MEM0_API_KEY')
+                    api_key = mc.get('api_key')
                     if not api_key:
                         ctx.logger.warning("MEM0_API_KEY not set, disabling Mem0")
                         try:
@@ -184,8 +182,8 @@ class Mem0Service:
                         except Exception:
                             pass
                         return
-                    org_id = os.getenv('MEM0_ORG_ID')
-                    project_id = os.getenv('MEM0_PROJECT_ID')
+                    org_id = mc.get('org_id')
+                    project_id = mc.get('project_id')
                     if org_id or project_id:
                         ctx.mem0_client = _Mem0Impl(api_key=api_key, org_id=org_id, project_id=project_id)  # type: ignore[call-arg]
                     else:
@@ -213,15 +211,18 @@ class Mem0Service:
             atexit.register(lambda: ctx._mem0_search_pool.shutdown(wait=False) if ctx._mem0_search_pool else None)
 
             # Common fields
-            ctx.mem0_user_id = os.getenv('MEM0_USER_ID', str(ctx.mem0_config.get('user_id', 'cli-user')))
-            ctx.mem0_agent_id = os.getenv('MEM0_AGENT_ID')
-            ctx.mem0_app_id = os.getenv('MEM0_APP_ID')
+            try:
+                ctx.mem0_user_id = str(mc.get('user_id', 'cli-user'))
+            except Exception:
+                ctx.mem0_user_id = 'cli-user'
+            ctx.mem0_agent_id = mc.get('agent_id')
+            ctx.mem0_app_id = mc.get('app_id')
             mode_str = getattr(ctx, 'mem0_mode', 'unknown')
             ctx.logger.info(f"Mem0 initialized and enabled in {mode_str} mode")
 
             # Prepare reranker client based on Mem0 LLM base (defaults to main host).
             try:
-                llm_base = os.getenv('MEM0_LLM_OLLAMA_URL') or getattr(self, '_mem0_llm_base', None) or getattr(ctx, 'host', None)
+                llm_base = mc.get('llm_base_url') or getattr(self, '_mem0_llm_base', None) or getattr(ctx, 'host', None)
                 main_host = str(getattr(ctx, 'host', '') or '').strip()
                 if llm_base and str(llm_base).strip() == main_host:
                     # Same as main chat; mark to reuse primary client dynamically
@@ -311,12 +312,13 @@ class Mem0Service:
             except Exception:
                 pass
 
-            filters = {"user_id": getattr(ctx, 'mem0_user_id', str(ctx.mem0_config.get('user_id', 'cli-user')))}
+            filters = {"user_id": getattr(ctx, 'mem0_user_id', str(getattr(ctx, 'mem0_config', {}).get('user_id', 'cli-user')))}
             def _do_search():
                 search_limit = ctx.mem0_max_hits
                 try:
                     if getattr(ctx, '_mem0_proxy_enabled', False) and ctx.mem0_proxy_model:
-                        search_limit = max(ctx.mem0_max_hits, int(str(os.getenv('MEM0_RERANK_SEARCH_LIMIT', '10')).strip() or '10'))
+                        limit_cfg = int(getattr(ctx, 'mem0_config', {}).get('rerank_search_limit', 10))
+                        search_limit = max(ctx.mem0_max_hits, limit_cfg)
                 except Exception:
                     pass
                 return self.search_api(ctx, user_message, filters=filters, limit=search_limit)
@@ -324,22 +326,13 @@ class Mem0Service:
             try:
                 if ctx._mem0_search_pool:
                     fut = ctx._mem0_search_pool.submit(_do_search)
-                    related = fut.result(timeout=max(0.05, ctx.mem0_search_timeout_ms / 1000.0))
+                    related = fut.result(timeout=max(0.05, getattr(ctx, 'mem0_search_timeout_ms', 500) / 1000.0))
                 else:
-                    related = self.search_api(ctx, user_message, filters=filters, limit=ctx.mem0_max_hits)
+                    related = self.search_api(ctx, user_message, filters=filters, limit=getattr(ctx, 'mem0_max_hits', 3))
             except FuturesTimeout:
-                ctx._trace("mem0:search:timeout")
-                ctx._mem0_fail_count += 1
-                if ctx.mem0_debug and not ctx.quiet:
-                    dt_ms = int((time.time() - start) * 1000)
-                    print(f"[mem0] search dt={dt_ms}ms hits=0 (timeout)")
-                if ctx._mem0_fail_count >= ctx._mem0_breaker_threshold:
-                    ctx._mem0_down_until_ms = int(time.time() * 1000) + ctx._mem0_breaker_cooldown_ms
-                    if not getattr(ctx, '_mem0_breaker_tripped_logged', False):
-                        ctx.logger.warning("Mem0 circuit breaker tripped; skipping calls temporarily")
-                        ctx._mem0_breaker_tripped_logged = True
-                        ctx._mem0_breaker_recovered_logged = False
-                return
+                related = []
+            except Exception:
+                related = []
 
             try:
                 ctx._trace(f"mem0:search:hits={len(related or [])}")
@@ -389,7 +382,7 @@ class Mem0Service:
                 pass
 
             try:
-                budget = max(200, int(os.getenv('MEM0_CONTEXT_BUDGET_CHARS', '800') or '800'))
+                budget = max(200, int(getattr(ctx, 'mem0_config', {}).get('context_budget_chars', 800)))
             except Exception:
                 budget = 800
             acc = []
@@ -410,7 +403,10 @@ class Mem0Service:
                     print(f"[mem0] search dt={dt_ms}ms hits=0")
                 return
             context = ctx.prompt.mem0_context_block(acc)
-            in_first = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                in_first = bool(getattr(ctx, 'mem0_config', {}).get('in_first_system', False))
+            except Exception:
+                in_first = False
             if in_first and ctx.conversation_history and (ctx.conversation_history[0] or {}).get('role') == 'system':
                 try:
                     base = str((ctx.conversation_history[0] or {}).get('content') or '').rstrip()

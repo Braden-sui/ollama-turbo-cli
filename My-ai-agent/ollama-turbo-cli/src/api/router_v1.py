@@ -10,15 +10,16 @@ from fastapi.responses import StreamingResponse
 from .models import ChatRequest, ChatResponse
 from .deps import get_api_key, get_idempotency_key
 from src.client import OllamaTurboClient
+from src.web import progress as _web_progress
 
 router = APIRouter(prefix="/v1", tags=["v1"]) 
 
 
 def _resolve_tool_results_format(req_opt: Optional[dict]) -> str:
-    # Request overrides env; default is 'string' for backward compatibility
+    # Request overrides env; default is 'object' for API surfaces
     if req_opt and req_opt.get("tool_results_format") in {"string", "object"}:
         return req_opt["tool_results_format"]
-    env = (os.getenv("TOOL_RESULTS_FORMAT") or "string").strip().lower()
+    env = (os.getenv("TOOL_RESULTS_FORMAT") or "object").strip().lower()
     return "object" if env == "object" else "string"
 
 
@@ -166,7 +167,52 @@ async def chat_stream(
                     # If tool calls are present, stop streaming and finalize silently
                     if message.get('tool_calls'):
                         tool_calls_detected = True
-                        final = client._handle_standard_chat()
+                        # Run standard chat (tool execution + synthesis) in background to stream progress
+                        channel_id = str(uuid.uuid4())
+                        prog_q = _web_progress.register(channel_id)
+                        done = False
+                        final_holder = {"text": ""}
+
+                        def _bg_run():
+                            try:
+                                _web_progress.attach_current(channel_id)
+                                res = client._handle_standard_chat()
+                                final_holder["text"] = res
+                            finally:
+                                try:
+                                    _web_progress.detach_current()
+                                except Exception:
+                                    pass
+                                nonlocal done
+                                done = True
+
+                        import threading as _th
+                        t = _th.Thread(target=_bg_run, name="chat-standard-bg", daemon=True)
+                        t.start()
+                        # Pump progress while tools run
+                        while not done:
+                            try:
+                                evt = prog_q.get(timeout=0.3)
+                            except Exception:
+                                evt = None
+                            if evt:
+                                try:
+                                    yield "event: progress\n"
+                                    yield f"data: {json.dumps(evt)}\n\n"
+                                except Exception:
+                                    pass
+                        # Drain remaining progress events
+                        try:
+                            while True:
+                                evt2 = prog_q.get_nowait()
+                                yield "event: progress\n"
+                                yield f"data: {json.dumps(evt2)}\n\n"
+                        except Exception:
+                            pass
+                        finally:
+                            _web_progress.unregister(channel_id)
+
+                        final = final_holder["text"]
                         tr = getattr(client, "_last_tool_results_structured", None) if fmt == "object" else getattr(client, "_last_tool_results_strings", None)
                         payload_final = {'type': 'final', 'content': final}
                         if tr:

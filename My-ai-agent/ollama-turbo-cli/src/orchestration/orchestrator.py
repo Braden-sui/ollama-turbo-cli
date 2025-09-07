@@ -7,16 +7,18 @@ Phase G: Extract the non-streaming (standard) flow into a reusable class without
 changing behavior. Streaming runner can be phased in next with the same API.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast, Optional
+from .context import OrchestrationContext
 
 from ..utils import truncate_text
 from ..reliability.guards.consensus import run_consensus
 from ..reliability.guards.validator import Validator
+from ..types import ChatMessage, AdapterOptions
 
 
 class ChatTurnOrchestrator:
-    def _adapter_opts_from_ctx(self, ctx) -> Dict[str, Any]:
-        adapter_opts: Dict[str, Any] = {}
+    def _adapter_opts_from_ctx(self, ctx: OrchestrationContext) -> AdapterOptions:
+        adapter_opts: AdapterOptions = {}
         if ctx.max_output_tokens is not None:
             adapter_opts['max_tokens'] = ctx.max_output_tokens
         if ctx.ctx_size is not None:
@@ -31,7 +33,7 @@ class ChatTurnOrchestrator:
             adapter_opts['frequency_penalty'] = ctx.frequency_penalty
         return adapter_opts
 
-    def build_streaming_round_kwargs(self, ctx, round_index: int, include_tools: bool) -> Dict[str, Any]:
+    def build_streaming_round_kwargs(self, ctx: OrchestrationContext, round_index: int, include_tools: bool) -> Dict[str, Any]:
         """Build kwargs for subsequent streaming rounds (round > 0). Does not set 'stream'."""
         kwargs: Dict[str, Any] = {
             'model': ctx.model,
@@ -58,12 +60,19 @@ class ChatTurnOrchestrator:
             kwargs['keep_alive'] = keep_val
         return kwargs
 
-    def format_reprompt_after_tools(self, ctx, payload, prebuilt_msgs, *, streaming: bool) -> None:
+    def format_reprompt_after_tools(
+        self,
+        ctx: OrchestrationContext,
+        payload: Dict[str, Any],
+        prebuilt_msgs: Optional[List[Dict[str, Any]]],
+        *,
+        streaming: bool,
+    ) -> None:
         """Adapter-driven tool message formatting with streaming/non-streaming parity."""
         try:
-            adapter_opts = None if streaming else self._adapter_opts_from_ctx(ctx)
+            adapter_opts: Optional[AdapterOptions] = None if streaming else self._adapter_opts_from_ctx(ctx)
             new_msgs, _ovr = ctx.adapter.format_reprompt_after_tools(
-                ctx.conversation_history,
+                cast(List[ChatMessage], ctx.conversation_history),
                 payload,
                 options=adapter_opts,
             )
@@ -79,6 +88,7 @@ class ChatTurnOrchestrator:
             except Exception:
                 pass
             if prebuilt_msgs:
+                # prebuilt messages are dict-shaped; safe to extend
                 ctx.conversation_history.extend(prebuilt_msgs)
             else:
                 tool_strings = getattr(ctx, '_last_tool_results_strings', [])
@@ -87,11 +97,11 @@ class ChatTurnOrchestrator:
                     'content': '\n'.join(tool_strings)
                 })
 
-    def finalize_reliability_streaming(self, ctx, final_out: str, *, tools_used: bool) -> str:
+    def finalize_reliability_streaming(self, ctx: OrchestrationContext, final_out: str, *, tools_used: bool) -> str:
         """Apply streaming-mode reliability consensus+validator behavior and return final text."""
         try:
             if (not tools_used) and ctx.reliability.get('consensus') and isinstance(ctx.reliability.get('consensus_k'), int) and (ctx.reliability.get('consensus_k') or 0) > 1:
-                def _gen_once_stream():
+                def _gen_once_stream() -> str:
                     kwargs2: Dict[str, Any] = {
                         'model': ctx.model,
                         'messages': ctx.conversation_history,
@@ -135,7 +145,7 @@ class ChatTurnOrchestrator:
         except Exception as ve:
             ctx.logger.debug(f"validator skipped: {ve}")
         return final_out
-    def handle_standard_chat(self, ctx, *, _suppress_errors: bool = False) -> str:
+    def handle_standard_chat(self, ctx: OrchestrationContext, *, _suppress_errors: bool = False) -> str:
         """Handle non-streaming chat interaction (delegated from streaming.standard).
 
         Args:
@@ -291,7 +301,7 @@ class ChatTurnOrchestrator:
                         # Skip consensus if tools were involved to avoid voting on a different path
                         tools_used_this_turn = bool(all_tool_results)
                         if (not tools_used_this_turn) and ctx.reliability.get('consensus') and isinstance(ctx.reliability.get('consensus_k'), int) and (ctx.reliability.get('consensus_k') or 0) > 1:
-                            def _gen_once():
+                            def _gen_once() -> str:
                                 kwargs2: Dict[str, Any] = {
                                     'model': ctx.model,
                                     'messages': ctx.conversation_history,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from typing import Optional
+from ..config import from_env as build_config
 
 from ..web.pipeline import run_research
 
@@ -27,7 +28,17 @@ TOOL_SCHEMA = {
 
 
 def web_research(query: str, top_k: int = 5, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, force_refresh: bool = False) -> str:
-    res = run_research(query, top_k=int(top_k or 5), site_include=site_include, site_exclude=site_exclude, freshness_days=freshness_days, force_refresh=bool(force_refresh))
+    # Centralized config: construct once and pass web section
+    cfg = build_config()
+    res = run_research(
+        query,
+        cfg=cfg.web,
+        top_k=int(top_k or 5),
+        site_include=site_include,
+        site_exclude=site_exclude,
+        freshness_days=freshness_days,
+        force_refresh=bool(force_refresh),
+    )
     # Return compact JSON for injection-safe integration
     return json.dumps(res, ensure_ascii=False)
 

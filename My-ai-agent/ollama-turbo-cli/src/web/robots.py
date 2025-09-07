@@ -8,6 +8,7 @@ from typing import Dict, Optional
 from urllib.parse import urlparse
 from urllib import robotparser
 from .config import WebConfig
+from .fetch import _httpx_client
 
 
 @dataclass
@@ -34,10 +35,15 @@ class RobotsPolicy:
         try:
             if os.path.isfile(path):
                 data = json.loads(open(path, 'r', encoding='utf-8').read())
+                cd = data.get('crawl_delay')
+                try:
+                    cd_f = float(cd) if cd is not None else None
+                except Exception:
+                    cd_f = None
                 return RobotsRecord(
                     ts=float(data.get('ts', 0)),
                     allow=bool(data.get('allow', True)),
-                    crawl_delay=(data.get('crawl_delay')),
+                    crawl_delay=cd_f,
                     sitemaps=list(data.get('sitemaps', []) or []),
                     raw=str(data.get('raw', '')),
                 )
@@ -59,13 +65,9 @@ class RobotsPolicy:
         rp = robotparser.RobotFileParser()
         robots_url = f"{urlparse(base).scheme}://{host}/robots.txt"
         try:
-            # Avoid importing httpx globally
-            import httpx  # type: ignore
-            timeout = httpx.Timeout(connect=self.cfg.timeout_connect, read=self.cfg.timeout_read, write=self.cfg.timeout_write)
-            limits = httpx.Limits(max_connections=self.cfg.max_connections, max_keepalive_connections=self.cfg.max_keepalive)
             headers = {"User-Agent": self.cfg.user_agent, "Accept": "text/plain,*/*;q=0.1"}
-            with httpx.Client(http2=True, timeout=timeout, limits=limits, headers=headers) as client:
-                resp = client.get(robots_url)
+            with _httpx_client(self.cfg) as client:
+                resp = client.get(robots_url, headers=headers, timeout=self.cfg.timeout_read)
                 raw = resp.text if resp.status_code == 200 else ''
         except Exception:
             raw = ''

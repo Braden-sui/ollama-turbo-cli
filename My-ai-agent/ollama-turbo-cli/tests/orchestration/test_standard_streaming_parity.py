@@ -69,7 +69,10 @@ def make_client(enable_tools: bool) -> OllamaTurboClient:
     return client
 
 
-def test_standard_vs_streaming_no_tools_parity():
+@pytest.mark.parametrize("mem0_enabled", [False, True])
+def test_standard_vs_streaming_no_tools_parity(mem0_enabled, monkeypatch):
+    # Toggle Mem0 per parameter to harden against default changes
+    monkeypatch.setenv('MEM0_ENABLED', '1' if mem0_enabled else '0')
     # Standard
     c_std = make_client(enable_tools=False)
     out_std = c_std.chat('hello', stream=False)
@@ -82,8 +85,12 @@ def test_standard_vs_streaming_no_tools_parity():
 
     # Trace parity: standard r0 and streaming r0 traces present
     assert any(ev.startswith('request:standard:round=0') for ev in c_std.trace)
-    # Streaming emits a Mem0 presence breadcrumb for r0
-    assert any(ev.startswith('mem0:present:stream:r0') for ev in c_str.trace)
+    # Streaming asserts start marker and r0 round marker
+    assert any(ev == 'request:stream:start' for ev in c_str.trace)
+    assert any(ev.startswith('request:stream:round=0') for ev in c_str.trace)
+    # Require Mem0 presence breadcrumb only when Mem0 is enabled
+    if getattr(c_str, 'mem0_enabled', False):
+        assert any('mem0:present:stream:r0' in ev for ev in c_str.trace)
     assert any(ev.startswith('request:stream:round=0') for ev in c_str.trace)
 
 

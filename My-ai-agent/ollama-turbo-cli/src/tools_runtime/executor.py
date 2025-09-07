@@ -14,6 +14,7 @@ import json
 import time
 
 from ..utils import truncate_text
+from .args import normalize_args
 
 
 class ToolRuntimeExecutor:
@@ -33,15 +34,29 @@ class ToolRuntimeExecutor:
             for i, tc in enumerate(tool_calls, 1):
                 function = tc.get('function', {})
                 function_name = function.get('name')
-                function_args = function.get('arguments') or {}
-                # Accept JSON strings per OpenAI tool-calls; fallback to {}
-                if isinstance(function_args, str):
-                    try:
-                        function_args = json.loads(function_args) if function_args.strip() else {}
-                    except json.JSONDecodeError:
-                        function_args = {}
-                elif not isinstance(function_args, dict):
-                    function_args = {}
+                raw_args = function.get('arguments')
+                # Discover the parameters schema for this tool if available (from ctx.tools)
+                param_schema = None
+                try:
+                    for sch in getattr(ctx, 'tools', []) or []:
+                        fn = (sch or {}).get('function') or {}
+                        if str(fn.get('name') or '') == str(function_name or ''):
+                            param_schema = fn.get('parameters')
+                            break
+                except Exception:
+                    param_schema = None
+                # Normalize arguments into a dict and validate against schema (best-effort)
+                try:
+                    function_args = normalize_args(param_schema, raw_args)
+                except Exception as ne:
+                    tool_results.append({
+                        'tool': function_name or 'unknown',
+                        'status': 'error',
+                        'content': None,
+                        'metadata': {},
+                        'error': {'code': 'invalid_args', 'message': str(ne)}
+                    })
+                    continue
                 if not function_name:
                     tool_results.append({
                         'tool': 'unknown',
@@ -197,13 +212,56 @@ class ToolRuntimeExecutor:
                 err = tr.get('error') or {}
                 msg = err.get('message') or 'error'
                 return f"{tool}: ERROR - {msg}"
+            # Friendly renderers for known web tools returning JSON
+            def _friendly_list(obj: Any) -> Optional[str]:
+                try:
+                    if not isinstance(obj, dict):
+                        return None
+                    results = obj.get('results') or []
+                    if not isinstance(results, list):
+                        return None
+                    lines = []
+                    title_head = 'DuckDuckGo' if tool == 'duckduckgo_search' else ('Wikipedia' if tool == 'wikipedia_search' else tool)
+                    lines.append(f"{title_head}: Top {len(results)} results")
+                    for i, r in enumerate(results[:5], 1):
+                        if not isinstance(r, dict):
+                            continue
+                        title = str(r.get('title') or '(no title)')
+                        url = str(r.get('url') or '')
+                        snippet = str(r.get('snippet') or '')
+                        lines.append(f"{i}. {title} - {url}")
+                        if snippet:
+                            lines.append(f"   {snippet[:160]}")
+                    return "\n".join(lines)
+                except Exception:
+                    return None
+
+            # If content is a JSON string, try to parse for friendly rendering
+            content_str: str
+            parsed_obj: Any = None
             if isinstance(content, (dict, list)):
+                parsed_obj = content
+                try:
+                    friendly = _friendly_list(parsed_obj) if tool in ('duckduckgo_search', 'wikipedia_search') else None
+                    if friendly:
+                        return friendly
+                except Exception:
+                    pass
                 try:
                     content_str = json.dumps(content, ensure_ascii=False)
                 except Exception:
                     content_str = str(content)
             else:
-                content_str = str(content) if content is not None else ''
+                s = str(content) if content is not None else ''
+                if tool in ('duckduckgo_search', 'wikipedia_search') and s.strip().startswith('{'):
+                    try:
+                        parsed_obj = json.loads(s)
+                        friendly = _friendly_list(parsed_obj)
+                        if friendly:
+                            return friendly
+                    except Exception:
+                        pass
+                content_str = s
             try:
                 content_str = truncate_text(content_str, getattr(ctx, 'tool_print_limit', 200))
             except Exception:

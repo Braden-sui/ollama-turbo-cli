@@ -5,16 +5,17 @@ without behavior changes. Functions accept a `ctx` (client) instance.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, cast
 import json
 
 from ..utils import RetryableError, truncate_text
 from ..reliability.guards.consensus import run_consensus
 from ..reliability.guards.validator import Validator
 from ..orchestration.orchestrator import ChatTurnOrchestrator
+from ..orchestration.context import OrchestrationContext
 
 
-def create_streaming_response(ctx):
+def create_streaming_response(ctx: OrchestrationContext):
     """Create a streaming response from the API (extracted from client)."""
     try:
         kwargs: Dict[str, Any] = {
@@ -64,7 +65,7 @@ def create_streaming_response(ctx):
         raise RetryableError(f"Failed to create streaming response: {e}")
 
 
-def handle_streaming_response(ctx, response_stream, tools_enabled: bool = True) -> str:
+def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_enabled: bool = True) -> str:
     """Complete streaming response handler with tool call support (multi-round optional)."""
     orch = ChatTurnOrchestrator()
     rounds = 0
@@ -120,7 +121,7 @@ def handle_streaming_response(ctx, response_stream, tools_enabled: bool = True) 
                     # Normalize chunk: some providers emit JSON strings/bytes or SSE lines
                     ck = chunk
                     # Reset events for each chunk to avoid leaking from previous chunks/rounds
-                    events: List[Dict[str, Any]] = []
+                    events: List[Any] = []
                     raw_str = None
                     try:
                         if isinstance(chunk, (bytes, bytearray)):
@@ -301,7 +302,10 @@ def handle_streaming_response(ctx, response_stream, tools_enabled: bool = True) 
                     # Trace parsed events for diagnostics (types and count) after normalization
                     try:
                         if ctx.show_trace:
-                            types = ','.join([str(ev.get('type')) for ev in (events or [])][:6])
+                            types = ','.join([
+                                str(ev.get('type') if isinstance(ev, dict) else type(ev).__name__)
+                                for ev in (events or [])
+                            ][:6])
                             ctx._trace(f"stream:events n={len(events)} types={types}")
                             # Also trace chunk type/keys for visibility
                             try:
@@ -334,10 +338,10 @@ def handle_streaming_response(ctx, response_stream, tools_enabled: bool = True) 
                             pass
 
                     for ev in events:
-                        et = ev.get('type')
+                        et = ev.get('type') if isinstance(ev, dict) else 'token'
                         # Treat both token and final events as printable/content-bearing
                         if et in {'token', 'final'}:
-                            piece = str(ev.get('content') or '')
+                            piece = str((ev.get('content') if isinstance(ev, dict) else ev) or '')
                             if not piece:
                                 continue
                             round_content += piece
@@ -426,31 +430,35 @@ def handle_streaming_response(ctx, response_stream, tools_enabled: bool = True) 
                                         pass
                         elif et == 'tool_call' and include_tools:
                             tool_calls_detected = True
-                            # Normalize to OpenAI-style for tool executor/history
-                            oc = {
-                                'type': 'function',
-                                'id': ev.get('id') or '',
-                                'function': {
-                                    'name': ev.get('name') or '',
-                                    'arguments': ev.get('arguments')
+                            if isinstance(ev, dict):
+                                # Normalize to OpenAI-style for tool executor/history
+                                oc = {
+                                    'type': 'function',
+                                    'id': ev.get('id') or '',
+                                    'function': {
+                                        'name': ev.get('name') or '',
+                                        'arguments': ev.get('arguments')
+                                    }
                                 }
-                            }
-                            # Merge updates for same id
-                            existing = False
-                            for tc in tool_calls:
-                                if tc.get('id') == oc.get('id'):
-                                    tc.update(oc)
-                                    existing = True
-                                    break
-                            if not existing:
-                                tool_calls.append(oc)
-                            # Trace tool-call delta detection
-                            try:
-                                if ctx.show_trace:
-                                    fname = oc.get('function', {}).get('name')
-                                    ctx._trace(f"tools:delta:detected id={oc.get('id')} name={fname}")
-                            except Exception:
-                                pass
+                                # Merge updates for same id
+                                existing = False
+                                for tc in tool_calls:
+                                    if tc.get('id') == oc.get('id'):
+                                        tc.update(oc)
+                                        existing = True
+                                        break
+                                if not existing:
+                                    tool_calls.append(oc)
+                                # Trace tool-call delta detection
+                                try:
+                                    if ctx.show_trace:
+                                        func_raw = oc.get('function')
+                                        fname = None
+                                        if isinstance(func_raw, dict):
+                                            fname = func_raw.get('name')
+                                        ctx._trace(f"tools:delta:detected id={oc.get('id')} name={fname}")
+                                except Exception:
+                                    pass
                             # End this streaming round immediately; execute tools next
                             end_round_for_tools = True
                             break

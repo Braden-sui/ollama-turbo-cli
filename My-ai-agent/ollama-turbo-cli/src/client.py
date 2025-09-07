@@ -27,6 +27,7 @@ from .transport import networking as _net
 from .streaming import runner as _runner, standard as _standard
 from .tools_runtime.executor import ToolRuntimeExecutor
 from .memory.mem0 import Mem0Service
+from .core.config import ClientRuntimeConfig
 
 
 class OllamaTurboClient:
@@ -42,7 +43,8 @@ class OllamaTurboClient:
                  mem0_ollama_url: Optional[str] = None,
                  mem0_llm_model: Optional[str] = None,
                  mem0_embedder_model: str = 'embeddinggemma',
-                 mem0_user_id: str = 'cli-user'):
+                 mem0_user_id: str = 'cli-user',
+                 cfg: Optional[ClientRuntimeConfig] = None):
         """Initialize Ollama Turbo client.
         
         Args:
@@ -57,25 +59,44 @@ class OllamaTurboClient:
             tool_print_limit: CLI print truncation for tool outputs (characters)
         """
         self.api_key = api_key
-        self.model = model
-        self.enable_tools = enable_tools
-        self.show_trace = show_trace
-        self.quiet = quiet
-        self.reasoning = reasoning if reasoning in {"low", "medium", "high"} else "high"
-        # How to send reasoning effort to provider: 'system' | 'request:top' | 'request:options'
-        rm = str(reasoning_mode or 'system').strip().lower()
-        self.reasoning_mode = rm if rm in {'system', 'request:top', 'request:options'} else 'system'
+        # Prefer centralized config when provided
+        self._cfg: Optional[ClientRuntimeConfig] = cfg
+        if cfg is not None:
+            self.model = cfg.model
+            self.enable_tools = enable_tools
+            self.show_trace = cfg.show_trace
+            self.quiet = cfg.quiet
+            self.reasoning = cfg.sampling.reasoning
+            self.reasoning_mode = cfg.sampling.reasoning_mode
+            self.max_output_tokens = cfg.sampling.max_output_tokens
+            self.ctx_size = cfg.sampling.ctx_size
+            self.temperature = cfg.sampling.temperature
+            self.top_p = cfg.sampling.top_p
+            self.presence_penalty = cfg.sampling.presence_penalty
+            self.frequency_penalty = cfg.sampling.frequency_penalty
+            self.tool_print_limit = cfg.tooling.print_limit
+            self.tool_context_cap = cfg.tooling.context_cap
+        else:
+            self.model = model
+            self.enable_tools = enable_tools
+            self.show_trace = show_trace
+            self.quiet = quiet
+            self.reasoning = reasoning if reasoning in {"low", "medium", "high"} else "high"
+            # How to send reasoning effort to provider: 'system' | 'request:top' | 'request:options'
+            rm = str(reasoning_mode or 'system').strip().lower()
+            self.reasoning_mode = rm if rm in {'system', 'request:top', 'request:options'} else 'system'
+            self.max_output_tokens = max_output_tokens
+            self.ctx_size = ctx_size
+            # Sampling parameters (may be None; adapter- or model-specific defaults can be applied later)
+            self.temperature: Optional[float] = temperature
+            self.top_p: Optional[float] = top_p
+            self.presence_penalty: Optional[float] = presence_penalty
+            self.frequency_penalty: Optional[float] = frequency_penalty
         self.trace: List[str] = []
         self.logger = logging.getLogger(__name__)
-        self.max_output_tokens = max_output_tokens
-        self.ctx_size = ctx_size
-        # Sampling parameters (may be None; adapter- or model-specific defaults can be applied later)
-        self.temperature: Optional[float] = temperature
-        self.top_p: Optional[float] = top_p
-        self.presence_penalty: Optional[float] = presence_penalty
-        self.frequency_penalty: Optional[float] = frequency_penalty
-        self.tool_print_limit = tool_print_limit
-        self.tool_context_cap = int(os.getenv('TOOL_CONTEXT_MAX_CHARS', '4000') or '4000')
+        if cfg is None:
+            self.tool_print_limit = tool_print_limit
+            self.tool_context_cap = int(os.getenv('TOOL_CONTEXT_MAX_CHARS', '4000') or '4000')
         self._last_user_message: Optional[str] = None
         self._mem0_notice_shown: bool = False
         self._skip_mem0_after_turn: bool = False
@@ -98,51 +119,73 @@ class OllamaTurboClient:
         self._mem0_breaker_tripped_logged: bool = False
         self._mem0_breaker_recovered_logged: bool = False
         self._last_mem_hash: Optional[str] = None
-        self._mem0_search_workers = int(os.getenv('MEM0_SEARCH_WORKERS', '2') or '2')
+        self._mem0_search_workers = cfg.mem0.search_workers if cfg is not None else int(os.getenv('MEM0_SEARCH_WORKERS', '2') or '2')
         # Mem0 search timeout unified here (ms)
-        try:
-            self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
-        except Exception:
-            self.mem0_search_timeout_ms = 500
-        # Tool-call iteration controls
-        env_mrt = os.getenv('MULTI_ROUND_TOOLS')
-        if env_mrt is not None:
-            self.multi_round_tools = env_mrt.strip().lower() in {'1', 'true', 'yes', 'on'}
+        if cfg is not None:
+            try:
+                self.mem0_search_timeout_ms = int(cfg.mem0.search_timeout_ms)
+            except Exception:
+                self.mem0_search_timeout_ms = 500
         else:
-            self.multi_round_tools = bool(multi_round_tools)
-        try:
-            default_rounds = tool_max_rounds if tool_max_rounds is not None else 6
-            parsed_rounds = int(os.getenv('TOOL_MAX_ROUNDS', str(default_rounds)) or str(default_rounds))
-            self.tool_max_rounds: int = max(1, parsed_rounds)
-        except Exception:
-            self.tool_max_rounds = max(1, tool_max_rounds if tool_max_rounds is not None else 6)
+            try:
+                self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
+            except Exception:
+                self.mem0_search_timeout_ms = 500
+        # Tool-call iteration controls
+        if cfg is not None:
+            self.multi_round_tools = bool(cfg.tooling.multi_round)
+            self.tool_max_rounds = max(1, int(cfg.tooling.max_rounds))
+        else:
+            env_mrt = os.getenv('MULTI_ROUND_TOOLS')
+            if env_mrt is not None:
+                self.multi_round_tools = env_mrt.strip().lower() in {'1', 'true', 'yes', 'on'}
+            else:
+                self.multi_round_tools = bool(multi_round_tools)
+            try:
+                default_rounds = tool_max_rounds if tool_max_rounds is not None else 6
+                parsed_rounds = int(os.getenv('TOOL_MAX_ROUNDS', str(default_rounds)) or str(default_rounds))
+                self.tool_max_rounds: int = max(1, parsed_rounds)
+            except Exception:
+                self.tool_max_rounds = max(1, tool_max_rounds if tool_max_rounds is not None else 6)
         self._mem0_search_pool: Optional[ThreadPoolExecutor] = None
         # CLI/network resilience knobs (env-controlled)
-        self.cli_retry_enabled: bool = os.getenv('CLI_RETRY_ENABLED', 'true').strip().lower() != 'false'
-        try:
-            self.cli_max_retries: int = max(0, int(os.getenv('CLI_MAX_RETRIES', '3') or '3'))
-        except Exception:
-            self.cli_max_retries = 3
-        try:
-            self.cli_stream_idle_reconnect_secs: int = max(10, int(os.getenv('CLI_STREAM_IDLE_RECONNECT_SECS', '90') or '90'))
-        except Exception:
-            self.cli_stream_idle_reconnect_secs = 90
-        try:
-            self.cli_connect_timeout_s: float = max(1.0, float(os.getenv('CLI_CONNECT_TIMEOUT_S', '5') or '5'))
-        except Exception:
-            self.cli_connect_timeout_s = 5.0
-        try:
-            self.cli_read_timeout_s: float = max(60.0, float(os.getenv('CLI_READ_TIMEOUT_S', '600') or '600'))
-        except Exception:
-            self.cli_read_timeout_s = 600.0
-        self.warm_models: bool = os.getenv('WARM_MODELS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
-        self.ollama_keep_alive_raw: Optional[str] = os.getenv('OLLAMA_KEEP_ALIVE')
+        if cfg is not None:
+            self.cli_retry_enabled = bool(cfg.retry.enabled)
+            self.cli_max_retries = int(cfg.retry.max_retries)
+            self.cli_stream_idle_reconnect_secs = int(cfg.streaming.idle_reconnect_secs)
+            self.cli_connect_timeout_s = float(cfg.transport.connect_timeout_s)
+            self.cli_read_timeout_s = float(cfg.transport.read_timeout_s)
+            self.warm_models = bool(cfg.transport.warm_models)
+            self.ollama_keep_alive_raw = cfg.transport.keep_alive_raw
+        else:
+            self.cli_retry_enabled: bool = os.getenv('CLI_RETRY_ENABLED', 'true').strip().lower() != 'false'
+            try:
+                self.cli_max_retries: int = max(0, int(os.getenv('CLI_MAX_RETRIES', '3') or '3'))
+            except Exception:
+                self.cli_max_retries = 3
+            try:
+                self.cli_stream_idle_reconnect_secs: int = max(10, int(os.getenv('CLI_STREAM_IDLE_RECONNECT_SECS', '90') or '90'))
+            except Exception:
+                self.cli_stream_idle_reconnect_secs = 90
+            try:
+                self.cli_connect_timeout_s: float = max(1.0, float(os.getenv('CLI_CONNECT_TIMEOUT_S', '5') or '5'))
+            except Exception:
+                self.cli_connect_timeout_s = 5.0
+            try:
+                self.cli_read_timeout_s: float = max(60.0, float(os.getenv('CLI_READ_TIMEOUT_S', '600') or '600'))
+            except Exception:
+                self.cli_read_timeout_s = 600.0
+            self.warm_models: bool = os.getenv('WARM_MODELS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
+            self.ollama_keep_alive_raw: Optional[str] = os.getenv('OLLAMA_KEEP_ALIVE')
         self._current_idempotency_key: Optional[str] = None
         # Tool results return format (for future API use). Default preserves v1 behavior (strings)
-        trf = (os.getenv('TOOL_RESULTS_FORMAT') or 'string').strip().lower()
-        self.tool_results_format: str = 'object' if trf == 'object' else 'string'
+        if cfg is not None:
+            self.tool_results_format = 'object' if (str(cfg.tooling.results_format).strip().lower() == 'object') else 'string'
+        else:
+            trf = (os.getenv('TOOL_RESULTS_FORMAT') or 'string').strip().lower()
+            self.tool_results_format: str = 'object' if trf == 'object' else 'string'
         # Reliability mode configuration (no-op placeholders until wired)
-        self.engine: Optional[str] = engine
+        self.engine: Optional[str] = (cfg.transport.engine if cfg is not None else engine)
         self.reliability = {
             'ground': bool(ground),
             'k': k,
@@ -185,7 +228,10 @@ class OllamaTurboClient:
         self.reliability_integration = ReliabilityIntegration()
         # Protocol adapter selection (default: auto -> harmony unless detected otherwise)
         try:
-            self.protocol = str(protocol or os.getenv('OLLAMA_PROTOCOL') or 'auto').strip().lower()
+            if cfg is not None:
+                self.protocol = str(cfg.protocol or 'auto').strip().lower()
+            else:
+                self.protocol = str(protocol or os.getenv('OLLAMA_PROTOCOL') or 'auto').strip().lower()
         except Exception:
             self.protocol = 'auto'
         self.adapter = get_adapter(model=self.model, protocol=self.protocol)
@@ -242,32 +288,52 @@ class OllamaTurboClient:
         # Mem0 configuration
         # Default: when using local Mem0 and no explicit Mem0 Ollama URL is provided,
         # point the embedder at local Ollama by default.
-        mem0_ollama_default = os.getenv('MEM0_OLLAMA_URL') or mem0_ollama_url
+        mem0_ollama_default = (cfg.mem0.ollama_url if cfg is not None else (os.getenv('MEM0_OLLAMA_URL') or mem0_ollama_url))
         if mem0_local and not mem0_ollama_default:
             mem0_ollama_default = 'http://localhost:11434'
         self.mem0_config = {
-            'enabled': mem0_enabled,
-            'local': mem0_local,
-            'vector_provider': mem0_vector_provider,
-            'vector_host': mem0_vector_host,
-            'vector_port': mem0_vector_port,
-            # Embedder base URL. Note: In local mode, Mem0Service ignores this for the embedder
-            # (it defaults to MEM0_EMBEDDER_OLLAMA_URL or http://localhost:11434) and selects the
-            # LLM base from MEM0_LLM_OLLAMA_URL or ctx.host. This field remains for compatibility.
+            'enabled': (cfg.mem0.enabled if cfg is not None else mem0_enabled),
+            'local': (cfg.mem0.local if cfg is not None else mem0_local),
+            'vector_provider': (cfg.mem0.vector_provider if cfg is not None else mem0_vector_provider),
+            'vector_host': (cfg.mem0.vector_host if cfg is not None else mem0_vector_host),
+            'vector_port': (cfg.mem0.vector_port if cfg is not None else mem0_vector_port),
+            # Base URLs (compat + explicit)
             'ollama_url': (mem0_ollama_default or self.host),
-            'llm_model': mem0_llm_model or model,  # Default to main model
-            'embedder_model': (mem0_embedder_model or ('embeddinggemma' if mem0_local else mem0_embedder_model)),
-            'user_id': mem0_user_id,
+            'llm_base_url': (cfg.mem0.llm_base_url if cfg is not None else None),
+            'embedder_base_url': (cfg.mem0.embedder_base_url if cfg is not None else None),
+            # Models
+            'llm_model': (cfg.mem0.llm_model if (cfg is not None and cfg.mem0.llm_model) else (mem0_llm_model or self.model)),
+            'embedder_model': ((cfg.mem0.embedder_model if cfg is not None else mem0_embedder_model) or ('embeddinggemma' if (cfg.mem0.local if cfg is not None else mem0_local) else (mem0_embedder_model))),
+            # Identity / auth
+            'user_id': (cfg.mem0.user_id if cfg is not None else mem0_user_id),
+            'agent_id': (cfg.mem0.agent_id if cfg is not None else None),
+            'app_id': (cfg.mem0.app_id if cfg is not None else None),
+            'api_key': (cfg.mem0.api_key if cfg is not None else None),
+            'org_id': (cfg.mem0.org_id if cfg is not None else None),
+            'project_id': (cfg.mem0.project_id if cfg is not None else None),
+            # Runtime knobs
+            'debug': (cfg.mem0.debug if cfg is not None else False),
+            'max_hits': (cfg.mem0.max_hits if cfg is not None else 3),
+            'timeout_connect_ms': (cfg.mem0.timeout_connect_ms if cfg is not None else 1000),
+            'timeout_read_ms': (cfg.mem0.timeout_read_ms if cfg is not None else 2000),
+            'add_queue_max': (cfg.mem0.add_queue_max if cfg is not None else 256),
+            'breaker_threshold': (cfg.mem0.breaker_threshold if cfg is not None else 3),
+            'breaker_cooldown_ms': (cfg.mem0.breaker_cooldown_ms if cfg is not None else 60000),
+            'in_first_system': (cfg.mem0.in_first_system if cfg is not None else False),
+            # Proxy / reranker
+            'proxy_model': (cfg.mem0.proxy_model if cfg is not None else None),
+            'proxy_timeout_ms': (cfg.mem0.proxy_timeout_ms if cfg is not None else 1200),
+            'rerank_search_limit': (cfg.mem0.rerank_search_limit if cfg is not None else 10),
         }
-        
+
         # Initialize Mem0 memory system (optional)
         self.mem0_service = Mem0Service(self.mem0_config)
         self._init_mem0()
 
-        self.logger.info(f"Initialized client with model: {model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, mode={self.reasoning_mode}, quiet={self.quiet}")
+        self.logger.info(f"Initialized client with model: {self.model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, mode={self.reasoning_mode}, quiet={self.quiet}")
         # Initial trace state
         if self.show_trace:
-            self.trace.append(f"client:init model={model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} mode={self.reasoning_mode} quiet={'on' if self.quiet else 'off'}")
+            self.trace.append(f"client:init model={self.model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} mode={self.reasoning_mode} quiet={'on' if self.quiet else 'off'}")
 
     # ---------- Reasoning Injection Helpers ----------
     def _nested_set(self, d: Dict[str, Any], path: str, value: Any) -> None:
@@ -443,8 +509,9 @@ class OllamaTurboClient:
         Returns:
             Model response as string
         """
-        # Reset trace for this turn
-        self.trace = [] if self.show_trace else []
+        # Reset trace for this turn (only when tracing is enabled)
+        if self.show_trace:
+            self.trace = []
         self._skip_mem0_after_turn = False
         self._trace(f"chat:start stream={'on' if stream else 'off'}")
 

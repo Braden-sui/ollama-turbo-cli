@@ -9,9 +9,9 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import quote_plus, urlparse, urljoin
 import xml.etree.ElementTree as ET
 import gzip
-import httpx  # type: ignore
 
 from .config import WebConfig
+from .fetch import _httpx_client
 
 
 @dataclass
@@ -89,10 +89,10 @@ def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
     try:
         headers = {"User-Agent": cfg.user_agent, "Accept": "text/plain, */*"}
         timeout = cfg.sitemap_timeout_s
-        with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as c:
+        with _httpx_client(cfg) as c:
             # robots.txt discovery
             try:
-                r = c.get(urljoin(base, "/robots.txt"))
+                r = c.get(urljoin(base, "/robots.txt"), headers=headers, timeout=timeout)
                 if r.status_code == 200 and isinstance(r.text, str):
                     for line in r.text.splitlines():
                         if line.lower().startswith("sitemap:"):
@@ -103,7 +103,7 @@ def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
                 pass
             # common default
             try:
-                r2 = c.get(urljoin(base, "/sitemap.xml"))
+                r2 = c.get(urljoin(base, "/sitemap.xml"), headers=headers, timeout=timeout)
                 if r2.status_code == 200:
                     sitemaps.append(str(r2.request.url))
             except Exception:
@@ -130,8 +130,8 @@ def _parse_sitemap_urls(sitemap_url: str, cfg: WebConfig, *, limit: int, include
     urls: List[str] = []
     try:
         headers = {"User-Agent": cfg.user_agent, "Accept": "application/xml,text/xml,application/rss+xml,application/gzip"}
-        with httpx.Client(timeout=cfg.sitemap_timeout_s, headers=headers, follow_redirects=True) as c:
-            r = c.get(sitemap_url)
+        with _httpx_client(cfg) as c:
+            r = c.get(sitemap_url, headers=headers, timeout=cfg.sitemap_timeout_s)
             if r.status_code != 200:
                 return []
             content: bytes
@@ -219,8 +219,8 @@ def _search_brave(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         if q.site:
             params["q"] = f"site:{q.site} {q.query}"
         headers = {"X-Subscription-Token": key, "Accept": "application/json", "User-Agent": cfg.user_agent}
-        with httpx.Client(timeout=cfg.timeout_read, headers=headers) as c:
-            r = c.get("https://api.search.brave.com/res/v1/web/search", params=params)
+        with _httpx_client(cfg) as c:
+            r = c.get("https://api.search.brave.com/res/v1/web/search", params=params, headers=headers, timeout=cfg.timeout_read)
             data = r.json()
             items = []
             for d in data.get('web', {}).get('results', []):
@@ -238,8 +238,9 @@ def _search_tavily(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         payload = {"query": q.query, "search_depth": "basic", "max_results": 10}
         if q.site:
             payload["query"] = f"site:{q.site} {q.query}"
-        with httpx.Client(timeout=cfg.timeout_read, headers={"Content-Type":"application/json", "Authorization": f"Bearer {key}"}) as c:
-            r = c.post("https://api.tavily.com/search", json=payload)
+        headers = {"Content-Type":"application/json", "Authorization": f"Bearer {key}"}
+        with _httpx_client(cfg) as c:
+            r = c.post("https://api.tavily.com/search", json=payload, headers=headers, timeout=cfg.timeout_read)
             data = r.json()
             items = []
             for d in data.get('results', []):
@@ -257,8 +258,9 @@ def _search_exa(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         payload = {"query": q.query, "numResults": 10}
         if q.site:
             payload["query"] = f"site:{q.site} {q.query}"
-        with httpx.Client(timeout=cfg.timeout_read, headers={"Content-Type":"application/json", "x-api-key": key}) as c:
-            r = c.post("https://api.exa.ai/search", json=payload)
+        headers = {"Content-Type":"application/json", "x-api-key": key}
+        with _httpx_client(cfg) as c:
+            r = c.post("https://api.exa.ai/search", json=payload, headers=headers, timeout=cfg.timeout_read)
             data = r.json()
             items = []
             for d in data.get('results', []):
@@ -274,8 +276,8 @@ def _search_google_pse(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
         return []
     try:
         qtext = f"site:{q.site} {q.query}" if q.site else q.query
-        with httpx.Client(timeout=cfg.timeout_read) as c:
-            r = c.get("https://www.googleapis.com/customsearch/v1", params={"key": key, "cx": cx, "q": qtext})
+        with _httpx_client(cfg) as c:
+            r = c.get("https://www.googleapis.com/customsearch/v1", params={"key": key, "cx": cx, "q": qtext}, timeout=cfg.timeout_read)
             data = r.json()
             items = []
             for d in data.get('items', []) or []:

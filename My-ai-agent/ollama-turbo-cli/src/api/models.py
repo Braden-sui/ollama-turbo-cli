@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 class ChatOptions(BaseModel):
     tool_results_format: Literal["string", "object"] = Field(
-        default="string",
+        default="object",
         description="How to return tool results: legacy 'string' for backward-compat, or 'object' for structured results.",
     )
 

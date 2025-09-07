@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import WebConfig
+from . import progress as _progress
 from .search import search
 from .fetch import fetch_url
 from .extract import extract_content
@@ -57,7 +58,15 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
 
     # Plan -> Search
+    try:
+        _progress.emit_current({"stage": "search", "status": "start", "query": query})
+    except Exception:
+        pass
     results = search(query, cfg=cfg, site=site_include, freshness_days=freshness_days)
+    try:
+        _progress.emit_current({"stage": "search", "status": "done", "count": len(results)})
+    except Exception:
+        pass
 
     citations: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
@@ -70,9 +79,17 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     def _build_citation(sr) -> Optional[Dict[str, Any]]:
         if site_exclude and site_exclude in (sr.url or ''):
             return None
+        try:
+            _progress.emit_current({"stage": "fetch", "status": "start", "url": sr.url})
+        except Exception:
+            pass
         f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
         if not f.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': f.reason or f"HTTP {f.status}"})
+            try:
+                _progress.emit_current({"stage": "fetch", "status": "error", "url": sr.url, "reason": f.reason or f"HTTP {f.status}"})
+            except Exception:
+                pass
             return None
         meta = {
             'url': f.url,
@@ -82,9 +99,17 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'body_path': f.body_path,
             'headers': f.headers,
         }
+        try:
+            _progress.emit_current({"stage": "extract", "status": "start", "url": f.final_url})
+        except Exception:
+            pass
         ex = extract_content(meta, cfg=cfg)
         if not ex.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': 'extract-failed'})
+            try:
+                _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
+            except Exception:
+                pass
             return None
         # Dedupe by URL and content hash (computed on markdown)
         body_hash = hashlib.sha256((ex.markdown or '').encode('utf-8', 'ignore')).hexdigest()
@@ -96,6 +121,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             # Record persistent mapping for future runs
             hash_to_url[body_hash] = f.final_url
 
+        try:
+            _progress.emit_current({"stage": "rerank", "status": "start", "url": f.final_url})
+        except Exception:
+            pass
         chunks = chunk_text(ex.markdown)
         ranked = rerank_chunks(query, chunks, cfg=cfg, top_k=3)
         # Archive on first success (with optional Memento pre-check)
@@ -171,6 +200,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cit = fut.result()
                 if cit:
                     citations.append(cit)
+                    try:
+                        _progress.emit_current({"stage": "citation", "status": "added", "url": cit.get('canonical_url', '')})
+                    except Exception:
+                        pass
             except Exception:
                 continue
 
@@ -198,4 +231,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     except Exception:
         pass
 
+    try:
+        _progress.emit_current({"stage": "done", "status": "ok", "citations": len(citations[:top_k])})
+    except Exception:
+        pass
     return answer
