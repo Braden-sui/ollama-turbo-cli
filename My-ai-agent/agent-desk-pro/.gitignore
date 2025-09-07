@@ -1,0 +1,15 @@
+node_modules
+.docusaurus
+build
+.vscode
+.DS_Store
+*.log
+coverage
+playwright-report
+test-results
+.dist
+dist
+src-tauri/target
+
+# Local environment (do not commit secrets)
+.env.local
