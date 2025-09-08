@@ -156,7 +156,7 @@ class Mem0Config:
     # Runtime knobs
     debug: bool = False
     max_hits: int = 10
-    search_timeout_ms: int = 700
+    search_timeout_ms: int = 800
     timeout_connect_ms: int = 1000
     timeout_read_ms: int = 2000
     add_queue_max: int = 256
@@ -169,7 +169,7 @@ class Mem0Config:
     proxy_timeout_ms: int = 1200      # MEM0_PROXY_TIMEOUT_MS
     rerank_search_limit: int = 10     # MEM0_RERANK_SEARCH_LIMIT
     # Context construction
-    context_budget_chars: int = 1200   # MEM0_CONTEXT_BUDGET_CHARS
+    context_budget_chars: int = 12000   # MEM0_CONTEXT_BUDGET_CHARS
     # Output format for mem0 client responses (avoid deprecation of v1.0)
     output_format: str = field(default_factory=lambda: os.getenv("MEM0_OUTPUT_FORMAT", "v1.1"))
 

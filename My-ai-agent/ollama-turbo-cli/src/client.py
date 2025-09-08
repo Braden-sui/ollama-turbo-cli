@@ -128,9 +128,9 @@ class OllamaTurboClient:
                 self.mem0_search_timeout_ms = 500
         else:
             try:
-                self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '500') or '500')
+                self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '800') or '800')
             except Exception:
-                self.mem0_search_timeout_ms = 500
+                self.mem0_search_timeout_ms = 800
         # Tool-call iteration controls
         if cfg is not None:
             self.multi_round_tools = bool(cfg.tooling.multi_round)
@@ -375,6 +375,14 @@ class OllamaTurboClient:
         # Initial trace state
         if self.show_trace:
             self.trace.append(f"client:init model={self.model} host={self.host} tools={'on' if enable_tools else 'off'} reasoning={self.reasoning} mode={self.reasoning_mode} quiet={'on' if self.quiet else 'off'}")
+
+        # Centralize WebConfig for the web pipeline (set once per client)
+        try:
+            if cfg is not None and getattr(cfg, 'web', None):
+                from .web import pipeline as _web_pipeline
+                _web_pipeline.set_default_config(cfg.web)
+        except Exception:
+            pass
 
     # ---------- Reasoning Injection Helpers ----------
     def _nested_set(self, d: Dict[str, Any], path: str, value: Any) -> None:

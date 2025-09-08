@@ -111,6 +111,13 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
             printed_prefix = False
             end_round_for_tools = False
 
+            # Trace verbosity controls (per-round budgets and de-duplication)
+            trace_events_budget = 6
+            trace_keys_budget = 4
+            trace_raw_logged = False
+            _last_types_sig: Optional[str] = None
+            _last_keys_sig: Optional[str] = None
+
             def _iter_stream_chunks(s):
                 # Simple wrapper to let us hook per-chunk accounting
                 for ch in s:
@@ -302,15 +309,19 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                     # Trace parsed events for diagnostics (types and count) after normalization
                     try:
                         if ctx.show_trace:
+                            # events types trace — only on signature changes and within budget
                             types = ','.join([
                                 str(ev.get('type') if isinstance(ev, dict) else type(ev).__name__)
                                 for ev in (events or [])
                             ][:6])
-                            ctx._trace(f"stream:events n={len(events)} types={types}")
-                            # Also trace chunk type/keys for visibility
+                            types_sig = f"{len(events)}|{types}"
+                            if trace_events_budget > 0 and types_sig != _last_types_sig:
+                                ctx._trace(f"stream:events n={len(events)} types={types}")
+                                _last_types_sig = types_sig
+                                trace_events_budget -= 1
+                            # chunk keys/type trace — only when non-metrics and signature changes within budget
                             try:
                                 if isinstance(ck, dict):
-                                    # Suppress pure-metrics chunks to reduce noise
                                     kset = set(ck.keys())
                                     METRIC_KEYS = {
                                         "model","created_at","done","done_reason",
@@ -320,20 +331,29 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                                         "eval_count","eval_duration"
                                     }
                                     metrics_only = kset.issubset(METRIC_KEYS)
-                                    if not metrics_only:
+                                    if not metrics_only and trace_keys_budget > 0:
                                         keys = ','.join(list(ck.keys())[:6])
-                                        ctx._trace(f"stream:chunk:keys={keys}")
+                                        if keys != _last_keys_sig:
+                                            ctx._trace(f"stream:chunk:keys={keys}")
+                                            _last_keys_sig = keys
+                                            trace_keys_budget -= 1
                                 else:
-                                    ctx._trace(f"stream:chunk:type={type(ck).__name__}")
+                                    # Only emit type changes within budget
+                                    ctype = type(ck).__name__
+                                    if trace_keys_budget > 0 and ctype != _last_keys_sig:
+                                        ctx._trace(f"stream:chunk:type={ctype}")
+                                        _last_keys_sig = ctype
+                                        trace_keys_budget -= 1
                             except Exception:
                                 pass
                     except Exception:
                         pass
-                    # If still nothing and we have a raw string, trace prefix for diagnostics
-                    if not events and raw_str is not None and ctx.show_trace:
+                    # If still nothing and we have a raw string, trace prefix for diagnostics (once per round)
+                    if (not events) and (raw_str is not None) and ctx.show_trace and (not trace_raw_logged):
                         try:
                             preview = raw_str[:80].replace('\n', ' ')
                             ctx._trace(f"stream:chunk:raw={preview}")
+                            trace_raw_logged = True
                         except Exception:
                             pass
 
@@ -564,6 +584,35 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                 rounds += 1
                 # Next loop iteration may include tools again if multi-round enabled
                 continue
+
+            # Empty-stream fallback: if no tool calls were detected and the provider yielded
+            # no content tokens for this round, attempt a non-streaming fallback to produce
+            # a final message so the agent doesn't appear silent.
+            if (not tool_calls) and (not (round_content or '').strip()):
+                try:
+                    ctx._trace("stream:empty -> fallback:standard")
+                except Exception:
+                    pass
+                try:
+                    final = ctx._handle_standard_chat(_suppress_errors=True)
+                    # Suppress obvious error strings to avoid leaking internal errors to users
+                    if final and not str(final).startswith("Error during chat:"):
+                        # Print once if nothing has been printed yet
+                        if (not printed_prefix) and (not ctx.quiet):
+                            print("🤖 Assistant: ", end="", flush=True)
+                            print(ctx._strip_harmony_markup(final), flush=True)
+                            printed_prefix = True
+                        # Append to history and persist memory
+                        ctx.conversation_history.append({'role': 'assistant', 'content': final})
+                        ctx._mem0_add_after_response(ctx._last_user_message, final)
+                        # Return aggregated tool results (if any) with the final
+                        if aggregated_results:
+                            prefix = (preface_content + "\n\n") if preface_content else ""
+                            return f"{prefix}[Tool Results]\n" + '\n'.join(aggregated_results) + f"\n\n{final}"
+                        return final
+                except Exception:
+                    # Fall through to normal finalization path below (may return empty string)
+                    pass
 
             # No tool calls -> final textual answer for this turn
             if printed_prefix and not ctx.quiet:

@@ -15,6 +15,18 @@ from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
 
+_DEFAULT_CFG: Optional[WebConfig] = None
+
+def set_default_config(cfg: WebConfig) -> None:
+    """Inject a centralized default WebConfig used when callers omit cfg.
+
+    This allows higher-level clients (e.g., OllamaTurboClient) to set a single
+    source of truth for all web pipeline modules without threading cfg through
+    every call site. Tests that monkeypatch functions may continue to omit cfg.
+    """
+    global _DEFAULT_CFG
+    _DEFAULT_CFG = cfg
+
 
 def _query_cache_key(query: str, opts: Dict[str, Any]) -> str:
     h = hashlib.sha256()
@@ -24,7 +36,7 @@ def _query_cache_key(query: str, opts: Dict[str, Any]) -> str:
 
 
 def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, top_k: int = 5, force_refresh: bool = False) -> Dict[str, Any]:
-    cfg = cfg or WebConfig()
+    cfg = cfg or _DEFAULT_CFG or WebConfig()
     os.makedirs(cfg.cache_root, exist_ok=True)
     opts = {
         'site_include': site_include,
@@ -198,10 +210,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
 
     citations: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
-    # Dedupe across URLs and content bodies
+    # Dedupe across URLs and content bodies (current-run only)
     seen_urls: set[str] = set()
-    # Start with any known hashes from previous runs
-    seen_hashes: set[str] = set(hash_to_url.keys())
+    seen_hashes: set[str] = set()
     dedupe_lock = threading.Lock()
 
     dedup_skips = 0
@@ -240,10 +251,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             except Exception:
                 pass
             return None
-        # Dedupe by URL and content hash (computed on markdown)
+        # Dedupe by URL and content hash (computed on markdown) — within this run only.
+        # We intentionally avoid cross-run dedupe via the persistent index because it can
+        # eliminate all citations on subsequent runs and produce an empty citations list.
         body_hash = hashlib.sha256((ex.markdown or '').encode('utf-8', 'ignore')).hexdigest()
         with dedupe_lock:
-            if f.final_url in seen_urls or body_hash in seen_hashes or body_hash in hash_to_url:
+            if f.final_url in seen_urls or body_hash in seen_hashes:
                 nonlocal dedup_skips
                 dedup_skips += 1
                 return None

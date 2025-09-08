@@ -67,16 +67,26 @@ def _blocklist() -> list[str]:
     return items
 
 
-def _host_allowed(host: str) -> bool:
-    patterns = _allowlist()
+def _host_allowed(host: str, cfg: Optional['WebConfig'] = None) -> bool:
+    if cfg is not None:
+        allow_patterns = cfg.sandbox_allow or ''
+        if not allow_patterns:
+            return True  # if no allowlist defined, default allow
+        patterns = [p.strip() for p in allow_patterns.split(',') if p.strip()]
+    else:
+        patterns = _allowlist()
     for pat in patterns:
         if fnmatch.fnmatch(host, pat):
             return True
     return False
 
 
-def _host_blocked(host: str) -> bool:
-    patterns = _blocklist()
+def _host_blocked(host: str, cfg: Optional['WebConfig'] = None) -> bool:
+    if cfg is not None:
+        # WebConfig doesn't have explicit blocklist, use empty list
+        patterns = []
+    else:
+        patterns = _blocklist()
     for pat in patterns:
         if fnmatch.fnmatch(host, pat):
             return True
@@ -254,6 +264,7 @@ def fetch_via_policy(
     timeout_s: int = 15,
     max_bytes: Optional[int] = None,
     cache_bypass: bool = False,
+    cfg: Optional['WebConfig'] = None,
 ) -> Dict[str, any]:
     """Fetch a URL with allowlist, SSRF, TLS, size, rate-limit, and caching.
 
@@ -263,13 +274,22 @@ def fetch_via_policy(
     if not requests:
         return {'ok': False, 'error': "requests not installed"}
 
-    env = _get_envs()
-    allow_http = _env_bool('SANDBOX_ALLOW_HTTP', False)
-    allow_proxies = _env_bool('SANDBOX_ALLOW_PROXIES', False)
-    max_download_mb = int(env['SANDBOX_MAX_DOWNLOAD_MB'] or '5')
-    ttl_s = int(env['SANDBOX_HTTP_CACHE_TTL_S'] or '600')
-    cache_mb = int(env['SANDBOX_HTTP_CACHE_MB'] or '200')
-    net_mode = env['SANDBOX_NET']
+    # Use centralized WebConfig when provided, otherwise fall back to env
+    if cfg is not None:
+        allow_http = cfg.sandbox_allow_http
+        allow_proxies = cfg.sandbox_allow_proxies
+        max_download_mb = cfg.max_download_bytes // (1024 * 1024)
+        ttl_s = cfg.cache_ttl_seconds
+        cache_mb = 200  # Keep existing default for cache pruning
+        net_mode = 'allowlist' if cfg.sandbox_allow else 'deny'
+    else:
+        env = _get_envs()
+        allow_http = _env_bool('SANDBOX_ALLOW_HTTP', False)
+        allow_proxies = _env_bool('SANDBOX_ALLOW_PROXIES', False)
+        max_download_mb = int(env['SANDBOX_MAX_DOWNLOAD_MB'] or '5')
+        ttl_s = int(env['SANDBOX_HTTP_CACHE_TTL_S'] or '600')
+        cache_mb = int(env['SANDBOX_HTTP_CACHE_MB'] or '200')
+        net_mode = env['SANDBOX_NET']
 
     url = (url or '').strip()
     if not url:
@@ -292,10 +312,10 @@ def fetch_via_policy(
     if net_mode == 'deny':
         return {'ok': False, 'error': 'Network is denied by policy'}
     if net_mode == 'allowlist':
-        if not _host_allowed(a_host):
+        if not _host_allowed(a_host, cfg):
             return {'ok': False, 'error': f'Host not in allowlist: {a_host}'}
     elif net_mode == 'blocklist':
-        if _host_blocked(a_host):
+        if _host_blocked(a_host, cfg):
             return {'ok': False, 'error': f'Host is blocklisted: {a_host}'}
 
     # SSRF block and local resolution policy w/ remote DNS consideration
@@ -310,7 +330,9 @@ def fetch_via_policy(
     if not _rate_allow(a_host):
         return {'ok': False, 'error': f'Rate limit exceeded for host {a_host}'}
 
-    hdrs = {'User-Agent': 'ollama-turbo-cli/1.0'}
+    # Use centralized user agent when available
+    user_agent = cfg.user_agent if cfg is not None else 'ollama-turbo-cli/1.0'
+    hdrs = {'User-Agent': user_agent}
     if headers:
         for k, v in headers.items():
             try:
@@ -377,10 +399,10 @@ def fetch_via_policy(
                     for host in filter(None, [orig_parsed.hostname, final_parsed.hostname]):
                         host_ascii = _idna_ascii(host)
                         if net_mode == 'allowlist':
-                            if not _host_allowed(host_ascii):
+                            if not _host_allowed(host_ascii, cfg):
                                 return {'ok': False, 'error': f'Host not in allowlist: {host_ascii}'}
                         elif net_mode == 'blocklist':
-                            if _host_blocked(host_ascii):
+                            if _host_blocked(host_ascii, cfg):
                                 return {'ok': False, 'error': f'Host is blocklisted: {host_ascii}'}
                         if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
                             if _is_ip_literal(host_ascii):
@@ -460,10 +482,10 @@ def fetch_via_policy(
                 if p.scheme == 'http' and not allow_http:
                     return {'ok': False, 'error': 'HTTP blocked. Enable SANDBOX_ALLOW_HTTP=1 to allow.'}
                 if net_mode == 'allowlist':
-                    if not _host_allowed(h_host):
+                    if not _host_allowed(h_host, cfg):
                         return {'ok': False, 'error': f'Redirected to disallowed host: {h_host}'}
                 elif net_mode == 'blocklist':
-                    if _host_blocked(h_host):
+                    if _host_blocked(h_host, cfg):
                         return {'ok': False, 'error': f'Redirected to blocklisted host: {h_host}'}
                 if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
                     if _is_ip_literal(h_host):
@@ -477,10 +499,10 @@ def fetch_via_policy(
             if f_parsed.scheme == 'http' and not allow_http:
                 return {'ok': False, 'error': 'HTTP blocked. Enable SANDBOX_ALLOW_HTTP=1 to allow.'}
             if net_mode == 'allowlist':
-                if not _host_allowed(f_host):
+                if not _host_allowed(f_host, cfg):
                     return {'ok': False, 'error': f'Final host not in allowlist: {f_host}'}
             elif net_mode == 'blocklist':
-                if _host_blocked(f_host):
+                if _host_blocked(f_host, cfg):
                     return {'ok': False, 'error': f'Final host is blocklisted: {f_host}'}
             if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
                 if _is_ip_literal(f_host):

@@ -4,6 +4,7 @@ import json
 from typing import Any, Dict, Optional
 
 from ..sandbox.net_proxy import fetch_via_policy
+from ..web.pipeline import _DEFAULT_CFG
 
 TOOL_SCHEMA = {
     "type": "function",
@@ -32,7 +33,7 @@ TOOL_SCHEMA = {
 def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] = None, body: Optional[str] = None, timeout_s: int = 15, max_bytes: Optional[int] = None, extract: str = 'auto', cache_bypass: bool = False) -> str:
     # Enforce HTTPS default inside fetch_via_policy
     data = body.encode() if body is not None else None
-    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes, cache_bypass=bool(cache_bypass))
+    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes, cache_bypass=bool(cache_bypass), cfg=_DEFAULT_CFG)
 
     # Build safe injection summary; never include large bodies
     inject = res.get('inject') or ''

@@ -57,7 +57,14 @@ def wikipedia_search(query: str, limit: int = 3):
             "utf8": "1",
             "srlimit": str(limit),
         }
-        headers = {"User-Agent": "ollama-turbo-cli/1.0 (+https://ollama.com)"}
+        # Use centralized WebConfig for user agent if available
+        try:
+            from ..web.pipeline import _DEFAULT_CFG
+            user_agent = _DEFAULT_CFG.user_agent if _DEFAULT_CFG else "ollama-turbo-cli/1.0 (+https://ollama.com)"
+        except Exception:
+            user_agent = "ollama-turbo-cli/1.0 (+https://ollama.com)"
+        
+        headers = {"User-Agent": user_agent}
         try:
             resp = requests.get("https://en.wikipedia.org/w/api.php", params=params, headers=headers, timeout=8)
         except Exception as e:

@@ -332,7 +332,7 @@ class Mem0Service:
             try:
                 if ctx._mem0_search_pool:
                     fut = ctx._mem0_search_pool.submit(_do_search)
-                    related = fut.result(timeout=max(0.05, getattr(ctx, 'mem0_search_timeout_ms', 500) / 1000.0))
+                    related = fut.result(timeout=max(0.08, getattr(ctx, 'mem0_search_timeout_ms', 800) / 1000.0))
                 else:
                     related = self.search_api(ctx, user_message, filters=filters, limit=getattr(ctx, 'mem0_max_hits', 3))
             except FuturesTimeout:

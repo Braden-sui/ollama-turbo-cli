@@ -58,8 +58,15 @@ def duckduckgo_search(query: str, max_results: int = 3):
             "no_redirect": "1",
             "t": "ollama-turbo-cli",
         }
+        # Use centralized WebConfig for user agent if available
+        try:
+            from ..web.pipeline import _DEFAULT_CFG
+            user_agent = _DEFAULT_CFG.user_agent if _DEFAULT_CFG else "ollama-turbo-cli/1.0 (+https://ollama.com)"
+        except Exception:
+            user_agent = "ollama-turbo-cli/1.0 (+https://ollama.com)"
+        
         headers = {
-            "User-Agent": "ollama-turbo-cli/1.0 (+https://ollama.com)",
+            "User-Agent": user_agent,
             "Accept": "application/json",
         }
 
@@ -91,7 +98,7 @@ def duckduckgo_search(query: str, max_results: int = 3):
         if data is None:
             # Fallback to HTML (Lite) endpoint and extract links
             html_headers = {
-                "User-Agent": "ollama-turbo-cli/1.0 (+https://ollama.com)",
+                "User-Agent": user_agent,
                 "Accept": "text/html",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://duckduckgo.com/",
