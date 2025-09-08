@@ -356,10 +356,16 @@ class OllamaTurboClient:
                 self.reasoning_field_style = (inj.field_style or 'string').strip().lower()
                 self.reasoning_object_key = (inj.object_key or 'effort').strip()
             else:
-                # Defaults when no cfg provided
-                self.reasoning_field_path = default_field_path
-                self.reasoning_field_style = 'string'
-                self.reasoning_object_key = 'effort'
+                # Defaults when no cfg provided — honor env overrides
+                try:
+                    rf_env = os.getenv('REASONING_FIELD_PATH')
+                    rs_env = os.getenv('REASONING_FIELD_STYLE')
+                    ro_env = os.getenv('REASONING_OBJECT_KEY')
+                except Exception:
+                    rf_env = rs_env = ro_env = None
+                self.reasoning_field_path = (rf_env.strip() if rf_env else default_field_path)
+                self.reasoning_field_style = ((rs_env or 'string').strip().lower())
+                self.reasoning_object_key = ((ro_env or 'effort').strip())
         except Exception:
             self.reasoning_field_path = 'reasoning'
             self.reasoning_field_style = 'string'
