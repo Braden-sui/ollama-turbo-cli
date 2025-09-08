@@ -139,3 +139,58 @@ def test_streaming_reprompt_adapter_fallback_trace(monkeypatch):
     assert 'reprompt:after-tools:fallback' in c.trace
     # Still produces a final output
     assert out
+
+
+def test_no_body_idempotency_key_in_stream_init(monkeypatch):
+    from src.client import OllamaTurboClient
+
+    # Arrange: disable Mem0 to keep messages minimal and avoid extra system blocks
+    monkeypatch.setenv('MEM0_ENABLED', '0')
+    c = OllamaTurboClient(api_key='test', enable_tools=False, quiet=True)
+    # Reuse the local DummyClient from this module
+    c.client = DummyClient()
+    c.show_trace = True
+
+    # Act
+    _ = c.chat('hello', stream=True)
+
+    # Assert: first call is streaming init; header-only idempotency (no body field)
+    assert c.client.calls, 'no client calls recorded'
+    first_call = c.client.calls[0]
+    assert first_call.get('stream') is True
+    assert 'idempotency_key' not in first_call
+    # Trace shows header injection occurred
+    assert any(ev.startswith('idempotency:set ') for ev in getattr(c, 'trace', []))
+
+
+def test_no_body_idempotency_key_in_standard_and_stream_followup(monkeypatch):
+    from src.client import OllamaTurboClient
+
+    # Arrange
+    monkeypatch.setenv('MEM0_ENABLED', '0')
+    c = OllamaTurboClient(api_key='test', enable_tools=True, quiet=True)
+    c.client = DummyClient()
+    c.show_trace = True
+    
+    # Add a trivial echo tool to trigger a multi-round streaming path
+    def fake_echo(**kwargs):
+        return json.dumps({"tool": "echo", "ok": True})
+    c.tool_functions['echo'] = fake_echo
+
+    # Standard path
+    _ = c.chat('hello', stream=False)
+    assert c.client.calls, 'no calls recorded for standard path'
+    std_first = c.client.calls[0]
+    assert 'idempotency_key' not in std_first
+
+    # Streaming multi-round path: 'use-tools' triggers follow-up round
+    c2 = OllamaTurboClient(api_key='test', enable_tools=True, quiet=True)
+    c2.client = DummyClient()
+    c2.show_trace = True
+    c2.tool_functions['echo'] = fake_echo
+    _ = c2.chat('please use-tools', stream=True)
+    assert len(c2.client.calls) >= 2
+    # First streaming init
+    assert 'idempotency_key' not in c2.client.calls[0]
+    # Follow-up round (still no body key; header-only)
+    assert 'idempotency_key' not in c2.client.calls[1]

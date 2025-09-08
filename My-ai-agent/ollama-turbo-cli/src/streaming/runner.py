@@ -55,13 +55,7 @@ def create_streaming_response(ctx: OrchestrationContext):
         keep_val = ctx._resolve_keep_alive()
         if keep_val is not None:
             kwargs['keep_alive'] = keep_val
-        # Per-turn idempotency (transport honors it across retries/reconnects)
-        try:
-            idem = getattr(ctx, '_current_idempotency_key', None)
-            if idem:
-                kwargs['idempotency_key'] = idem
-        except Exception:
-            pass
+        # Idempotency is handled via transport headers; do not include in body.
         ctx._trace("request:stream:start")
         # Trace Mem0 presence prior to initial streaming dispatch
         ctx._trace_mem0_presence(kwargs.get('messages'), "stream:init")
