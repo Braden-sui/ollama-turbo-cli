@@ -319,9 +319,13 @@ class OllamaTurboClient:
             'add_queue_max': (cfg.mem0.add_queue_max if cfg is not None else 256),
             'breaker_threshold': (cfg.mem0.breaker_threshold if cfg is not None else 3),
             'breaker_cooldown_ms': (cfg.mem0.breaker_cooldown_ms if cfg is not None else 60000),
-            'in_first_system': (cfg.mem0.in_first_system if cfg is not None else False),
+            'in_first_system': (
+                cfg.mem0.in_first_system if cfg is not None else (
+                    (os.getenv('MEM0_IN_FIRST_SYSTEM') or '').strip().lower() in {'1','true','yes','on'}
+                )
+            ),
             # Proxy / reranker
-            'proxy_model': (cfg.mem0.proxy_model if cfg is not None else None),
+            'proxy_model': (cfg.mem0.proxy_model if cfg is not None else (os.getenv('MEM0_PROXY_MODEL') or None)),
             'proxy_timeout_ms': (cfg.mem0.proxy_timeout_ms if cfg is not None else 1200),
             'rerank_search_limit': (cfg.mem0.rerank_search_limit if cfg is not None else 10),
         }
@@ -420,6 +424,19 @@ class OllamaTurboClient:
                     mem0_block = str((msgs[latest_idx] or {}).get('content') or '')
                     # Remove that block so the adapter can merge into first system
                     msgs = msgs[:latest_idx] + msgs[latest_idx + 1:]
+                    # Mirror the merge in our persistent history to keep tests and callers consistent
+                    try:
+                        if self.conversation_history and (self.conversation_history[0] or {}).get('role') == 'system':
+                            base0 = str((self.conversation_history[0] or {}).get('content') or '').rstrip()
+                            merged0 = (base0 + "\n\n" + mem0_block).strip()
+                            self.conversation_history[0]['content'] = merged0
+                            # Remove the separate Mem0 block from history at the same index
+                            if 0 <= int(latest_idx) < len(self.conversation_history):
+                                del self.conversation_history[int(latest_idx)]
+                            # Trace adapter-side merge for visibility
+                            self._trace("mem0:inject:first:adapter")
+                    except Exception:
+                        pass
 
             # Delegate to adapter for initial formatting
             norm_msgs, overrides = self.adapter.format_initial_messages(
