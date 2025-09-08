@@ -14,7 +14,12 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "wikipedia_search",
-        "description": "Keyless Wikipedia search via the MediaWiki API. Use for factual background and canonical topic pages. Provide a focused query (entity or concept). Returns concise top results (title, URL, snippet). For reading full pages, call web_fetch with a returned URL.",
+        "description": (
+            "Keyless Wikipedia search via the MediaWiki API. Use for factual background and canonical topic pages. "
+            "Provide a focused query (entity or concept). Returns concise top results (title, URL, snippet). "
+            "To read the page content, call web_fetch on a returned URL. Subject to the agent's network policy; "
+            "if access is blocked, acknowledge policy and propose alternative sources or queries."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

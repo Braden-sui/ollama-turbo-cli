@@ -16,7 +16,12 @@ TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "duckduckgo_search",
-        "description": "Keyless web search via DuckDuckGo Instant Answer API. Use to discover sources or quick facts when external information is required. Provide a focused query (keywords or quoted phrase). The tool returns concise top results (title, URL, snippet). Choose a small max_results (1-5) to minimize noise.",
+        "description": (
+            "Keyless web search via DuckDuckGo Instant Answer API (with HTML fallback). "
+            "Use to discover sources or quick facts; provide a focused query (keywords or a quoted phrase). "
+            "Returns concise top results (title, URL, snippet). Choose a small max_results (1–5). "
+            "Subject to the agent's network policy (allowlist/proxy); if blocked, acknowledge policy and suggest narrowing or alternative domains."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

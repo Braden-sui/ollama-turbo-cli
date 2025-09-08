@@ -112,6 +112,19 @@ python -m src.cli --api-key YOUR_API_KEY --message "What's 15 * 8?"
 python -m src.cli --message "Weather in London" --stream
 ```
 
+## Important: Security Defaults
+
+By default, this repo is configured for an easy research/development experience, not a hardened production posture.
+
+- Web tools (duckduckgo, wikipedia, web_fetch) run with liberal defaults via cfg:
+  - Allowlist is wildcard `*` (all public hosts allowed)
+  - Proxies are permitted
+  - Robots.txt is not enforced; HEAD‑gating is off; larger byte caps and higher concurrency are used
+  - Private/loopback/link‑local IPs are always blocked (SSRF defense)
+- Shell sandbox (execute_shell) is disabled by default and has network egress OFF unless you opt in.
+
+Harden these defaults before production by setting a restrictive allowlist, disabling proxies, enforcing robots, enabling HEAD‑gating, reducing max bytes/concurrency, and leaving shell networking off. See the “Secure Execution & Web Access” section below for a quick profile.
+
 ## Available Tools
 
 ### 🌤️ Weather Service
@@ -451,7 +464,10 @@ Mem0 is integrated as the long-term memory store. It is optional and enabled whe
 
 - **Sandbox guarantees**: CPU/mem/pids/disk/time limits, read-only project mount at `/project`, tmpfs workspace, no host env (only `env_vars` pass-through). Windows requires Docker Desktop/WSL2. If Docker is unavailable, execution fails closed with a clear message.
 
-- **Web access is allowlist-only**: The `web_fetch` tool goes through a controlled client with host allowlist and SSRF protections. HTTPS-only by default (`SANDBOX_ALLOW_HTTP=0`). Add domains to `SANDBOX_NET_ALLOW` (supports wildcards like `*.wikipedia.org`).
+- **Web tools (cfg-first defaults are liberal)**: By default, the web client uses a wildcard allowlist (`*`) and permits proxies to make research easy. Private/loopback IPs remain blocked. If `SANDBOX_*` envs are set, they override cfg at runtime for strict enforcement.
+
+  - To harden: set a narrow allowlist, disable proxies, enforce robots, enable HEAD‑gating, and reduce byte/concurrency limits.
+  - To keep permissive behavior: do not set `SANDBOX_*` envs and rely on cfg defaults, or explicitly set `SANDBOX_NET_ALLOW=*`.
 
 - **Summarization before injection**: Tool outputs are summarized and capped (`TOOL_CONTEXT_MAX_CHARS`, default 4000). Full logs and payloads are kept under `.sandbox/sessions/` and `.sandbox/cache/` and are not shared with the model.
 
@@ -467,15 +483,26 @@ Mem0 is integrated as the long-term memory store. It is optional and enabled whe
 
 2. Run your prompt. When asked, confirm the preview.
 
-### Add a domain to the allowlist
-
-- Set `SANDBOX_NET_ALLOW` to include your domain(s), comma-separated, e.g.:
+### Hardened web profile (recommended for production)
 
 ```bash
-SANDBOX_NET_ALLOW=api.github.com,*.wikipedia.org,example.com
+# Allow only specific hosts (supports wildcards)
+export SANDBOX_NET=allowlist
+export SANDBOX_NET_ALLOW=api.github.com,*.wikipedia.org
+
+# Enforce HTTPS and disable proxies
+export SANDBOX_ALLOW_HTTP=0
+export SANDBOX_ALLOW_PROXIES=0
+
+# Tighten fetch behavior
+export WEB_RESPECT_ROBOTS=1
+export WEB_HEAD_GATING=1
+export WEB_MAX_DOWNLOAD_BYTES=1048576   # 1 MB
+export WEB_MAX_CONNECTIONS=8
+export WEB_PER_HOST_CONCURRENCY=2
 ```
 
-- Keep HTTPS-only unless absolutely necessary (`SANDBOX_ALLOW_HTTP=0`).
+To keep the permissive research profile, omit `SANDBOX_*` envs (cfg defaults apply) or set `SANDBOX_NET_ALLOW=*` explicitly.
 
 ### Environment knobs
 

@@ -129,7 +129,7 @@ class ToolingConfig:
     print_limit: int = 2000
     context_cap: int = field(default_factory=lambda: _env_int("TOOL_CONTEXT_MAX_CHARS", 4000))
     multi_round: bool = field(default_factory=lambda: _env_bool("MULTI_ROUND_TOOLS", True))
-    max_rounds: int = field(default_factory=lambda: max(1, _env_int("TOOL_MAX_ROUNDS", 6)))
+    max_rounds: int = field(default_factory=lambda: max(1, _env_int("TOOL_MAX_ROUNDS",10)))
     results_format: str = field(default_factory=lambda: (os.getenv("TOOL_RESULTS_FORMAT") or "string").strip().lower())
 
 
@@ -204,22 +204,22 @@ class WebConfig:
     user_agent: str = field(default_factory=lambda: os.getenv("WEB_UA", "ollama-turbo-cli-web/1.0 (+https://github.com)"))
     # Timeouts (seconds)
     timeout_connect: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_CONNECT", 5.0))
-    timeout_read: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_READ", 20.0))
+    timeout_read: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_READ", 15.0))
     timeout_write: float = field(default_factory=lambda: _env_float("WEB_TIMEOUT_WRITE", 10.0))
     # Retries
     retry_attempts: int = field(default_factory=lambda: _env_int("WEB_RETRY_ATTEMPTS", 3, min_value=0))
     retry_backoff_base: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_BASE", 0.4))
     retry_backoff_max: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_MAX", 6.0))
     # Concurrency
-    max_connections: int = field(default_factory=lambda: _env_int("WEB_MAX_CONNECTIONS", 64, min_value=1))
-    max_keepalive: int = field(default_factory=lambda: _env_int("WEB_MAX_KEEPALIVE", 32, min_value=0))
-    per_host_concurrency: int = field(default_factory=lambda: _env_int("WEB_PER_HOST_CONCURRENCY", 8, min_value=1))
+    max_connections: int = field(default_factory=lambda: _env_int("WEB_MAX_CONNECTIONS", 20, min_value=1))
+    max_keepalive: int = field(default_factory=lambda: _env_int("WEB_MAX_KEEPALIVE", 10, min_value=0))
+    per_host_concurrency: int = field(default_factory=lambda: _env_int("WEB_PER_HOST_CONCURRENCY", 4, min_value=1))
     # Fetch behavior
     follow_redirects: bool = field(default_factory=lambda: _env_bool("WEB_FOLLOW_REDIRECTS", True))
-    head_gating_enabled: bool = field(default_factory=lambda: _env_bool("WEB_HEAD_GATING", False))
-    max_download_bytes: int = field(default_factory=lambda: _env_int("WEB_MAX_DOWNLOAD_BYTES", 50 * 1024 * 1024, min_value=1024))
+    head_gating_enabled: bool = field(default_factory=lambda: _env_bool("WEB_HEAD_GATING", True))
+    max_download_bytes: int = field(default_factory=lambda: _env_int("WEB_MAX_DOWNLOAD_BYTES", 10 * 1024 * 1024, min_value=1024))
     accept_header_override: str = field(default_factory=lambda: os.getenv("WEB_ACCEPT_HEADER", ""))
-    client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 32, min_value=1))
+    client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 16, min_value=1))
     # Caching and robots
     cache_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SECONDS", 86400, min_value=0))
     robots_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_ROBOTS_TTL_SECONDS", 3600, min_value=0))
@@ -244,19 +244,19 @@ class WebConfig:
         RerankProviderSpec(name="voyage", model="rerank-2"),
     ])
     # Policies
-    respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", False))
+    respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
     allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
     # Debugging / fallbacks
     emergency_bootstrap: bool = field(default_factory=lambda: _env_bool("WEB_EMERGENCY_BOOTSTRAP", True))
     debug_metrics: bool = field(default_factory=lambda: _env_bool("WEB_DEBUG_METRICS", False))
     # Rate limiting
-    rate_tokens_per_host: int = field(default_factory=lambda: _env_int("WEB_RATE_TOKENS_PER_HOST", 20, min_value=1))
-    rate_refill_per_sec: float = field(default_factory=lambda: _env_float("WEB_RATE_REFILL_PER_SEC", 2.0, min_value=0.01))
+    rate_tokens_per_host: int = field(default_factory=lambda: _env_int("WEB_RATE_TOKENS_PER_HOST", 4, min_value=1))
+    rate_refill_per_sec: float = field(default_factory=lambda: _env_float("WEB_RATE_REFILL_PER_SEC", 0.5, min_value=0.01))
     respect_retry_after: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_RETRY_AFTER", True))
     # Allowlist integration (reuse sandbox policy)
     sandbox_allow: Optional[str] = field(default_factory=lambda: os.getenv("SANDBOX_NET_ALLOW", "*"))
-    sandbox_allow_http: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_HTTP", True))
-    sandbox_allow_proxies: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_PROXIES", True))
+    sandbox_allow_http: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_HTTP", False))
+    sandbox_allow_proxies: bool = field(default_factory=lambda: _env_bool("SANDBOX_ALLOW_PROXIES", False))
     # Network safety policy
     block_private_ips: bool = field(default_factory=lambda: _env_bool("SANDBOX_BLOCK_PRIVATE_IPS", True))
     # Proxy environment (centralized)

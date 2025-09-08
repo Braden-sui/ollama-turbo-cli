@@ -5,12 +5,19 @@ from typing import Any, Dict, Optional
 
 from ..sandbox.net_proxy import fetch_via_policy
 from ..web.pipeline import _DEFAULT_CFG
+from ..web.config import WebConfig
 
 TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "web_fetch",
-        "description": "Fetch web content through a sandboxed allowlist proxy with SSRF protection and size caps. Use when you need to read a specific page or API without credentials. Prefer HTTPS URLs, small timeouts, and minimal content. Only a compact summary ('inject') is added to model context and may be truncated; avoid fetching large pages.",
+        "description": (
+            "Fetch a single HTTPS URL through the agent's sandboxed web client. "
+            "Behavior is policy‑aware: by default cfg enables a liberal allowlist ('*') and proxies are permitted, "
+            "but explicit SANDBOX_* environment variables may override this at runtime. Private/loopback IPs are always blocked. "
+            "Use this to read a specific page or small API response (no credentials). Prefer HTTPS, short timeouts, and small max_bytes; "
+            "only a compact summary ('inject') is added to context and may be truncated. If access is blocked by policy, report that briefly instead of retrying."
+        ),
         "parameters": {
             "type": "object",
             "additionalProperties": False,
@@ -33,7 +40,23 @@ TOOL_SCHEMA = {
 def web_fetch(url: str, method: str = 'GET', headers: Optional[Dict[str, str]] = None, body: Optional[str] = None, timeout_s: int = 15, max_bytes: Optional[int] = None, extract: str = 'auto', cache_bypass: bool = False) -> str:
     # Enforce HTTPS default inside fetch_via_policy
     data = body.encode() if body is not None else None
-    res = fetch_via_policy(url, method=method or 'GET', headers=headers or {}, body=data, timeout_s=int(timeout_s), max_bytes=max_bytes, cache_bypass=bool(cache_bypass), cfg=_DEFAULT_CFG)
+    # Prefer centralized cfg when set by the client; if explicit sandbox policy envs are present,
+    # defer to environment by passing cfg=None to preserve test/user overrides.
+    import os as _os
+    _policy_env_present = any((_os.getenv(k) is not None) for k in (
+        'SANDBOX_NET','SANDBOX_NET_ALLOW','SANDBOX_NET_BLOCK','SANDBOX_ALLOW_HTTP','SANDBOX_ALLOW_PROXIES','SANDBOX_BLOCK_PRIVATE_IPS'
+    ))
+    cfg = None if _policy_env_present else (_DEFAULT_CFG or WebConfig())
+    res = fetch_via_policy(
+        url,
+        method=method or 'GET',
+        headers=headers or {},
+        body=data,
+        timeout_s=int(timeout_s),
+        max_bytes=max_bytes,
+        cache_bypass=bool(cache_bypass),
+        cfg=cfg,
+    )
 
     # Build safe injection summary; never include large bodies
     inject = res.get('inject') or ''

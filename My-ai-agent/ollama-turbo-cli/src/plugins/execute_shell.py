@@ -13,11 +13,11 @@ TOOL_SCHEMA = {
     "function": {
         "name": "execute_shell",
         "description": (
-            "Execute a short shell command in a containerized sandbox. Default mode is restrictive: "
-            "read-only rootfs, project mounted read-only, path confinement to SHELL_TOOL_ROOT, allowlisted command prefixes, "
-            "and network disabled. Use sparingly for diagnostics (e.g., 'git status', 'ls'). Requires SHELL_TOOL_ALLOW=1. "
-            "When SANDBOX_PERMISSIVE=1 and policy allows (e.g., SHELL_TOOL_ALLOWLIST='*'), the sandbox runs with project mounted read-write, "
-            "working directory at /project, root user, and bridge networking enabled. Handle with extreme care."
+            "Execute a short shell command inside a Docker-based sandbox. By default it's locked down: "
+            "read-only rootfs, project mounted read-only, path confinement to SHELL_TOOL_ROOT, allowlisted command prefixes, and network disabled. "
+            "Use sparingly for diagnostics (e.g., 'git status', 'ls'). Requires SHELL_TOOL_ALLOW=1. "
+            "To allow egress from the container, explicitly opt in with SANDBOX_PERMISSIVE=1 or SANDBOX_NET=bridge (and adjust SHELL_TOOL_ALLOWLIST as needed). "
+            "This is separate from web_fetch, which uses the agent's policy-aware web client; prefer web_fetch for HTTP(S) reads."
         ),
         "parameters": {
             "type": "object",
