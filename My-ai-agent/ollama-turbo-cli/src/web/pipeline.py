@@ -4,9 +4,10 @@ import json
 import hashlib
 import time
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from .robots import RobotsPolicy
 from .config import WebConfig
 # Ensure .env.local/.env are loaded even when this module is imported outside the CLI
 # (e.g., tests or custom orchestrators). This mirrors src/config.py with a safe fallback.
@@ -277,6 +278,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     dedupe_lock = threading.Lock()
 
     dedup_skips = 0
+    excluded_skips = 0
+
+    def _host_in_excluded(u: str) -> bool:
+        try:
+            host = (urlparse(u).hostname or '').lower().strip('.')
+            if not host:
+                return False
+            for dom in (cfg.exclude_citation_domains or []):
+                d = str(dom or '').lower().strip('.')
+                if not d:
+                    continue
+                if host == d or host.endswith('.' + d):
+                    return True
+            return False
+        except Exception:
+            return False
     def _build_citation(sr) -> Optional[Dict[str, Any]]:
         if site_exclude and site_exclude in (sr.url or ''):
             return None
@@ -284,6 +301,13 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             _progress.emit_current({"stage": "fetch", "status": "start", "url": sr.url})
         except Exception:
             pass
+        # Respect exclusion list: allow discovery (search) but skip quoting as a citation
+        if _host_in_excluded(sr.url):
+            items.append({'url': sr.url, 'ok': False, 'reason': 'excluded-domain'})
+            nonlocal excluded_skips
+            with dedupe_lock:
+                excluded_skips += 1
+            return None
         f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
         if not f.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': f.reason or f"HTTP {f.status}"})
@@ -459,6 +483,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     'ok': len(citations[:top_k]),
                     'failed': len([it for it in items if not it.get('ok')]),
                     'dedupe_skips': dedup_skips,
+                    'excluded': excluded_skips,
                 },
             }
         except Exception:

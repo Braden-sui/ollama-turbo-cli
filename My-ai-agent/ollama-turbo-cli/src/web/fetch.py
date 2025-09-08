@@ -147,7 +147,13 @@ def _cfg_proxy_for_scheme(cfg: WebConfig, scheme: str) -> Optional[str]:
 
 def _httpx_client(cfg: WebConfig):
     import httpx
-    timeout = httpx.Timeout(connect=cfg.timeout_connect, read=cfg.timeout_read, write=cfg.timeout_write)
+    # httpx requires either a default timeout or all four: connect, read, write, pool
+    timeout = httpx.Timeout(
+        connect=cfg.timeout_connect,
+        read=cfg.timeout_read,
+        write=cfg.timeout_write,
+        pool=cfg.timeout_connect,
+    )
     limits = httpx.Limits(max_connections=cfg.max_connections, max_keepalive_connections=cfg.max_keepalive)
     # Build proxies from centralized cfg (do not read env here)
     proxies = None
@@ -177,15 +183,32 @@ def _httpx_client(cfg: WebConfig):
     except Exception:
         proxies = None
     # Always disable trust_env so only cfg drives behavior
-    return httpx.Client(
-        http2=False,
-        timeout=timeout,
-        limits=limits,
-        headers={"User-Agent": cfg.user_agent},
-        follow_redirects=cfg.follow_redirects,
-        trust_env=False,
-        proxies=proxies,
-    )
+    client_kwargs = {
+        "timeout": timeout,
+        "limits": limits,
+        "headers": {"User-Agent": cfg.user_agent},
+        "follow_redirects": cfg.follow_redirects,
+        "trust_env": False,
+    }
+    # Prefer HTTP/1.1 for wider compatibility; set http2 only if supported
+    try:
+        client_kwargs["http2"] = False
+    except Exception:
+        pass
+    # Include proxies only when allowed and supported
+    if proxies:
+        client_kwargs["proxies"] = proxies
+    try:
+        return httpx.Client(**client_kwargs)
+    except TypeError:
+        # Fallback: remove proxies if this httpx version doesn't accept the kwarg
+        client_kwargs.pop("proxies", None)
+        try:
+            return httpx.Client(**client_kwargs)
+        except TypeError:
+            # Final fallback: remove http2 flag if unsupported
+            client_kwargs.pop("http2", None)
+            return httpx.Client(**client_kwargs)
 
 
 # Small LRU pool of httpx.Clients keyed by origin

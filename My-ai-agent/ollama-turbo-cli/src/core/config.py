@@ -246,6 +246,10 @@ class WebConfig:
     # Policies
     respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
     allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
+    # Citation policy
+    exclude_citation_domains: list[str] = field(default_factory=lambda: [
+        d.strip().lower() for d in (os.getenv("WEB_EXCLUDE_CITATION_DOMAINS", "").split(",") if os.getenv("WEB_EXCLUDE_CITATION_DOMAINS") else []) if d.strip()
+    ])
     # Debugging / fallbacks
     emergency_bootstrap: bool = field(default_factory=lambda: _env_bool("WEB_EMERGENCY_BOOTSTRAP", True))
     debug_metrics: bool = field(default_factory=lambda: _env_bool("WEB_DEBUG_METRICS", False))

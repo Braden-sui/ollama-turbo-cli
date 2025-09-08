@@ -266,7 +266,9 @@ def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchRe
             collected: List[SearchResult] = []
             for base in ("https://duckduckgo.com/lite/", "https://html.duckduckgo.com/html/"):
                 try:
-                    r2 = c.get(base, params={"q": qtext}, headers=headers_html, timeout=cfg.timeout_read)
+                    # Add locale and web intent to reduce gating and region variance
+                    params_html = {"q": qtext, "kl": "wt-wt", "ia": "web", "t": "ollama-turbo-cli"}
+                    r2 = c.get(base, params=params_html, headers=headers_html, timeout=cfg.timeout_read)
                 except Exception:
                     continue
                 if r2.status_code != 200:
