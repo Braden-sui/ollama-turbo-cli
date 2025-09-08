@@ -419,9 +419,29 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                                                 new_segment = ""
                                             if new_segment:
                                                 if not printed_prefix:
-                                                    print("🤖 Assistant: ", end="", flush=True)
+                                                    try:
+                                                        _sink = getattr(ctx, 'output_sink', None)
+                                                        if callable(_sink):
+                                                            try:
+                                                                _sink("🤖 Assistant: ")
+                                                            except TypeError:
+                                                                _sink("🤖 Assistant: ")
+                                                        else:
+                                                            print("🤖 Assistant: ", end="", flush=True)
+                                                    except Exception:
+                                                        print("🤖 Assistant: ", end="", flush=True)
                                                     printed_prefix = True
-                                                print(new_segment, end="", flush=True)
+                                                try:
+                                                    _sink = getattr(ctx, 'output_sink', None)
+                                                    if callable(_sink):
+                                                        try:
+                                                            _sink(new_segment)
+                                                        except TypeError:
+                                                            _sink(new_segment)
+                                                    else:
+                                                        print(new_segment, end="", flush=True)
+                                                except Exception:
+                                                    print(new_segment, end="", flush=True)
                                                 printed_len = len(round_content_clean)
                                                 try:
                                                     if ctx.show_trace:
@@ -438,10 +458,30 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                                 # Print live until a tool call is detected in the current round
                                 if new_segment_pre:
                                     if not printed_prefix:
-                                        print("🤖 Assistant: ", end="", flush=True)
+                                        try:
+                                            _sink = getattr(ctx, 'output_sink', None)
+                                            if callable(_sink):
+                                                try:
+                                                    _sink("🤖 Assistant: ")
+                                                except TypeError:
+                                                    _sink("🤖 Assistant: ")
+                                            else:
+                                                print("🤖 Assistant: ", end="", flush=True)
+                                        except Exception:
+                                            print("🤖 Assistant: ", end="", flush=True)
                                         printed_prefix = True
                                     # Always print sanitized tokens (no Harmony markup leakage)
-                                    print(new_segment_pre, end="", flush=True)
+                                    try:
+                                        _sink = getattr(ctx, 'output_sink', None)
+                                        if callable(_sink):
+                                            try:
+                                                _sink(new_segment_pre)
+                                            except TypeError:
+                                                _sink(new_segment_pre)
+                                        else:
+                                            print(new_segment_pre, end="", flush=True)
+                                    except Exception:
+                                        print(new_segment_pre, end="", flush=True)
                                     printed_len = len(round_content_clean)
                                     # Trace printing metrics
                                     try:
@@ -600,8 +640,23 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                     if final and not str(final).startswith("Error during chat:"):
                         # Print once if nothing has been printed yet
                         if (not printed_prefix) and (not ctx.quiet):
-                            print("🤖 Assistant: ", end="", flush=True)
-                            print(ctx._strip_harmony_markup(final), flush=True)
+                            try:
+                                _sink = getattr(ctx, 'output_sink', None)
+                                if callable(_sink):
+                                    try:
+                                        _sink("🤖 Assistant: ")
+                                    except TypeError:
+                                        _sink("🤖 Assistant: ")
+                                    try:
+                                        _sink(ctx._strip_harmony_markup(final))
+                                    except TypeError:
+                                        _sink(ctx._strip_harmony_markup(final))
+                                else:
+                                    print("🤖 Assistant: ", end="", flush=True)
+                                    print(ctx._strip_harmony_markup(final), flush=True)
+                            except Exception:
+                                print("🤖 Assistant: ", end="", flush=True)
+                                print(ctx._strip_harmony_markup(final), flush=True)
                             printed_prefix = True
                         # Append to history and persist memory
                         ctx.conversation_history.append({'role': 'assistant', 'content': final})
@@ -637,8 +692,23 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
 
             # If nothing was printed live, print final once for good UX
             if (not printed_prefix) and (not ctx.quiet) and final_out:
-                print("🤖 Assistant: ", end="", flush=True)
-                print(ctx._strip_harmony_markup(final_out), flush=True)
+                try:
+                    _sink = getattr(ctx, 'output_sink', None)
+                    if callable(_sink):
+                        try:
+                            _sink("🤖 Assistant: ")
+                        except TypeError:
+                            _sink("🤖 Assistant: ")
+                        try:
+                            _sink(ctx._strip_harmony_markup(final_out))
+                        except TypeError:
+                            _sink(ctx._strip_harmony_markup(final_out))
+                    else:
+                        print("🤖 Assistant: ", end="", flush=True)
+                        print(ctx._strip_harmony_markup(final_out), flush=True)
+                except Exception:
+                    print("🤖 Assistant: ", end="", flush=True)
+                    print(ctx._strip_harmony_markup(final_out), flush=True)
 
             # Reliability integrations (streaming): consensus+validator without altering streamed text
             tools_used_stream = bool(aggregated_results)
@@ -657,7 +727,15 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
 
             if aggregated_results:
                 prefix = (preface_content + "\n\n") if preface_content else ""
+                try:
+                    ctx._trace("stream:end")
+                except Exception:
+                    pass
                 return f"{prefix}[Tool Results]\n" + '\n'.join(aggregated_results) + f"\n\n{final_out}"
+            try:
+                ctx._trace("stream:end")
+            except Exception:
+                pass
             return final_out
     except Exception as e:
         # Do not leak streaming errors to CLI; rely on standard handler fallback path
