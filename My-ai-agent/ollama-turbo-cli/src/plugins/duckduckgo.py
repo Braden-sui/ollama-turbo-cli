@@ -63,15 +63,19 @@ def duckduckgo_search(query: str, max_results: int = 3):
             "no_redirect": "1",
             "t": "ollama-turbo-cli",
         }
-        # Use centralized WebConfig for user agent if available
+        # Use centralized WebConfig for user agent if available; prefer a browser-like UA
+        # to avoid DDG gating (e.g., HTTP 202/403 for non-browser UAs).
         try:
             from ..web.pipeline import _DEFAULT_CFG
-            user_agent = _DEFAULT_CFG.user_agent if _DEFAULT_CFG else "ollama-turbo-cli/1.0 (+https://ollama.com)"
+            ua = (_DEFAULT_CFG.user_agent if _DEFAULT_CFG else "") or ""
         except Exception:
-            user_agent = "ollama-turbo-cli/1.0 (+https://ollama.com)"
-        
+            ua = ""
+        # Fallback to a common Chromium UA if UA is empty or obviously bot-like
+        if (not ua) or ("ollama" in ua.lower()) or ("cli" in ua.lower()):
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
         headers = {
-            "User-Agent": user_agent,
+            "User-Agent": ua,
             "Accept": "application/json",
         }
 
@@ -103,7 +107,7 @@ def duckduckgo_search(query: str, max_results: int = 3):
         if data is None:
             # Fallback to HTML (Lite) endpoint and extract links
             html_headers = {
-                "User-Agent": user_agent,
+                "User-Agent": ua,
                 "Accept": "text/html",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://duckduckgo.com/",
@@ -116,7 +120,8 @@ def duckduckgo_search(query: str, max_results: int = 3):
             collected: List[Dict[str, str]] = []
             for base in fallback_urls:
                 try:
-                    r = requests.get(base, params={"q": query}, headers=html_headers, timeout=8)
+                    params_html = {"q": query, "kl": "wt-wt"}  # worldwide locale to reduce region gating
+                    r = requests.get(base, params=params_html, headers=html_headers, timeout=8)
                 except Exception:
                     continue
                 if r.status_code != 200:
@@ -169,6 +174,25 @@ def duckduckgo_search(query: str, max_results: int = 3):
                     snippet = (r.get("snippet") or "").strip()
                     results.append({"rank": i, "title": title, "url": url, "snippet": snippet})
                 return {"ok": True, "query": query, "engine": "duckduckgo", "results": results}
+
+            # Last-chance fallback: reuse internal HTML fallback via httpx client with centralized policy
+            try:
+                from ..web.search import _search_duckduckgo_fallback, SearchQuery
+                from ..web.config import WebConfig
+                items = _search_duckduckgo_fallback(SearchQuery(query=query), WebConfig())
+                if items:
+                    results = []
+                    for i, it in enumerate(items[:max_results], 1):
+                        results.append({
+                            "rank": i,
+                            "title": (it.title or "(no title)"),
+                            "url": it.url,
+                            "snippet": (it.snippet or "").strip(),
+                        })
+                    return {"ok": True, "query": query, "engine": "duckduckgo", "results": results}
+            except Exception:
+                pass
+
             # If still nothing useful, report the last status
             code = resp.status_code if (resp is not None and hasattr(resp, 'status_code')) else 'unknown'
             return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": f"HTTP {code} and no fallback results"}}
