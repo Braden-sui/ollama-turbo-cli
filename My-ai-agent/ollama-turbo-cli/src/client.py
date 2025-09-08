@@ -30,6 +30,8 @@ from .streaming import runner as _runner, standard as _standard
 from .tools_runtime.executor import ToolRuntimeExecutor
 from .memory.mem0 import Mem0Service
 from .core.config import ClientRuntimeConfig
+from .web.config import WebConfig  # re-exported wrapper around core WebConfig
+from .web.pipeline import set_default_config as _web_set_default_config
 
 
 class OllamaTurboClient:
@@ -63,6 +65,16 @@ class OllamaTurboClient:
         self.api_key = api_key
         # Prefer centralized config when provided
         self._cfg: Optional[ClientRuntimeConfig] = cfg
+        # Ensure web pipeline uses the same centralized WebConfig
+        try:
+            if cfg is not None and getattr(cfg, 'web', None):
+                _web_set_default_config(cfg.web)
+            else:
+                # Fall back to environment-derived WebConfig
+                _web_set_default_config(WebConfig())
+        except Exception:
+            # Never fail client init due to optional web config propagation
+            pass
         if cfg is not None:
             self.model = cfg.model
             self.enable_tools = enable_tools

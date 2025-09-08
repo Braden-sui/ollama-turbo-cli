@@ -8,6 +8,67 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import WebConfig
+# Ensure .env.local/.env are loaded even when this module is imported outside the CLI
+# (e.g., tests or custom orchestrators). This mirrors src/config.py with a safe fallback.
+try:
+    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    try:
+        path_local = find_dotenv('.env.local', usecwd=True)
+        if path_local:
+            load_dotenv(path_local, override=True)
+    except Exception:
+        pass
+    try:
+        path_default = find_dotenv('.env', usecwd=True)
+        if path_default:
+            load_dotenv(path_default, override=False)
+    except Exception:
+        pass
+except Exception:
+    # Fallback: minimal manual loader for .env.local and .env
+    import os as _os
+    def _find_upwards(_filename: str) -> str:
+        try:
+            _cwd = _os.getcwd()
+        except Exception:
+            return ""
+        _cur = _cwd
+        while True:
+            _cand = _os.path.join(_cur, _filename)
+            if _os.path.isfile(_cand):
+                return _cand
+            _parent = _os.path.dirname(_cur)
+            if not _parent or _parent == _cur:
+                break
+            _cur = _parent
+        return ""
+    def _load_env_file(_path: str, *, _override: bool) -> None:
+        if not _path:
+            return
+        try:
+            with open(_path, 'r', encoding='utf-8') as _f:
+                for _line in _f:
+                    _s = _line.strip()
+                    if not _s or _s.startswith('#') or '=' not in _s:
+                        continue
+                    _k, _v = _s.split('=', 1)
+                    _key = _k.strip(); _val = _v.strip().strip('"').strip("'")
+                    if _override or (_key not in _os.environ):
+                        _os.environ[_key] = _val
+        except Exception:
+            pass
+    try:
+        _p_local = _find_upwards('.env.local')
+        if _p_local:
+            _load_env_file(_p_local, _override=True)
+    except Exception:
+        pass
+    try:
+        _p_env = _find_upwards('.env')
+        if _p_env:
+            _load_env_file(_p_env, _override=False)
+    except Exception:
+        pass
 from . import progress as _progress
 from .search import search, SearchResult
 from .fetch import fetch_url, _httpx_client
