@@ -94,6 +94,24 @@ class SamplingConfig:
 
 
 @dataclass
+class ReasoningInjectionConfig:
+    """Controls request-level reasoning injection placement and style.
+
+    field_path: dot-path in the request payload to place reasoning effort.
+      - Typical: 'options.reasoning_effort' (for request:options mode)
+      - Or: 'reasoning' (for request:top mode)
+      - Leave empty to auto-pick based on reasoning_mode.
+    field_style: 'string' | 'object'
+      - 'string' → injects a simple string (e.g., 'high').
+      - 'object' → injects {object_key: 'high'}.
+    object_key: key to use when style is 'object' (default: 'effort').
+    """
+    field_path: str = ""  # default: auto by mode
+    field_style: str = field(default_factory=lambda: (os.getenv("REASONING_FIELD_STYLE") or "string").strip().lower())
+    object_key: str = field(default_factory=lambda: os.getenv("REASONING_OBJECT_KEY", "effort"))
+
+
+@dataclass
 class ToolingConfig:
     enabled: bool = True
     print_limit: int = 2000
@@ -140,6 +158,8 @@ class Mem0Config:
     rerank_search_limit: int = 10     # MEM0_RERANK_SEARCH_LIMIT
     # Context construction
     context_budget_chars: int = 1200   # MEM0_CONTEXT_BUDGET_CHARS
+    # Output format for mem0 client responses (avoid deprecation of v1.0)
+    output_format: str = field(default_factory=lambda: os.getenv("MEM0_OUTPUT_FORMAT", "v1.1"))
 
 
 @dataclass
@@ -260,6 +280,7 @@ class ClientRuntimeConfig:
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     tooling: ToolingConfig = field(default_factory=ToolingConfig)
+    reasoning_injection: ReasoningInjectionConfig = field(default_factory=ReasoningInjectionConfig)
     mem0: Mem0Config = field(default_factory=Mem0Config)
     reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
@@ -417,5 +438,13 @@ class ClientRuntimeConfig:
 
         # History window
         cfg.history.max_history = max(2, min(_env_int("MAX_CONVERSATION_HISTORY", 10), 10))
+
+        # Reasoning injection (override field_path only; style/object_key picked up via defaults)
+        try:
+            fp = os.getenv("REASONING_FIELD_PATH")
+            if fp is not None:
+                cfg.reasoning_injection.field_path = fp.strip()
+        except Exception:
+            pass
 
         return cfg

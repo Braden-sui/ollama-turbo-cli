@@ -324,6 +324,8 @@ class OllamaTurboClient:
                     (os.getenv('MEM0_IN_FIRST_SYSTEM') or '').strip().lower() in {'1','true','yes','on'}
                 )
             ),
+            # Output format for mem0 client (centralized)
+            'output_format': (cfg.mem0.output_format if cfg is not None else (os.getenv('MEM0_OUTPUT_FORMAT') or 'v1.1')),
             # Proxy / reranker
             'proxy_model': (cfg.mem0.proxy_model if cfg is not None else (os.getenv('MEM0_PROXY_MODEL') or None)),
             'proxy_timeout_ms': (cfg.mem0.proxy_timeout_ms if cfg is not None else 1200),
@@ -333,6 +335,24 @@ class OllamaTurboClient:
         # Initialize Mem0 memory system (optional)
         self.mem0_service = Mem0Service(self.mem0_config)
         self._init_mem0()
+
+        # Reasoning injection config (centralized)
+        try:
+            default_field_path = 'options.reasoning_effort' if (self.reasoning_mode == 'request:options') else 'reasoning'
+            if cfg is not None and getattr(cfg, 'reasoning_injection', None):
+                inj = cfg.reasoning_injection
+                self.reasoning_field_path = (inj.field_path.strip() or default_field_path)
+                self.reasoning_field_style = (inj.field_style or 'string').strip().lower()
+                self.reasoning_object_key = (inj.object_key or 'effort').strip()
+            else:
+                # Defaults when no cfg provided
+                self.reasoning_field_path = default_field_path
+                self.reasoning_field_style = 'string'
+                self.reasoning_object_key = 'effort'
+        except Exception:
+            self.reasoning_field_path = 'reasoning'
+            self.reasoning_field_style = 'string'
+            self.reasoning_object_key = 'effort'
 
         self.logger.info(f"Initialized client with model: {self.model}, host: {self.host}, tools enabled: {enable_tools}, reasoning={self.reasoning}, mode={self.reasoning_mode}, quiet={self.quiet}")
         # Initial trace state
@@ -364,11 +384,10 @@ class OllamaTurboClient:
         try:
             if self.reasoning_mode == 'system':
                 return
-            # Resolve defaults by mode
-            default_path = 'options.reasoning_effort' if self.reasoning_mode == 'request:options' else 'reasoning'
-            field_path = (os.getenv('REASONING_FIELD_PATH') or default_path).strip()
-            style = (os.getenv('REASONING_FIELD_STYLE') or 'string').strip().lower()
-            obj_key = (os.getenv('REASONING_OBJECT_KEY') or 'effort').strip()
+            # Resolve from centralized config prepared at init
+            field_path = getattr(self, 'reasoning_field_path', None) or ('options.reasoning_effort' if self.reasoning_mode == 'request:options' else 'reasoning')
+            style = (getattr(self, 'reasoning_field_style', 'string') or 'string').strip().lower()
+            obj_key = (getattr(self, 'reasoning_object_key', 'effort') or 'effort').strip()
 
             if style == 'object':
                 value: Any = {obj_key: self.reasoning}
@@ -384,11 +403,19 @@ class OllamaTurboClient:
     def _prepare_initial_messages_for_adapter(self, *, include_tools: bool, adapter_opts: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Prepare initial-turn messages via adapter, merging Mem0 into first system if needed.
 
+        Behavior
         - If Mem0 is already merged into the first system message, pass through.
-        - If Mem0 exists as a separate system block, strip it from the outgoing
-          message list and pass it to the adapter via mem0_block for safe merge.
+        - If Mem0 exists as a separate system block and MEM0_IN_FIRST_SYSTEM is enabled,
+          remove the separate block and pass it to the adapter as ``mem0_block`` so the
+          adapter can merge it into the first system message deterministically.
+        - If MEM0_IN_FIRST_SYSTEM is disabled, the separate Mem0 block remains as-is,
+          and no merge hint (``mem0_block``) is provided to the adapter.
         - Returns (normalized_messages, payload_overrides) where overrides may include
           provider-specific options and tools.
+
+        Tracing
+        - Emits ``mem0:inject:first:adapter`` when a Mem0 block is merged into the first
+          system message by this method (merge enabled and a Mem0 block was present).
         """
         try:
             msgs: List[Dict[str, Any]] = list(self.conversation_history or [])
@@ -407,43 +434,44 @@ class OllamaTurboClient:
                 first_c = str((msgs[0] or {}).get('content') or '')
                 mem0_in_first = any((p and (p in first_c)) for p in prefixes)
 
+            # Detect Mem0 block if present (latest occurrence)
             mem0_block: Optional[str] = None
-            # Respect env flag: only merge into first system when explicitly enabled
+            latest_idx: Optional[int] = None
+            for i in range(len(msgs) - 1, -1, -1):
+                m = msgs[i]
+                if m.get('role') == 'system':
+                    c = str(m.get('content') or '')
+                    if any(c.startswith(p) for p in prefixes):
+                        latest_idx = i
+                        mem0_block = c
+                        break
+            # Respect env flag: only remove and merge when explicitly enabled
             prefer_merge = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
-            if prefer_merge and (not mem0_in_first):
-                # Find the latest Mem0 system block and extract it
-                latest_idx: Optional[int] = None
-                for i in range(len(msgs) - 1, -1, -1):
-                    m = msgs[i]
-                    if m.get('role') == 'system':
-                        c = str(m.get('content') or '')
-                        if any(c.startswith(p) for p in prefixes):
-                            latest_idx = i
-                            break
-                if latest_idx is not None:
-                    mem0_block = str((msgs[latest_idx] or {}).get('content') or '')
-                    # Remove that block so the adapter can merge into first system
-                    msgs = msgs[:latest_idx] + msgs[latest_idx + 1:]
-                    # Mirror the merge in our persistent history to keep tests and callers consistent
-                    try:
-                        if self.conversation_history and (self.conversation_history[0] or {}).get('role') == 'system':
-                            base0 = str((self.conversation_history[0] or {}).get('content') or '').rstrip()
-                            merged0 = (base0 + "\n\n" + mem0_block).strip()
-                            self.conversation_history[0]['content'] = merged0
-                            # Remove the separate Mem0 block from history at the same index
-                            if 0 <= int(latest_idx) < len(self.conversation_history):
-                                del self.conversation_history[int(latest_idx)]
-                            # Trace adapter-side merge for visibility
-                            self._trace("mem0:inject:first:adapter")
-                    except Exception:
-                        pass
+            if prefer_merge and (not mem0_in_first) and (latest_idx is not None and mem0_block):
+                # Remove that block so the adapter can merge into first system
+                msgs = msgs[:latest_idx] + msgs[latest_idx + 1:]
+                # Mirror the merge in our persistent history to keep tests and callers consistent
+                try:
+                    if self.conversation_history and (self.conversation_history[0] or {}).get('role') == 'system':
+                        base0 = str((self.conversation_history[0] or {}).get('content') or '').rstrip()
+                        merged0 = (base0 + "\n\n" + mem0_block).strip()
+                        self.conversation_history[0]['content'] = merged0
+                        # Remove the separate Mem0 block from history at the same index
+                        if 0 <= int(latest_idx) < len(self.conversation_history):
+                            del self.conversation_history[int(latest_idx)]
+                        # Trace adapter-side merge for visibility
+                        self._trace("mem0:inject:first:adapter")
+                except Exception:
+                    pass
 
-            # Delegate to adapter for initial formatting
+            # Delegate to adapter for initial formatting. Only pass mem0_block
+            # when we intentionally removed it to merge into the first system.
+            mem0_for_adapter = mem0_block if (prefer_merge and (not mem0_in_first) and (latest_idx is not None and mem0_block)) else None
             norm_msgs, overrides = self.adapter.format_initial_messages(
                 messages=msgs,
                 tools=(self.tools if (include_tools and bool(self.tools)) else None),
                 options=(adapter_opts or None),
-                mem0_block=mem0_block,
+                mem0_block=mem0_for_adapter,
             )
             return norm_msgs, (overrides or {})
         except Exception:
@@ -487,6 +515,20 @@ class OllamaTurboClient:
 
         The trace is non-sensitive and only records booleans/counts. Used to verify that providers that
         only honor the first system message still receive Mem0 context when enabled.
+
+        Canonical Mem0 trace keys (for tests and diagnostics)
+        - ``mem0:present:{where} first={0|1} blocks={N}``
+          Emitted by this method to indicate whether the first system contains Mem0 (``first``)
+          and how many Mem0 system blocks are present in the message list (``blocks``).
+          Typical ``where`` values include ``standard:r0``, ``stream:init``, and ``stream:r0``.
+
+        - ``mem0:inject:first:adapter``
+          Emitted by ``_prepare_initial_messages_for_adapter`` when a Mem0 block is merged into the
+          first system message (i.e., MEM0_IN_FIRST_SYSTEM enabled and a separate Mem0 block existed).
+
+        - ``mem0:search:hits={N}``
+          Emitted by the Mem0 service after a search to record how many related memories were found
+          before constructing the final Mem0 context block.
         """
         if not self.show_trace:
             return

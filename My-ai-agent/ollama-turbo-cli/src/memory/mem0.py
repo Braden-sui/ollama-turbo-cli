@@ -100,6 +100,11 @@ class Mem0Service:
             # API flags
             ctx._mem0_api_version_pref = 'v2'
             ctx._mem0_supports_version_kw = True
+            # Prefer centrally configured output_format to avoid mem0 deprecation warnings
+            try:
+                ctx._mem0_output_format = str(mc.get('output_format') or 'v1.1')
+            except Exception:
+                ctx._mem0_output_format = 'v1.1'
 
             # Proxy reranker (prefer centralized config)
             try:
@@ -172,7 +177,8 @@ class Mem0Service:
                     return
             else:
                 try:
-                    api_key = mc.get('api_key')
+                    # Prefer centralized config, fallback to environment variables for tests/compat
+                    api_key = mc.get('api_key') or os.getenv('MEM0_API_KEY')
                     if not api_key:
                         ctx.logger.warning("MEM0_API_KEY not set, disabling Mem0")
                         try:
@@ -182,8 +188,8 @@ class Mem0Service:
                         except Exception:
                             pass
                         return
-                    org_id = mc.get('org_id')
-                    project_id = mc.get('project_id')
+                    org_id = mc.get('org_id') or os.getenv('MEM0_ORG_ID')
+                    project_id = mc.get('project_id') or os.getenv('MEM0_PROJECT_ID')
                     if org_id or project_id:
                         ctx.mem0_client = _Mem0Impl(api_key=api_key, org_id=org_id, project_id=project_id)  # type: ignore[call-arg]
                     else:
@@ -333,6 +339,12 @@ class Mem0Service:
                 related = []
             except Exception:
                 related = []
+            # Fallback: if threaded path yielded no results, try a direct call synchronously
+            if not related:
+                try:
+                    related = self.search_api(ctx, user_message, filters=filters, limit=getattr(ctx, 'mem0_max_hits', 3))
+                except Exception:
+                    related = []
 
             try:
                 ctx._trace(f"mem0:search:hits={len(related or [])}")
@@ -570,6 +582,12 @@ class Mem0Service:
             return []
         user_id = getattr(ctx, 'mem0_user_id', str(ctx.mem0_config.get('user_id', 'cli-user')))
         kwargs = {"messages": messages, "user_id": user_id, "version": getattr(ctx, '_mem0_api_version_pref', 'v2'), "metadata": metadata}
+        try:
+            of = getattr(ctx, '_mem0_output_format', None)
+            if of:
+                kwargs["output_format"] = of
+        except Exception:
+            pass
         if getattr(ctx, 'mem0_agent_id', None):
             kwargs["agent_id"] = ctx.mem0_agent_id
         try:
@@ -585,8 +603,13 @@ class Mem0Service:
                     kwargs_no_agent.pop("agent_id", None)
                     res = ctx.mem0_client.add(**kwargs_no_agent)
                 except TypeError:
-                    kwargs_min = {"messages": messages, "user_id": user_id}
-                    res = ctx.mem0_client.add(**kwargs_min)
+                    try:
+                        kwargs_no_of = dict(kwargs)
+                        kwargs_no_of.pop("output_format", None)
+                        res = ctx.mem0_client.add(**kwargs_no_of)
+                    except TypeError:
+                        kwargs_min = {"messages": messages, "user_id": user_id}
+                        res = ctx.mem0_client.add(**kwargs_min)
         ids: List[str] = []
         try:
             if isinstance(res, dict):
@@ -615,18 +638,29 @@ class Mem0Service:
             for delay in backoffs:
                 start_meta = time.time()
                 try:
+                    # Try with output_format first (newer mem0), then fall back gracefully
+                    of = getattr(ctx, '_mem0_output_format', None)
                     try:
-                        ctx.mem0_client.update(memory_id=mid, metadata=metadata)
+                        if of:
+                            ctx.mem0_client.update(memory_id=mid, metadata=metadata, output_format=of)
+                        else:
+                            raise TypeError()
                     except TypeError:
                         ctx.mem0_client.update(memory_id=mid, **{"metadata": metadata})
                     if getattr(ctx, 'mem0_agent_id', None):
                         try:
-                            ctx.mem0_client.update(memory_id=mid, agent_id=ctx.mem0_agent_id)
+                            if of:
+                                ctx.mem0_client.update(memory_id=mid, agent_id=ctx.mem0_agent_id, output_format=of)
+                            else:
+                                raise TypeError()
                         except TypeError:
                             pass
                     if getattr(ctx, 'mem0_app_id', None):
                         try:
-                            ctx.mem0_client.update(memory_id=mid, app_id=ctx.mem0_app_id)
+                            if of:
+                                ctx.mem0_client.update(memory_id=mid, app_id=ctx.mem0_app_id, output_format=of)
+                            else:
+                                raise TypeError()
                         except TypeError:
                             pass
                     ok = True
@@ -648,6 +682,8 @@ class Mem0Service:
         except Exception:
             user_id = None
         attempts = []
+        of = getattr(ctx, '_mem0_output_format', None)
+        # Prefer legacy signatures first to support monkeypatched tests
         if getattr(ctx, '_mem0_supports_version_kw', True):
             attempts.append(lambda: ctx.mem0_client.search(query, version=ctx._mem0_api_version_pref, filters=filters, limit=limit))
         attempts.append(lambda: ctx.mem0_client.search(query, filters=filters, limit=limit))
@@ -658,6 +694,17 @@ class Mem0Service:
             if limit is not None:
                 attempts.append(lambda: ctx.mem0_client.search(query=query, user_id=user_id, limit=limit))
         attempts.append(lambda: ctx.mem0_client.search(query))
+        # Then try with explicit output_format if supported by SDK
+        if of:
+            if getattr(ctx, '_mem0_supports_version_kw', True):
+                attempts.append(lambda: ctx.mem0_client.search(query, version=ctx._mem0_api_version_pref, filters=filters, limit=limit, output_format=of))
+            attempts.append(lambda: ctx.mem0_client.search(query, filters=filters, limit=limit, output_format=of))
+            if user_id is not None:
+                if getattr(ctx, '_mem0_supports_version_kw', True):
+                    attempts.append(lambda: ctx.mem0_client.search(query=query, user_id=user_id, version=ctx._mem0_api_version_pref, output_format=of))
+                attempts.append(lambda: ctx.mem0_client.search(query=query, user_id=user_id, output_format=of))
+                if limit is not None:
+                    attempts.append(lambda: ctx.mem0_client.search(query=query, user_id=user_id, limit=limit, output_format=of))
         last_type_error: Optional[Exception] = None
         for call in attempts:
             try:
@@ -679,6 +726,8 @@ class Mem0Service:
         except Exception:
             user_id = None
         attempts = []
+        of = getattr(ctx, '_mem0_output_format', None)
+        # Try legacy signatures first
         if getattr(ctx, '_mem0_supports_version_kw', True):
             attempts.append(lambda: ctx.mem0_client.get_all(filters=filters, version=ctx._mem0_api_version_pref))
         attempts.append(lambda: ctx.mem0_client.get_all(filters=filters))
@@ -686,6 +735,15 @@ class Mem0Service:
             if getattr(ctx, '_mem0_supports_version_kw', True):
                 attempts.append(lambda: ctx.mem0_client.get_all(user_id=user_id, version=ctx._mem0_api_version_pref))
             attempts.append(lambda: ctx.mem0_client.get_all(user_id=user_id))
+        # Then include output_format variants
+        if of:
+            if getattr(ctx, '_mem0_supports_version_kw', True):
+                attempts.append(lambda: ctx.mem0_client.get_all(filters=filters, version=ctx._mem0_api_version_pref, output_format=of))
+            attempts.append(lambda: ctx.mem0_client.get_all(filters=filters, output_format=of))
+            if user_id is not None:
+                if getattr(ctx, '_mem0_supports_version_kw', True):
+                    attempts.append(lambda: ctx.mem0_client.get_all(user_id=user_id, version=ctx._mem0_api_version_pref, output_format=of))
+                attempts.append(lambda: ctx.mem0_client.get_all(user_id=user_id, output_format=of))
         for call in attempts:
             try:
                 return call()

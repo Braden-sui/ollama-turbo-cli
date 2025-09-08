@@ -8,7 +8,7 @@ from typing import Dict, Optional
 from urllib.parse import urlparse
 from urllib import robotparser
 from .config import WebConfig
-from .fetch import _httpx_client
+import httpx
 
 
 @dataclass
@@ -66,8 +66,9 @@ class RobotsPolicy:
         robots_url = f"{urlparse(base).scheme}://{host}/robots.txt"
         try:
             headers = {"User-Agent": self.cfg.user_agent, "Accept": "text/plain,*/*;q=0.1"}
-            with _httpx_client(self.cfg) as client:
-                resp = client.get(robots_url, headers=headers, timeout=self.cfg.timeout_read)
+            # Local client avoids circular import on fetch
+            with httpx.Client(timeout=self.cfg.timeout_read, headers={"User-Agent": self.cfg.user_agent}, follow_redirects=True) as client:
+                resp = client.get(robots_url, headers=headers)
                 raw = resp.text if resp.status_code == 200 else ''
         except Exception:
             raw = ''

@@ -9,9 +9,9 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import quote_plus, urlparse, urljoin, parse_qs, unquote
 import xml.etree.ElementTree as ET
 import gzip
+import httpx
 
 from .config import WebConfig
-from .fetch import _httpx_client
 
 
 @dataclass
@@ -88,11 +88,10 @@ def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
     sitemaps: List[str] = []
     try:
         headers = {"User-Agent": cfg.user_agent, "Accept": "text/plain, */*"}
-        timeout = cfg.sitemap_timeout_s
-        with _httpx_client(cfg) as c:
+        with httpx.Client(timeout=cfg.sitemap_timeout_s, headers=headers, follow_redirects=cfg.follow_redirects) as c:
             # robots.txt discovery
             try:
-                r = c.get(urljoin(base, "/robots.txt"), headers=headers, timeout=timeout)
+                r = c.get(urljoin(base, "/robots.txt"))
                 if r.status_code == 200 and isinstance(r.text, str):
                     for line in r.text.splitlines():
                         if line.lower().startswith("sitemap:"):
@@ -103,7 +102,7 @@ def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
                 pass
             # common default
             try:
-                r2 = c.get(urljoin(base, "/sitemap.xml"), headers=headers, timeout=timeout)
+                r2 = c.get(urljoin(base, "/sitemap.xml"))
                 if r2.status_code == 200:
                     sitemaps.append(str(r2.request.url))
             except Exception:
@@ -130,8 +129,8 @@ def _parse_sitemap_urls(sitemap_url: str, cfg: WebConfig, *, limit: int, include
     urls: List[str] = []
     try:
         headers = {"User-Agent": cfg.user_agent, "Accept": "application/xml,text/xml,application/rss+xml,application/gzip"}
-        with _httpx_client(cfg) as c:
-            r = c.get(sitemap_url, headers=headers, timeout=cfg.sitemap_timeout_s)
+        with httpx.Client(timeout=cfg.sitemap_timeout_s, headers=headers, follow_redirects=cfg.follow_redirects) as c:
+            r = c.get(sitemap_url)
             if r.status_code != 200:
                 return []
             content: bytes

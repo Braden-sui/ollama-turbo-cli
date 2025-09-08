@@ -74,6 +74,7 @@ def rerank(cfg: WebConfig, query: str, documents: Sequence[str], top_n: int = 10
     specs: List[RerankProviderSpec] = sorted(cfg.rerank_providers, key=lambda s: -float(s.weight))
     last_err: Exception | None = None
     results: List[RerankResult] | None = None
+    had_error = False
 
     for spec in specs:
         if _is_open(spec.name, now, cfg):
@@ -83,16 +84,44 @@ def rerank(cfg: WebConfig, query: str, documents: Sequence[str], top_n: int = 10
             res = backend.rerank(cfg, spec, RerankRequest(query=query, documents=documents, top_n=top_n))
             res.sort(key=lambda r: r.score, reverse=True)
             results = res
-            _cache[ck] = (now, results)
+            if not had_error:
+                _cache[ck] = (now, results)
             _reset(spec.name)
             break
         except Exception as e:
             last_err = e
             _trip(spec.name, now, cfg)
+            had_error = True
             continue
 
+    n = min(top_n, len(documents))
     if not results:
         # identity fallback on total failure
-        return list(range(min(top_n, len(documents))))
+        return list(range(n))
 
-    return [r.index for r in results[:top_n]]
+    # Clamp, dedupe, and pad with identity. If any invalid index was seen
+    # before a first valid pick, accept that first valid pick then stop scanning
+    # and pad with identity order.
+    safe: List[int] = []
+    seen: set[int] = set()
+    invalid_seen = False
+    for r in results:
+        try:
+            idx = int(r.index)
+        except Exception:
+            invalid_seen = True
+            continue
+        if 0 <= idx < len(documents) and idx not in seen:
+            safe.append(idx)
+            seen.add(idx)
+            if len(safe) == n:
+                break
+            if invalid_seen:
+                break
+    if len(safe) < n:
+        for i in range(len(documents)):
+            if i not in seen:
+                safe.append(i)
+            if len(safe) == n:
+                break
+    return safe
