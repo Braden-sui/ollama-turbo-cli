@@ -112,6 +112,18 @@ class ReasoningInjectionConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Prompt presentation preferences.
+
+    verbosity: 'concise' | 'detailed' — controls style line in system prompts.
+    fewshots: include few-shot section (disabled by default to preserve behavior).
+    verbose_after_tools: use the more verbose post-tool reprompt (off by default).
+    """
+    verbosity: str = field(default_factory=lambda: (os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower())
+    fewshots: bool = field(default_factory=lambda: _env_bool("PROMPT_FEWSHOTS", False))
+    verbose_after_tools: bool = field(default_factory=lambda: _env_bool("PROMPT_VERBOSE_AFTER_TOOLS", False))
+
+@dataclass
 class ToolingConfig:
     enabled: bool = True
     print_limit: int = 2000
@@ -281,6 +293,7 @@ class ClientRuntimeConfig:
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     tooling: ToolingConfig = field(default_factory=ToolingConfig)
     reasoning_injection: ReasoningInjectionConfig = field(default_factory=ReasoningInjectionConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
     mem0: Mem0Config = field(default_factory=Mem0Config)
     reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)

@@ -17,15 +17,27 @@ from . import plugin_loader
 class PromptManager:
     """Builds and returns prompt strings used across the client."""
 
-    def __init__(self, reasoning: str) -> None:
+    def __init__(self, reasoning: str, *, verbosity: str | None = None, verbose_after_tools: bool | None = None, fewshots: bool | None = None) -> None:
         self.reasoning = reasoning
+        # Defaults preserve previous behavior (concise, no fewshots, compact after-tools reprompt)
+        try:
+            self.verbosity = (verbosity or os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower()
+        except Exception:
+            self.verbosity = "concise"
+        try:
+            self.verbose_after_tools = bool(verbose_after_tools if verbose_after_tools is not None else ((os.getenv("PROMPT_VERBOSE_AFTER_TOOLS") or "0").lower() in {"1","true","yes","on"}))
+        except Exception:
+            self.verbose_after_tools = False
+        try:
+            self.fewshots = bool(fewshots if fewshots is not None else ((os.getenv("PROMPT_FEWSHOTS") or "0").lower() in {"1","true","yes","on"}))
+        except Exception:
+            self.fewshots = False
 
     # ---------- System / Initial Prompt ----------
     def initial_system_prompt(self) -> str:
-        import os
-        verbosity = (os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower()
+        verbosity = (self.verbosity or "concise").lower()
         style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
-        return (
+        base = (
             "You are GPT-OSS running with Harmony channels.\n\n"
             "— Reasoning —\n"
             f"• Reasoning: {self.reasoning}\n\n"
@@ -46,14 +58,18 @@ class PromptManager:
             "— Formatting —\n"
             "• Use clear paragraphs or short bullets when synthesizing.\n"
         )
+        # Preserve behavior: fewshots off by default; include only when explicitly enabled
+        if getattr(self, "fewshots", False):
+            base = base + "\n" + self.few_shots_block()
+        return base
 
     def deepseek_system_prompt(self) -> str:
         """Minimal, neutral system prompt tailored for DeepSeek Chat (v3.x).
 
         Avoids Harmony-specific markup and focuses on clarity and focus.
-        Controlled by PROMPT_VERBOSITY similar to the default prompt.
+        Controlled by PromptManager.verbosity similar to the default prompt.
         """
-        verbosity = (os.getenv("PROMPT_VERBOSITY", "concise") or "concise").lower()
+        verbosity = (self.verbosity or "concise").lower()
         style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
         return (
             "You are a helpful AI assistant.\n"
@@ -66,8 +82,7 @@ class PromptManager:
 
     # ---------- Post-Tool Reprompt ----------
     def reprompt_after_tools(self) -> str:
-        import os
-        verbose = (os.getenv("PROMPT_VERBOSE_AFTER_TOOLS", "0") or "0").lower() in {"1","true","yes","on"}
+        verbose = bool(getattr(self, "verbose_after_tools", False))
         if verbose:
             return (
                 "Using the tool results above, produce <|channel|>final with:\n"

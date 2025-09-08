@@ -220,8 +220,19 @@ class OllamaTurboClient:
             headers={'Authorization': api_key}
         )
         
-        # Prompt management
-        self.prompt = PromptManager(self.reasoning)
+        # Prompt management (centralized via cfg.prompt)
+        try:
+            if cfg is not None and getattr(cfg, 'prompt', None):
+                self.prompt = PromptManager(
+                    self.reasoning,
+                    verbosity=str(cfg.prompt.verbosity or 'concise'),
+                    verbose_after_tools=bool(cfg.prompt.verbose_after_tools),
+                    fewshots=bool(cfg.prompt.fewshots),
+                )
+            else:
+                self.prompt = PromptManager(self.reasoning)
+        except Exception:
+            self.prompt = PromptManager(self.reasoning)
         # Harmony parsing/markup processing
         self.harmony = HarmonyProcessor()
         # Reliability integration facade (Phase F)
