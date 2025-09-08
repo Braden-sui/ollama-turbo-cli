@@ -5,6 +5,7 @@ import hashlib
 import time
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .robots import RobotsPolicy
@@ -270,6 +271,72 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
 
+    # Wikipedia-guided expansion: use Wikipedia only for discovery.
+    # For any Wikipedia results, fetch and extract external reference links,
+    # and add those links as new candidates (skipping Wikipedia itself).
+    wiki_refs_added = 0
+    try:
+        def _is_wiki(u: str) -> bool:
+            try:
+                h = (urlparse(u).hostname or '').lower().strip('.')
+                return bool(h) and (h == 'wikipedia.org' or h.endswith('.wikipedia.org'))
+            except Exception:
+                return False
+
+        expanded: List[SearchResult] = []
+        seen_set: set[str] = set()
+        # Keep non-wiki results as-is
+        for sr in results:
+            if not _is_wiki(sr.url):
+                if sr.url and sr.url not in seen_set:
+                    expanded.append(sr)
+                    seen_set.add(sr.url)
+        # Expand refs from wiki pages (bounded)
+        for sr in results:
+            if not _is_wiki(sr.url):
+                continue
+            try:
+                f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=False)
+                if not f.ok:
+                    continue
+                meta = {
+                    'url': f.url,
+                    'final_url': f.final_url,
+                    'status': f.status,
+                    'content_type': f.content_type,
+                    'body_path': f.body_path,
+                    'headers': f.headers,
+                }
+                ex = extract_content(meta, cfg=cfg)
+                if not ex.ok:
+                    continue
+                md = ex.markdown or ''
+                links = re.findall(r'https?://[^\s\)\]\>\"\']+', md)
+                # Filter external links (non-wikipedia) and dedupe
+                filtered: List[str] = []
+                for lk in links:
+                    if _is_wiki(lk):
+                        continue
+                    if lk not in seen_set:
+                        filtered.append(lk)
+                        seen_set.add(lk)
+                # Add up to 8 references per wiki page to bound fanout
+                for lk in filtered[:8]:
+                    try:
+                        host = (urlparse(lk).hostname or '')
+                    except Exception:
+                        host = ''
+                    title = host or lk
+                    expanded.append(SearchResult(title=title, url=lk, snippet='', source='wiki_ref', published=None))
+                    wiki_refs_added += 1
+            except Exception:
+                continue
+        # Replace results with expanded list if we added anything
+        if wiki_refs_added > 0:
+            results = expanded
+    except Exception:
+        pass
+
     citations: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
     # Dedupe across URLs and content bodies (current-run only)
@@ -484,6 +551,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     'failed': len([it for it in items if not it.get('ok')]),
                     'dedupe_skips': dedup_skips,
                     'excluded': excluded_skips,
+                    'wiki_refs_added': wiki_refs_added,
                 },
             }
         except Exception:

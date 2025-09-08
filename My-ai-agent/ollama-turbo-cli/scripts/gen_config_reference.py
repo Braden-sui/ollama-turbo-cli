@@ -129,6 +129,36 @@ def main() -> int:
     ]
     for name, dc in sections:
         print(_dump_dataclass(name, dc))
+
+    # Operational guidance / notes (static prose)
+    print("""
+### Environment precedence and loading
+
+- The CLI (`src/cli.py`) and API (`src/api/app.py`) load `.env.local` first (override=True), then `.env` (override=False).
+- The web pipeline (`src/web/pipeline.py`) also loads `.env.local` then `.env` on import, so tests and direct imports see the same defaults.
+- Programmatic configs set via `src.web.pipeline.set_default_config(cfg.web)` take precedence when callers supply a central `ClientRuntimeConfig`.
+
+### Permissive profile (example .env.local)
+
+```
+WEB_RESPECT_ROBOTS=0
+WEB_HEAD_GATING=0
+SANDBOX_NET_ALLOW=*
+WEB_UA=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
+WEB_DEBUG_METRICS=1
+```
+
+### Citation policy: exclude certain domains
+
+- Set `WEB_EXCLUDE_CITATION_DOMAINS` to a comma-separated list (e.g., `wikipedia.org,reddit.com`).
+- These domains will be used for discovery (search), but they will not be quoted as citations in `run_research()`.
+
+### Wikipedia-guided expansion
+
+- When Wikipedia results appear in search, the pipeline fetches the page, extracts external links from the content, and adds those links as candidates.
+- Wikipedia hosts are excluded from citations when `WEB_EXCLUDE_CITATION_DOMAINS` includes `wikipedia.org`.
+- Debug counters include `excluded` (filtered candidates) and `wiki_refs_added` (external references added from Wikipedia pages).
+""")
     return 0
 
 
