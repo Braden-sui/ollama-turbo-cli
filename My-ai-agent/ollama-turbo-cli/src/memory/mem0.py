@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 from ..utils import truncate_text
+import re
 
 
 
@@ -462,11 +463,28 @@ class Mem0Service:
             return
         if not user_message and not assistant_message:
             return
+        # Sanitize and filter before persisting to avoid storing orchestration/control tokens
+        u_clean = self._sanitize_for_mem0(ctx, user_message)
+        a_clean = self._sanitize_for_mem0(ctx, assistant_message)
+        # Drop low-value control fragments (e.g., 'use web', 'final') for assistant
+        if self._looks_low_value(a_clean):
+            a_clean = ""
+        # Do not drop short user acks unless they look like pure control tokens
+        if self._looks_low_value(u_clean):
+            if re.fullmatch(r"(?i)^(final|done|ok)$", (u_clean or "").strip()):
+                u_clean = ""
+        # If both are empty after sanitization, skip persistence
+        if not ((u_clean or "").strip() or (a_clean or "").strip()):
+            try:
+                ctx._trace("mem0:add:skip:empty")
+            except Exception:
+                pass
+            return
         messages: List[Dict[str, str]] = []
-        if user_message:
-            messages.append({"role": "user", "content": user_message})
-        if assistant_message:
-            messages.append({"role": "assistant", "content": assistant_message})
+        if (u_clean or "").strip():
+            messages.append({"role": "user", "content": u_clean})
+        if (a_clean or "").strip():
+            messages.append({"role": "assistant", "content": a_clean})
         metadata: Dict[str, Any] = {
             "source": "chat",
             "category": "inferred",
@@ -487,6 +505,65 @@ class Mem0Service:
         except Exception:
             self.enqueue_add(ctx, messages, metadata)
         ctx._trace("mem0:add:queued")
+
+    # ------------------ Sanitization helpers ------------------
+    def _sanitize_for_mem0(self, ctx, text: Optional[str]) -> str:
+        """Strip Harmony markup and obvious orchestration directives before persisting.
+
+        Uses ctx._strip_harmony_markup when available, removes residual control tokens,
+        trims reprompt scaffolding, and normalizes whitespace.
+        """
+        s = text or ""
+        if not s:
+            return ""
+        # Use the client's Harmony stripper if available
+        try:
+            if hasattr(ctx, '_strip_harmony_markup') and callable(getattr(ctx, '_strip_harmony_markup')):
+                s = ctx._strip_harmony_markup(s)
+        except Exception:
+            pass
+        # Remove any lingering Harmony channel/control tokens
+        try:
+            s = re.sub(r"<\|channel\|>\s*(?:commentary|final|analysis)\b[^\n<]*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"<\|message\|>|<\|call\|>|<\|end\|>", "", s, flags=re.IGNORECASE)
+        except Exception:
+            pass
+        # Remove explicit after-tools reprompt scaffolding if leaked
+        try:
+            s = re.sub(r"(?is)\bBased on the tool results above,\s*produce\s*<\|channel\|>\s*final\b.*$", "", s).strip()
+        except Exception:
+            s = s.strip()
+        # Collapse whitespace
+        try:
+            s = re.sub(r"\s+", " ", s).strip()
+        except Exception:
+            s = s.strip()
+        return s
+
+    def _looks_low_value(self, s: Optional[str]) -> bool:
+        """Heuristics to avoid persisting control/planning fragments like 'use web' or 'final'."""
+        t = (s or "").strip()
+        if not t:
+            return True
+        # Extremely short non-informative tokens
+        if len(t) <= 3:
+            return True
+        # Common control/planning phrases
+        patterns = [
+            r"(?i)^final$",
+            r"(?i)^done$",
+            r"(?i)^ok$",
+            r"(?i)^(use|call|invoke)\s+(web|tool|function|search)\b",
+            r"(?i)^(planning|analysis)[: ]?\b",
+            r"(?i)^produce\s*final\b",
+        ]
+        for p in patterns:
+            try:
+                if re.search(p, t):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def enqueue_add(self, ctx, messages: List[Dict[str, str]], metadata: Dict[str, Any]) -> None:
         try:

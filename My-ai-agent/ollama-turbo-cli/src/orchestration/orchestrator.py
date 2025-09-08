@@ -58,6 +58,13 @@ class ChatTurnOrchestrator:
         keep_val = ctx._resolve_keep_alive()
         if keep_val is not None:
             kwargs['keep_alive'] = keep_val
+        # Per-turn idempotency key (transport will honor it across retries/reconnects)
+        try:
+            idem = getattr(ctx, '_current_idempotency_key', None)
+            if idem:
+                kwargs['idempotency_key'] = idem
+        except Exception:
+            pass
         return kwargs
 
     def format_reprompt_after_tools(
@@ -207,6 +214,13 @@ class ChatTurnOrchestrator:
                         kwargs['options'] = options
 
                 # Optional request-level reasoning injection
+                # Supply per-turn idempotency to transport
+                try:
+                    idem = getattr(ctx, '_current_idempotency_key', None)
+                    if idem:
+                        kwargs['idempotency_key'] = idem
+                except Exception:
+                    pass
                 ctx._maybe_inject_reasoning(kwargs)
 
                 ctx._trace(f"request:standard:round={rounds}{' tools' if include_tools else ''}")

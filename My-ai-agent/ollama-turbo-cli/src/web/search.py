@@ -12,6 +12,7 @@ import gzip
 import httpx
 
 from .config import WebConfig
+from .fetch import _httpx_client
 
 
 @dataclass

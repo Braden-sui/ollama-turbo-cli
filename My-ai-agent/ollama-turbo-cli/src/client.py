@@ -24,6 +24,8 @@ from .harmony_processor import HarmonyProcessor
 from .reliability_integration.integration import ReliabilityIntegration
 from .protocols import get_adapter
 from .transport import networking as _net
+from .transport.http import TransportHttpClient
+from .transport.policy import RetryPolicy
 from .streaming import runner as _runner, standard as _standard
 from .tools_runtime.executor import ToolRuntimeExecutor
 from .memory.mem0 import Mem0Service
@@ -211,14 +213,31 @@ class OllamaTurboClient:
         self._last_citations_map: Dict[str, Any] = {}
         self._system_cited_cache: Optional[str] = None
 
-        # Initialize Ollama client with authentication
+        # Initialize SDK client and wrap with transport policy (retries, idempotency, keep-alive)
         # Note: Ollama Turbo uses Authorization header without 'Bearer' prefix
         resolved_host = self._resolve_host(self.engine)
         self.host = resolved_host
-        self.client = Client(
+        _sdk_client = Client(
             host=resolved_host,
             headers={'Authorization': api_key}
         )
+        # Retry/backoff policy (transport owns retries now)
+        rp = RetryPolicy(
+            max_retries=(int(cfg.retry.max_retries) if (cfg is not None) else int(self.cli_max_retries)),
+        )
+        self.client = TransportHttpClient(
+            _sdk_client,
+            host=resolved_host,
+            connect_timeout_s=float(self.cli_connect_timeout_s),
+            read_timeout_s=float(self.cli_read_timeout_s),
+            warm_models=bool(self.warm_models),
+            keep_alive_raw=self.ollama_keep_alive_raw,
+            retry_policy=rp,
+            logger=self.logger,
+            trace_hook=self._trace,
+        )
+        # Disable client-level retry wrappers to avoid double retrying; transport handles it
+        self.cli_retry_enabled = False
         
         # Prompt management (centralized via cfg.prompt)
         try:
@@ -278,12 +297,16 @@ class OllamaTurboClient:
             }
         ]
         # Enforce local history window <= 10 turns (excluding initial system)
+        # Prefer centralized config for history window; fallback to env only when cfg is absent
         try:
-            raw_hist = os.getenv('MAX_CONVERSATION_HISTORY', '10')
-            parsed_hist = int(raw_hist) if str(raw_hist).isdigit() else 10
+            if self._cfg is not None and getattr(self._cfg, 'history', None):
+                self.max_history = max(2, min(int(self._cfg.history.max_history), 10))
+            else:
+                raw_hist = os.getenv('MAX_CONVERSATION_HISTORY', '10')
+                parsed_hist = int(raw_hist) if str(raw_hist).isdigit() else 10
+                self.max_history = max(2, min(parsed_hist, 10))
         except Exception:
-            parsed_hist = 10
-        self.max_history = max(2, min(parsed_hist, 10))
+            self.max_history = 10
         
         # Set up tools if enabled (use copies to avoid global mutation leaks).
         # Access plugin aggregates lazily to avoid import-time plugin loading.
@@ -471,7 +494,11 @@ class OllamaTurboClient:
                         mem0_block = c
                         break
             # Respect env flag: only remove and merge when explicitly enabled
-            prefer_merge = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+            # Centralized control: prefer cfg-provided switch; fall back to env only when cfg missing
+            try:
+                prefer_merge = bool(self.mem0_config.get('in_first_system', False))
+            except Exception:
+                prefer_merge = str(os.getenv('MEM0_IN_FIRST_SYSTEM', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
             if prefer_merge and (not mem0_in_first) and (latest_idx is not None and mem0_block):
                 # Remove that block so the adapter can merge into first system
                 msgs = msgs[:latest_idx] + msgs[latest_idx + 1:]
@@ -597,6 +624,14 @@ class OllamaTurboClient:
         if self.show_trace:
             self.trace = []
         self._skip_mem0_after_turn = False
+        # Generate a stable Idempotency-Key for this turn; transport will reuse
+        # it across any internal retries/reconnections. Downstream call sites
+        # (standard/streaming) will pass this in kwargs.
+        try:
+            self._current_idempotency_key = str(uuid.uuid4())
+            self._trace(f"idempotency:set {self._current_idempotency_key}")
+        except Exception:
+            self._current_idempotency_key = None
         self._trace(f"chat:start stream={'on' if stream else 'off'}")
 
         # Inject relevant memories BEFORE user message (one system block per turn)
@@ -622,9 +657,6 @@ class OllamaTurboClient:
         # Trim history if needed
         self._trim_history()
         
-        # Generate a fresh Idempotency-Key per turn (reused across retries/reconnects)
-        self._current_idempotency_key = str(uuid.uuid4())
-        self._set_idempotency_key(self._current_idempotency_key)
         try:
             if stream:
                 result = self._handle_streaming_chat()
@@ -644,8 +676,7 @@ class OllamaTurboClient:
             self._print_trace()
             return error_msg
         finally:
-            # Clear idempotency header after the turn
-            self._clear_idempotency_key()
+            pass
     
     def _handle_standard_chat(self, *, _suppress_errors: bool = False) -> str:
         """Handle non-streaming chat interaction (delegated) with dynamic retries."""

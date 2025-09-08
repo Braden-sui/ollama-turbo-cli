@@ -12,6 +12,75 @@ from dataclasses import asdict
 
 from .core.config import ClientRuntimeConfig
 
+# Ensure .env.local/.env are honored even when importing this module directly (e.g., python -c ...)
+# This mirrors the behavior in src/cli.py but is safe and no-op if python-dotenv is unavailable.
+try:
+    from dotenv import load_dotenv, find_dotenv  # type: ignore
+    try:
+        path_local = find_dotenv('.env.local', usecwd=True)
+        if path_local:
+            load_dotenv(path_local, override=True)
+    except Exception:
+        pass
+    try:
+        path_default = find_dotenv('.env', usecwd=True)
+        if path_default:
+            load_dotenv(path_default, override=False)
+    except Exception:
+        pass
+except Exception:
+    # Fallback: minimal manual loader to honor .env.local and .env without python-dotenv
+    import os
+
+    def _find_upwards(filename: str) -> str:
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            return ""
+        cur = cwd
+        while True:
+            cand = os.path.join(cur, filename)
+            if os.path.isfile(cand):
+                return cand
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+        return ""
+
+    def _load_env_file(path: str, *, override: bool) -> None:
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith('#'):
+                        continue
+                    if '=' not in s:
+                        continue
+                    k, v = s.split('=', 1)
+                    key = k.strip()
+                    val = v.strip().strip('"').strip("'")
+                    if override or (key not in os.environ):
+                        os.environ[key] = val
+        except Exception:
+            # Best-effort; ignore malformed lines
+            pass
+
+    try:
+        p_local = _find_upwards('.env.local')
+        if p_local:
+            _load_env_file(p_local, override=True)
+    except Exception:
+        pass
+    try:
+        p_env = _find_upwards('.env')
+        if p_env:
+            _load_env_file(p_env, override=False)
+    except Exception:
+        pass
+
 
 def from_env(*, model: Optional[str] = None,
              protocol: Optional[str] = None,

@@ -245,9 +245,23 @@ def _env_proxy_for_scheme(scheme: str) -> Optional[str]:
     return None
 
 
-def _proxy_enabled_for_host(scheme: str, host: str, allow_proxies: bool) -> bool:
+def _proxy_enabled_for_host(scheme: str, host: str, allow_proxies: bool, cfg: Optional['WebConfig'] = None) -> bool:
+    """Return True if a proxy applies for the given scheme/host under policy.
+
+    When cfg is provided, prefer cfg-defined proxies and no_proxy; otherwise fall back to env.
+    """
     if not allow_proxies:
         return False
+    if cfg is not None:
+        # Prefer ALL_PROXY, then scheme-specific
+        proxy_url = (cfg.all_proxy or (
+            (cfg.https_proxy if scheme == 'https' else cfg.http_proxy) or cfg.http_proxy
+        ))
+        if not proxy_url:
+            return False
+        no_proxy = cfg.no_proxy or ''
+        return not _bypass_proxy(host, no_proxy)
+    # Env fallbacks
     proxy_url = _env_proxy_for_scheme(scheme) or _env_proxy_for_scheme('http')
     if not proxy_url:
         return False
@@ -319,8 +333,9 @@ def fetch_via_policy(
             return {'ok': False, 'error': f'Host is blocklisted: {a_host}'}
 
     # SSRF block and local resolution policy w/ remote DNS consideration
-    use_proxy_initial = _proxy_enabled_for_host(parsed.scheme, a_host, allow_proxies)
-    if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
+    use_proxy_initial = _proxy_enabled_for_host(parsed.scheme, a_host, allow_proxies, cfg)
+    block_priv = (cfg.block_private_ips if cfg is not None else _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True))
+    if block_priv:
         if _is_ip_literal(a_host):
             _resolve_and_check(a_host)
         else:
@@ -440,23 +455,49 @@ def fetch_via_policy(
     redirects = 0
     try:
         with requests.Session() as s:
-            # Control environment trust for proxies explicitly
-            try:
-                s.trust_env = bool(allow_proxies)
-            except Exception:
-                pass
-            # Merge environment settings (verify/cert/proxies)
-            settings = s.merge_environment_settings(url, {}, None, True, None)
-            # Compute proxies: ignore unless explicitly allowed
-            proxies = settings.get('proxies', None) if allow_proxies else {}
-            # Respect NO_PROXY patterns explicitly when proxies are allowed
-            if allow_proxies:
+            # Build connection settings
+            if cfg is not None:
+                # When cfg is provided, avoid inheriting proxy envs
                 try:
-                    no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
-                    if _bypass_proxy(a_host, no_proxy):
-                        proxies = {}
+                    s.trust_env = False
                 except Exception:
                     pass
+                settings = s.merge_environment_settings(url, {}, None, True, None)
+                # Compute proxies from cfg when allowed
+                if allow_proxies:
+                    proxies = {}
+                    # Prefer ALL_PROXY; otherwise scheme-specific
+                    if cfg.all_proxy:
+                        proxies = {'http': cfg.all_proxy, 'https': cfg.all_proxy}
+                    else:
+                        if cfg.http_proxy:
+                            proxies['http'] = cfg.http_proxy
+                        if cfg.https_proxy:
+                            proxies['https'] = cfg.https_proxy
+                    # Apply NO_PROXY-style bypass
+                    try:
+                        npats = cfg.no_proxy or ''
+                        if _bypass_proxy(a_host, npats):
+                            proxies = {}
+                    except Exception:
+                        pass
+                else:
+                    proxies = {}
+            else:
+                # Env-based fallback behavior
+                try:
+                    s.trust_env = bool(allow_proxies)
+                except Exception:
+                    pass
+                settings = s.merge_environment_settings(url, {}, None, True, None)
+                proxies = settings.get('proxies', None) if allow_proxies else {}
+                if allow_proxies:
+                    try:
+                        no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
+                        if _bypass_proxy(a_host, no_proxy):
+                            proxies = {}
+                    except Exception:
+                        pass
             resp = s.request(
                 method=m,
                 url=url,
@@ -487,11 +528,11 @@ def fetch_via_policy(
                 elif net_mode == 'blocklist':
                     if _host_blocked(h_host, cfg):
                         return {'ok': False, 'error': f'Redirected to blocklisted host: {h_host}'}
-                if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
+                if block_priv:
                     if _is_ip_literal(h_host):
                         _resolve_and_check(h_host)
                     else:
-                        if not _proxy_enabled_for_host(p.scheme or parsed.scheme, h_host, allow_proxies):
+                        if not _proxy_enabled_for_host(p.scheme or parsed.scheme, h_host, allow_proxies, cfg):
                             _resolve_and_check(h_host)
             # Revalidate final URL host/scheme as well
             f_parsed = urlparse(final_url)
@@ -504,11 +545,11 @@ def fetch_via_policy(
             elif net_mode == 'blocklist':
                 if _host_blocked(f_host, cfg):
                     return {'ok': False, 'error': f'Final host is blocklisted: {f_host}'}
-            if _env_bool('SANDBOX_BLOCK_PRIVATE_IPS', True):
+            if block_priv:
                 if _is_ip_literal(f_host):
                     _resolve_and_check(f_host)
                 else:
-                    if not _proxy_enabled_for_host(f_parsed.scheme or parsed.scheme, f_host, allow_proxies):
+                    if not _proxy_enabled_for_host(f_parsed.scheme or parsed.scheme, f_host, allow_proxies, cfg):
                         _resolve_and_check(f_host)
 
             # Best-effort post-connect peer IP verification (may not work across adapters)

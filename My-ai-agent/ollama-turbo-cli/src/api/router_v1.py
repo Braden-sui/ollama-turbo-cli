@@ -113,13 +113,7 @@ async def chat_stream(
                 client._trim_history()
             except Exception:
                 pass
-            # Set an idempotency key for this turn
-            try:
-                key = str(uuid.uuid4())
-                client._current_idempotency_key = key
-                client._set_idempotency_key(key)
-            except Exception:
-                pass
+            # Idempotency is managed by the transport layer now; no manual header management here
 
             # Create initial stream
             try:
@@ -341,9 +335,7 @@ async def chat_stream(
             yield f"event: summary\n"
             yield f"data: {json.dumps(summary)}\n\n"
         finally:
-            try:
-                client._clear_idempotency_key()
-            except Exception:
-                pass
+            # Transport clears idempotency when stream completes
+            pass
 
     return StreamingResponse(sse_gen(), media_type="text/event-stream")

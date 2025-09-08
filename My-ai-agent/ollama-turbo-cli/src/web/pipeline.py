@@ -354,6 +354,23 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     # Deterministic order: by score if available then by url hash
     citations.sort(key=lambda c: (c.get('risk', ''), hashlib.sha256(c.get('canonical_url','').encode()).hexdigest()))
 
+    # Fallback: if no citations were produced, retry once with force_refresh=True to bypass
+    # potentially stale caches or transient extraction failures.
+    if not citations and not force_refresh:
+        try:
+            _progress.emit_current({"stage": "fallback", "status": "refresh"})
+        except Exception:
+            pass
+        return run_research(
+            query,
+            cfg=cfg,
+            site_include=site_include,
+            site_exclude=site_exclude,
+            freshness_days=freshness_days,
+            top_k=top_k,
+            force_refresh=True,
+        )
+
     answer = {
         'query': query,
         'top_k': top_k,
