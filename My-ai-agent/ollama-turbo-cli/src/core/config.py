@@ -302,6 +302,25 @@ class WebConfig:
     sitemap_max_urls: int = field(default_factory=lambda: _env_int("WEB_SITEMAP_MAX_URLS", 50, min_value=1))
     sitemap_timeout_s: float = field(default_factory=lambda: _env_float("WEB_SITEMAP_TIMEOUT_S", 5.0, min_value=1.0))
     sitemap_include_subs: bool = field(default_factory=lambda: _env_bool("WEB_SITEMAP_INCLUDE_SUBS", True))
+    # Query handling knobs (Commit 1 – defaults preserve current behavior)
+    query_compression_mode: str = field(
+        default_factory=lambda: (os.getenv("WEB_QUERY_COMPRESSION_MODE", "aggressive") or "aggressive").strip().lower()
+    )
+    query_max_tokens_fallback: int = field(
+        default_factory=lambda: _env_int("WEB_QUERY_MAX_TOKENS_FALLBACK", 6, min_value=1)
+    )
+    stopword_profile: str = field(
+        default_factory=lambda: (os.getenv("WEB_STOPWORD_PROFILE", "standard") or "standard").strip().lower()
+    )  # minimal | standard
+    recency_soft_accept_when_empty: bool = field(
+        default_factory=lambda: _env_bool("WEB_RECENCY_SOFT_ACCEPT_WHEN_EMPTY", False)
+    )
+    variant_parallel: bool = field(
+        default_factory=lambda: _env_bool("WEB_VARIANT_PARALLEL", False)
+    )
+    variant_max: int = field(
+        default_factory=lambda: _env_int("WEB_VARIANT_MAX", 2, min_value=0)
+    )
 
 @dataclass
 class ClientRuntimeConfig:

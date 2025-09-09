@@ -9,6 +9,11 @@ class ChatOptions(BaseModel):
         default="object",
         description="How to return tool results: legacy 'string' for backward-compat, or 'object' for structured results.",
     )
+    # Optional web retrieval profile mapping (Commit 1 – non-breaking)
+    web_profile: Optional[Literal['quick', 'balanced', 'rigorous']] = Field(
+        default=None,
+        description="Optional retrieval profile: quick|balanced|rigorous. Defaults to rigorous behavior (unchanged).",
+    )
 
 
 class ChatRequest(BaseModel):

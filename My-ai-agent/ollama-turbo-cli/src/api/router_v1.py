@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from .models import ChatRequest, ChatResponse
 from .deps import get_api_key, get_idempotency_key
 from src.client import OllamaTurboClient
+from src.core.config import ClientRuntimeConfig
 from src.web import progress as _web_progress
 
 router = APIRouter(prefix="/v1", tags=["v1"]) 
@@ -21,6 +22,29 @@ def _resolve_tool_results_format(req_opt: Optional[dict]) -> str:
         return req_opt["tool_results_format"]
     env = (os.getenv("TOOL_RESULTS_FORMAT") or "object").strip().lower()
     return "object" if env == "object" else "string"
+
+
+def _build_client_cfg_from_options(options) -> ClientRuntimeConfig:
+    """Construct a per-request ClientRuntimeConfig and map optional web_profile to WebConfig overrides.
+
+    Defaults preserve existing behavior (aggressive compression; no soft-accept).
+    """
+    cfg = ClientRuntimeConfig.from_env()
+    profile = None
+    try:
+        profile = getattr(options, 'web_profile', None) if options is not None else None
+    except Exception:
+        profile = None
+    if profile == 'quick':
+        cfg.web.query_compression_mode = 'soft'
+        cfg.web.query_max_tokens_fallback = 12
+        cfg.web.recency_soft_accept_when_empty = True
+    elif profile == 'balanced':
+        cfg.web.query_compression_mode = 'soft'
+        cfg.web.query_max_tokens_fallback = 12
+        # recency soft-accept remains default (False) for balanced
+    # 'rigorous' or None → leave defaults unchanged
+    return cfg
 
 
 @router.get("/health")
@@ -48,6 +72,7 @@ async def chat(
 ) -> ChatResponse:
     # Instantiate client per request for now; pool/reuse can be added later
     upstream_key = os.getenv("OLLAMA_API_KEY", "") or _api_key
+    cfg = _build_client_cfg_from_options(payload.options)
     client = OllamaTurboClient(
         api_key=upstream_key,
         enable_tools=True,
@@ -59,6 +84,7 @@ async def chat(
         consensus=bool(payload.consensus or False),
         engine=payload.engine,
         eval_corpus=payload.eval_corpus,
+        cfg=cfg,
     )
     fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
     # Respect API-level idempotency key in future by exposing a setter in client;
@@ -87,7 +113,8 @@ async def chat_stream(
       and emits a final event: {type: 'final', content: '...'}
     """
     upstream_key = os.getenv("OLLAMA_API_KEY", "") or _api_key
-    client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True)
+    cfg = _build_client_cfg_from_options(payload.options)
+    client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True, cfg=cfg)
     fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
 
     def sse_gen():
