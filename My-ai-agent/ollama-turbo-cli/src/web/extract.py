@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 from .config import WebConfig
+import logging
 from .fetch import _httpx_client
 
 
@@ -55,9 +56,22 @@ def _assess_risk(text: str) -> tuple[str, list[str]]:
 
 
 def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
+    # Silence noisy library loggers
+    try:
+        logging.getLogger("trafilatura").setLevel(logging.ERROR)
+        logging.getLogger("readability.readability").setLevel(logging.ERROR)
+    except Exception:
+        pass
     used = {"trafilatura": False, "readability": False, "jina": False}
-    meta: Dict[str, Any] = {"title": "", "date": None}
+    meta: Dict[str, Any] = {"title": "", "date": None, "lang": ""}
     markdown = ""
+    # Best-effort language detection from html tag
+    try:
+        mlang = re.search(r"<html[^>]*lang=\"([^\"]+)\"", html, flags=re.I)
+        if mlang:
+            meta["lang"] = (mlang.group(1) or '').lower()
+    except Exception:
+        pass
     # Try trafilatura
     try:
         import trafilatura  # type: ignore
@@ -66,6 +80,41 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
             markdown = art
             used["trafilatura"] = True
             meta["title"] = trafilatura.bare_extraction(html).get('title', '') if hasattr(trafilatura, 'bare_extraction') else ''
+            # Try to parse date from common meta tags and JSON-LD
+            try:
+                m = re.search(r"<meta[^>]+property=\"article:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                if m:
+                    meta["date"] = m.group(1)
+                if not meta.get('date'):
+                    m2 = re.search(r"<time[^>]+datetime=\"([^\"]+)\"", html, flags=re.I)
+                    if m2:
+                        meta["date"] = m2.group(1)
+                if not meta.get('date'):
+                    for js in re.findall(r"<script[^>]+type=\"application/ld\+json\"[^>]*>(.*?)</script>", html, flags=re.I|re.S):
+                        try:
+                            data = json.loads(js.strip())
+                        except Exception:
+                            continue
+                        def _find_date(obj):
+                            if isinstance(obj, dict):
+                                if (obj.get('@type') in {'NewsArticle','Article'}) and obj.get('datePublished'):
+                                    return obj.get('datePublished')
+                                for v in obj.values():
+                                    r = _find_date(v)
+                                    if r:
+                                        return r
+                            if isinstance(obj, list):
+                                for it in obj:
+                                    r = _find_date(it)
+                                    if r:
+                                        return r
+                            return None
+                        d = _find_date(data)
+                        if d:
+                            meta['date'] = d
+                            break
+            except Exception:
+                pass
     except Exception:
         pass
     # Fallback readability-lxml
@@ -81,6 +130,13 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
             markdown = f"# {title}\n\n{text.strip()}\n"
             used["readability"] = True
             meta["title"] = title
+            # Best-effort date parse with readability path too
+            try:
+                m = re.search(r"<meta[^>]+property=\"article:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                if m:
+                    meta["date"] = m.group(1)
+            except Exception:
+                pass
         except Exception:
             pass
     return markdown or "", meta, used

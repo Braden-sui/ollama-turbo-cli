@@ -36,3 +36,14 @@ test-results/
 .sandbox/webcache/*.json
 .sandbox
 *.jar
+
+# Keep shared YAML in Git; ignore only local/secret variants
+src/config/local.yaml
+src/config/secrets.yaml
+src/config/*.local.yaml
+src/config/*override*.yaml
+
+# Always ignore env files (except example)
+.env
+.env.*
+!.env.example

@@ -1,0 +1,7 @@
+# Local overrides (not committed). Copy to src/config/local.yaml and edit.
+# Example shape:
+# reliability:
+#   overlap:
+#     threshold: 0.22
+#     multi_cite_policy: any
+#     require_value_match: false

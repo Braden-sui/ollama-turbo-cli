@@ -10,6 +10,7 @@ from urllib.parse import quote_plus, urlparse, urljoin, parse_qs, unquote
 import xml.etree.ElementTree as ET
 import gzip
 import httpx
+from datetime import datetime
 
 from .config import WebConfig
 from .fetch import _httpx_client
@@ -81,6 +82,42 @@ def _norm_host(site: str) -> str:
         return host.strip('/')
     except Exception:
         return site
+
+
+def _is_recency_trigger(text: str, freshness_days: Optional[int]) -> bool:
+    try:
+        if freshness_days and int(freshness_days) > 0:
+            return True
+    except Exception:
+        pass
+    t = (text or "").lower()
+    return any(k in t for k in ["today", "this week", "recent", "recently", "latest", "breaking", "past week", "last week"])
+
+
+def _strip_stale_years(q: str) -> str:
+    """Remove explicit years older than the current year to avoid stale searches."""
+    try:
+        now_y = datetime.now().year
+    except Exception:
+        now_y = 2025
+    # Remove 2010..(current_year-1)
+    years = [str(y) for y in range(2010, max(2010, now_y))]
+    pat = re.compile(r"\b(" + "|".join(map(re.escape, years)) + r")\b") if years else None
+    return pat.sub("", q) if pat else q
+
+
+def _recency_augmented_query(q: SearchQuery) -> str:
+    """Rewrite query for recency: strip stale years and append current month/year token."""
+    base = q.query or ""
+    if _is_recency_trigger(base, q.freshness_days):
+        try:
+            base = _strip_stale_years(base)
+            # Append an absolute month/year token to bias engines
+            label = datetime.now().strftime("%b %Y")  # e.g., "Sep 2025"
+            base = (base.strip() + f" {label}").strip()
+        except Exception:
+            pass
+    return base
 
 
 def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
@@ -216,7 +253,8 @@ def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchRe
     This avoids external API keys and keeps network policy centralized via WebConfig.
     """
     try:
-        qtext = f"site:{q.site} {q.query}" if q.site else q.query
+        aug = _recency_augmented_query(q)
+        qtext = f"site:{q.site} {aug}" if q.site else aug
         headers_json = {"Accept": "application/json", "User-Agent": cfg.user_agent}
         params = {"q": qtext, "format": "json", "no_html": "1", "no_redirect": "1", "t": "ollama-turbo-cli"}
         results: List[SearchResult] = []
@@ -317,9 +355,10 @@ def _search_brave(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        params = {"q": q.query, "count": 10}
+        aug = _recency_augmented_query(q)
+        params = {"q": aug, "count": 10}
         if q.site:
-            params["q"] = f"site:{q.site} {q.query}"
+            params["q"] = f"site:{q.site} {aug}"
         headers = {"X-Subscription-Token": key, "Accept": "application/json", "User-Agent": cfg.user_agent}
         with _httpx_client(cfg) as c:
             r = c.get("https://api.search.brave.com/res/v1/web/search", params=params, headers=headers, timeout=cfg.timeout_read)
@@ -370,9 +409,10 @@ def _search_tavily(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        payload = {"query": q.query, "search_depth": "basic", "max_results": 10}
+        aug = _recency_augmented_query(q)
+        payload = {"query": aug, "search_depth": "basic", "max_results": 10}
         if q.site:
-            payload["query"] = f"site:{q.site} {q.query}"
+            payload["query"] = f"site:{q.site} {aug}"
         headers = {"Content-Type":"application/json", "Authorization": f"Bearer {key}"}
         with _httpx_client(cfg) as c:
             r = c.post("https://api.tavily.com/search", json=payload, headers=headers, timeout=cfg.timeout_read)
@@ -390,9 +430,10 @@ def _search_exa(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        payload = {"query": q.query, "numResults": 10}
+        aug = _recency_augmented_query(q)
+        payload = {"query": aug, "numResults": 10}
         if q.site:
-            payload["query"] = f"site:{q.site} {q.query}"
+            payload["query"] = f"site:{q.site} {aug}"
         headers = {"Content-Type":"application/json", "x-api-key": key}
         with _httpx_client(cfg) as c:
             r = c.post("https://api.exa.ai/search", json=payload, headers=headers, timeout=cfg.timeout_read)
@@ -410,7 +451,8 @@ def _search_google_pse(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key or not cx:
         return []
     try:
-        qtext = f"site:{q.site} {q.query}" if q.site else q.query
+        aug = _recency_augmented_query(q)
+        qtext = f"site:{q.site} {aug}" if q.site else aug
         with _httpx_client(cfg) as c:
             r = c.get("https://www.googleapis.com/customsearch/v1", params={"key": key, "cx": cx, "q": qtext}, timeout=cfg.timeout_read)
             data = r.json()
@@ -441,11 +483,16 @@ def search(query: str, *, cfg: Optional[WebConfig] = None, site: Optional[str] =
     if not candidates:
         try:
             toks = re.findall(r"[A-Za-z0-9]+", query)
+            # Build dynamic year stop set excluding current year
+            try:
+                now_y = datetime.now().year
+            except Exception:
+                now_y = 2025
+            years = {str(y) for y in range(2010, max(2010, now_y))}
             stop = {
                 'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
                 'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
-                '2023','2024','2025'
-            }
+            } | years
             key_toks = [t for t in toks if t.lower() not in stop]
             short_q = " ".join(key_toks[:6]) or query[:80]
         except Exception:

@@ -18,7 +18,10 @@ def _short_allow() -> List[str]:
         return [t.strip().lower() for t in env.split(',') if t.strip()]
     return ['ai','uk','us','eu','fda','sec','q1','q2','q3','q4','ios','gpu','api','llm']
 
-_NUM_RE = re.compile(r"[$€£]?\d{1,3}(?:[\u00A0\u202F ,]\d{3})*(?:[\.,]\d+)?%?|\d+(?:[\.,]\d+)?%?")
+_NUM_RE = re.compile(
+    r"[$€£]?\d{1,3}(?:[\u00A0\u202F ,]\d{3})*(?:[\.,]\d+)?(?:%|[kKmMbB](?:n)?)?"
+    r"|\d+(?:[\.,]\d+)?(?:%|[kKmMbB](?:n)?)?"
+)
 _WORD_RE = re.compile(r"[a-z]{3,}")
 _SHORT_RE = re.compile(r"\b(?:ai|uk|us|eu|fda|sec|q[1-4]|ios|gpu|api|llm)\b", re.I)
 _QY_RE = re.compile(r"\bq([1-4])\s*20(\d{2})\b", re.I)

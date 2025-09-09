@@ -1,0 +1,17 @@
+reliability:
+  overlap:
+    threshold: 0.18
+    discount_word_only_numeric: 0.25
+    require_numeric_match: false
+    require_value_match: false
+    min_claim_tokens: 3
+    multi_cite_policy: union  # union|any|all
+    allow_comma_decimals: true
+    allow_thinspace_thousands: true
+    enable_suffix_normalization: false
+    short_allow: [ai, us, uk, eu, fda, sec, q1, q2, q3, q4, ios, gpu, api, llm]
+    token_weights:
+      announced: 0.3
+      launched: 0.3
+      reported: 0.3
+      shipped: 0.3

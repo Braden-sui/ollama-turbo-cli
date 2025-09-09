@@ -459,6 +459,35 @@ class ChatTurnOrchestrator:
                             ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
                     except Exception as ve:
                         ctx.logger.debug(f"validator skipped: {ve}")
+                    # Auto-repair (enforce mode only): one pass
+                    try:
+                        if isinstance(report, dict) and (ctx.reliability.get('check') == 'enforce') and (not report.get('ok')):
+                            bad = [d for d in (report.get('details') or []) if not d.get('passed')]
+                            if bad:
+                                repair_instructions = (
+                                    "One or more cited sentences lacked sufficient overlap with sources. "
+                                    "Please either (a) quote directly from one cited source (with [n]), (b) soften with hedging, or (c) remove the claim. "
+                                    "Keep inline [n] and ensure numeric claims match exactly after normalization."
+                                )
+                                ctx.conversation_history.append({'role': 'user', 'content': repair_instructions})
+                                resp_fix = ctx.client.chat(model=ctx.model, messages=ctx.conversation_history)
+                                msg_fix = resp_fix.get('message', {})
+                                fixed_text = msg_fix.get('content', '') or ''
+                                # Revalidate once
+                                report2 = Validator(mode='enforce').validate(
+                                    fixed_text,
+                                    getattr(ctx, '_last_context_blocks', []),
+                                    getattr(ctx, '_last_citations_map', {}),
+                                )
+                                # Prefer repaired if ok, else keep original
+                                if isinstance(report2, dict) and report2.get('ok'):
+                                    final_out = fixed_text
+                                    report = report2
+                                    ctx._trace("validator:repair:applied")
+                                else:
+                                    ctx._trace("validator:repair:failed")
+                    except Exception:
+                        pass
 
                     ctx.conversation_history.append({
                         'role': 'assistant',
@@ -483,12 +512,31 @@ class ChatTurnOrchestrator:
                         cits = []
                         for idx, ref in (citations_map.items() if isinstance(citations_map, dict) else []):
                             cits.append({'n': idx, 'title': (ref or {}).get('title'), 'url': (ref or {}).get('url'), 'highlights': []})
+                        # Aggregated overlap telemetry
+                        overlap = (report.get('details') if isinstance(report, dict) else None)
+                        hist = {}
+                        gated = 0
+                        repaired = 0
+                        val_fails = 0
+                        try:
+                            for d in (overlap or []):
+                                s = float(d.get('overlap_score') or 0.0)
+                                b = f"{int(s*5)/5:.1f}-{int((s*5)+1)/5:.1f}"
+                                hist[b] = hist.get(b, 0) + 1
+                                if not d.get('passed'):
+                                    gated += 1
+                                if d.get('repair_action'):
+                                    repaired += 1
+                                if d.get('value_tokens_present') and (not d.get('numeric_matched')):
+                                    val_fails += 1
+                        except Exception:
+                            pass
                         write_audit_line(
                             mode=str(mode_meta.get('mode') or ('researcher' if ctx.reliability.get('ground') else 'standard')),
                             query=(getattr(ctx, '_last_user_message', '') or ''),
                             answer=out,
                             citations=cits,
-                            metrics={'sources': len(cits), 'overlap': (report.get('details') if isinstance(report, dict) else None)},
+                            metrics={'sources': len(cits), 'overlap': overlap, 'overlap_histogram': hist, 'num_sentences_gated': gated, 'num_sentences_repaired': repaired, 'value_mismatch_fails': val_fails},
                             router={'score': mode_meta.get('score'), 'details': mode_meta.get('details')},
                         )
                     except Exception:
@@ -526,6 +574,15 @@ class ChatTurnOrchestrator:
         # Apply contract for this turn (override ctx.reliability transiently)
         contract = to_contract(mode or default)
         ctx.reliability.update({'ground': contract.ground, 'cite': contract.cite, 'check': contract.check})
+        # Governance profile tweaks
+        try:
+            profile = (os.getenv('GOVERNANCE_PROFILE') or '').strip().lower()
+            if profile == 'strict':
+                ctx.reliability.update({'check': 'enforce', 'consensus': True, 'consensus_k': 3})
+            elif profile == 'creative':
+                ctx.reliability.update({'check': 'off'})
+        except Exception:
+            pass
         # Stash for audit
         try:
             setattr(ctx, '_turn_mode_meta', {'mode': mode, 'score': score, 'details': reason})

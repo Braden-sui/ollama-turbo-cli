@@ -1,0 +1,5 @@
+reliability:
+  overlap:
+    threshold: 0.18
+    require_value_match: false
+    multi_cite_policy: union
