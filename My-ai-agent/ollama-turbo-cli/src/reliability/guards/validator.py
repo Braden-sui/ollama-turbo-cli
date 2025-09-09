@@ -54,25 +54,57 @@ class Validator:
         }
 
     def _sentences_with_cites(self, text: str) -> List[Tuple[str, List[str]]]:
+        """Extract sentences ending with citation clusters.
+
+        Accept formats:
+        - [1][2]
+        - [1] [2]
+        - [1, 2]
+        - [1-3] / [1–3]
+        Allow closing ) ] " ” ’ before final punctuation.
+        """
         out: List[Tuple[str,List[str]]] = []
-        for m in re.finditer(r"([^\.!?\n]+?)\s*((?:\[\d+\])+)(?:[\.!?]|$)", text or "", re.M):
-            sent = m.group(1).strip()
-            cites = re.findall(r"\[(\d+)\]", m.group(2) or "")
+        pattern = re.compile(r"(.+?)\s*(\[(?:[0-9,\s\-–]+)\](?:\s*\[(?:[0-9,\s\-–]+)\])*)\s*[)\]""”’]*\s*(?:[\.!?]|$)", re.M)
+        for m in pattern.finditer(text or ""):
+            sent = (m.group(1) or '').strip()
+            cluster = m.group(2) or ''
+            # extract ids from each [...] group
+            ids: List[int] = []
+            for g in re.findall(r"\[([^\]]+)\]", cluster):
+                parts = [p.strip() for p in re.split(r",", g) if p.strip()]
+                for p in parts:
+                    if re.match(r"^\d+$", p):
+                        ids.append(int(p))
+                    else:
+                        mm = re.match(r"^(\d+)\s*[\-–]\s*(\d+)$", p)
+                        if mm:
+                            a, b = int(mm.group(1)), int(mm.group(2))
+                            lo, hi = (a, b) if a <= b else (b, a)
+                            ids.extend(list(range(lo, hi + 1)))
+            cites = [str(i) for i in ids]
             if sent and cites:
                 out.append((sent, cites))
         return out
 
-    def _weighted_recall(self, claim_tokens: List[str], quote_tokens: List[str], *, weights: Dict[str, float]) -> Tuple[float, bool, bool]:
+    def _weighted_recall(self, claim_tokens: List[str], quote_tokens: List[str], *, weights: Dict[str, float]) -> Tuple[float, bool, bool, bool]:
         cset = set(claim_tokens)
         qset = set(quote_tokens)
-        cnum = any(any(ch.isdigit() for ch in t) for t in cset)
-        qnum_match = any((t in qset) and any(ch.isdigit() for ch in t) for t in cset)
+        # Split numeric tokens into value vs period
+        def _is_year(tok: str) -> bool:
+            return len(tok) == 4 and tok.isdigit() and tok.startswith('20')
+        def _is_quarter(tok: str) -> bool:
+            return tok.startswith('q') and '-' in tok and tok[1].isdigit()
+        claim_values = {t for t in cset if any(ch.isdigit() for ch in t) and not (_is_year(t) or _is_quarter(t))}
+        claim_periods = {t for t in cset if _is_year(t) or _is_quarter(t)}
+        value_match = any(t in qset for t in claim_values)
+        period_match = any(t in qset for t in claim_periods)
+        has_value = bool(claim_values)
         def w(tok: str) -> float:
             return float(weights.get(tok, 1.0))
         denom = sum(w(t) for t in cset)
         inter = sum(w(t) for t in (cset & qset))
         score = inter / max(1.0, denom)
-        return score, cnum, qnum_match
+        return score, has_value, value_match, period_match
 
     def validate(self, answer: str, context_blocks: List[Dict[str, Any]], citations_map: Dict[str, Any] | None = None) -> Dict[str, Any]:
         cfg = self._cfg()
@@ -102,28 +134,83 @@ class Validator:
             ctoks = _ovl_tokens(sent)
             if len(ctoks) < int(cfg.get('min_claim_tokens') or 3):
                 continue
-            qtoks_union: List[str] = []
-            for h in highlights:
-                q = str((h or {}).get('quote') or '')
-                if q:
-                    qtoks_union.extend(_qtoks(q))
-            score, has_num, num_match = self._weighted_recall(ctoks, qtoks_union, weights=token_weights)
+            policy = os.getenv('OVERLAP_MULTI_CITE_POLICY', 'union').strip().lower() or 'union'
+            threshold = float(cfg.get('threshold', 0.18))
             discount_applied = False
-            if has_num and (not num_match):
-                if bool(cfg.get('require_numeric_match', False)):
-                    score = 0.0
-                else:
-                    score *= float(cfg.get('discount_word_only_numeric', 0.25) or 0.25)
-                    discount_applied = True
-            passed = (score >= float(cfg.get('threshold', 0.18))) and (not missing)
+            # Build token sets per cite
+            per_cite_tokens: List[List[str]] = []
+            # approximate number of sources with highlights
+            num_sources_covered = 0
+            if policy == 'union' or policy not in {'union','any','all'}:
+                qtoks_union: List[str] = []
+                for h in highlights:
+                    q = str((h or {}).get('quote') or '')
+                    if q:
+                        qtoks_union.extend(_qtoks(q))
+                score, has_value, value_match, period_match = self._weighted_recall(ctoks, qtoks_union, weights=token_weights)
+                if highlights:
+                    num_sources_covered = 1  # union
+                if has_value and (not value_match):
+                    if bool(cfg.get('require_numeric_match', False)) or bool(os.getenv('OVERLAP_REQUIRE_VALUE_MATCH','0').lower() in {'1','true','yes','on'}):
+                        score = 0.0
+                    else:
+                        score *= float(cfg.get('discount_word_only_numeric', 0.25) or 0.25)
+                        discount_applied = True
+                passed = (score >= threshold) and (not missing)
+            else:
+                # Build token sets per cited source id
+                src_map: Dict[str, List[str]] = {}
+                for cid in cite_ids:
+                    src_map.setdefault(cid, [])
+                for h in highlights:
+                    q = str((h or {}).get('quote') or '')
+                    if not q:
+                        continue
+                    for cid in cite_ids:
+                        # naive: attach all highlights to every id (if unioned upstream); if backend groups, adapt here
+                        src_map[cid].extend(_qtoks(q))
+                scores = []
+                all_ok = True
+                any_ok = False
+                value_presence = False
+                value_match_any = False
+                period_match_any = False
+                for cid, toks in src_map.items():
+                    if toks:
+                        num_sources_covered += 1
+                    s, has_value, value_m, period_m = self._weighted_recall(ctoks, toks, weights=token_weights)
+                    # numeric policy
+                    if has_value and (not value_m):
+                        if bool(cfg.get('require_numeric_match', False)) or bool(os.getenv('OVERLAP_REQUIRE_VALUE_MATCH','0').lower() in {'1','true','yes','on'}):
+                            s = 0.0
+                        else:
+                            s *= float(cfg.get('discount_word_only_numeric', 0.25) or 0.25)
+                    scores.append(s)
+                    value_presence = value_presence or has_value
+                    value_match_any = value_match_any or value_m
+                    period_match_any = period_match_any or period_m
+                    any_ok = any_ok or (s >= threshold)
+                    all_ok = all_ok and (s >= threshold)
+                passed = any_ok if policy == 'any' else all_ok
+            # Enforce value-match hard when configured
+            try:
+                require_val = bool(cfg.get('require_numeric_match', False)) or bool(os.getenv('OVERLAP_REQUIRE_VALUE_MATCH','0').lower() in {'1','true','yes','on'})
+            except Exception:
+                require_val = False
+            if require_val and ('has_value' in locals()) and ('value_match' in locals()) and has_value and (not value_match):
+                passed = False
             if not passed:
                 ok = False
             details.append({
                 'sentence': sent,
                 'cites': cite_ids,
-                'overlap_score': round(score, 4),
-                'numeric_matched': bool(num_match),
-                'threshold': float(cfg.get('threshold', 0.18)),
+                'overlap_score': round(score if 'score' in locals() else 0.0, 4),
+                'numeric_matched': bool('value_match' in locals() and value_match),
+                'value_tokens_present': bool('has_value' in locals() and has_value),
+                'period_match': bool('period_match' in locals() and period_match),
+                'policy': policy,
+                'num_sources_covered': num_sources_covered,
+                'threshold': threshold,
                 'discount_applied': discount_applied,
                 'missing_highlights': bool(missing),
                 'passed': passed,
