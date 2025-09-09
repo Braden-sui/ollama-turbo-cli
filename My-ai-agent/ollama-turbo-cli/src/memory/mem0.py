@@ -408,7 +408,7 @@ class Mem0Service:
                 snip = ttxt[:slice_len]
                 if len(snip) < len(ttxt):
                     snip = snip.rstrip() + "…"
-                acc.append(f"- {snip}")
+                acc.append(snip)
                 used += len(snip) + 2
             if not acc:
                 dt_ms = int((time.time() - start) * 1000)

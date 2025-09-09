@@ -116,25 +116,23 @@ class PromptManager:
     # ---------- Mem0 Context Block ----------
     @staticmethod
     def mem0_prefix() -> str:
-        return "Relevant user context (optional):"
+        return "Previous context from user history (use if relevant):"
 
     @classmethod
     def mem0_prefixes(cls) -> List[str]:
         # Include backward-compatible prefixes to support trimming and cleanup
         return [
             cls.mem0_prefix(),
-            # Backward-compatible headers
-            "Previous context from user history (use if relevant):",
             "Relevant information:",
-            "Relevant user memories",
+            "Relevant memories",
         ]
 
     def mem0_context_block(self, bullets: List[str]) -> str:
         prefix = self.mem0_prefix()
         # Ensure each bullet line is prefixed with '- '
-        items = "\n- ".join([str(b) for b in bullets])
-        tail = "\n\nUse only if it clearly improves the answer; otherwise ignore."
-        return f"{prefix}\n- {items}{tail}"
+        items = "\n".join([f"- {str(b)}" for b in bullets])
+        tail = "\n\nIntegrate this context naturally into your response only where it adds value."
+        return f"{prefix}\n{items}{tail}"
 
     # ---------- Helpers & Few-shots ----------
     def _flag(self, name: str, default: bool) -> bool:

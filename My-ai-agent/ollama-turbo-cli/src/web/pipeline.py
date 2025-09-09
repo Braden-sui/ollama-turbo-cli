@@ -74,6 +74,7 @@ except Exception:
 from . import progress as _progress
 from .search import search, SearchResult, _year_guard
 from .fetch import fetch_url, _httpx_client
+from .trust import trust_score
 from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
@@ -216,6 +217,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     obs_extract_fail: int = 0
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
+    obs_trust_decisions: List[Dict[str, Any]] = []
     # Dateline instrumentation
     dateline_from_structured = 0
     dateline_from_path = 0
@@ -495,9 +497,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         t = (q or '').lower()
         return any(k in t for k in ['today','this week','recent','recently','latest','breaking','past week','last week'])
 
-    recency_gate = _recency_required(q_sanitized, freshness_final)
+    # Recency discipline: only when user provided freshness_days or query text strongly implies timeliness
+    recency_gate = _recency_required(q_sanitized, freshness_days)
     now_ts = time.time()
-    window_secs = (int(freshness_final) * 86400) if (freshness_final and int(freshness_final) > 0) else (cfg.default_freshness_days * 86400)
+    window_secs = (int(freshness_days) * 86400) if (freshness_days and int(freshness_days) > 0) else (7 * 86400)
 
     def _parse_pub_date(s: Optional[str]) -> Optional[float]:
         if not s:
@@ -572,6 +575,35 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             except Exception:
                 pass
             return None
+        # Trust and wildcard configuration
+        try:
+            cfg_allow = list(allow_list or [])
+        except Exception:
+            cfg_allow = []
+        try:
+            cfg_allow2 = list(getattr(cfg, 'allowlist_domains', []) or [])
+        except Exception:
+            cfg_allow2 = []
+        wildcard = ('*' in cfg_allow) or ('*' in cfg_allow2)
+        is_allowlisted = (not wildcard) and (_in_list(h, cfg_allow) or _in_list(h, cfg_allow2))
+        trust_mode = (getattr(cfg, 'trust_mode', 'allowlist') or 'allowlist').strip().lower()
+        use_trust = wildcard or (trust_mode in {'heuristic','ml','open'})
+        threshold = float(getattr(cfg, 'trust_threshold', 0.6) or 0.6)
+        min_accept = max(0.2, threshold - 0.1)
+        # Compute heuristic trust score only when needed
+        t_score = 0.0
+        t_signals: Dict[str, Any] = {}
+        if use_trust and (not is_allowlisted):
+            t_score, t_signals = trust_score(f.final_url, {
+                'date': ex.date,
+                'title': ex.title,
+                'markdown': ex.markdown,
+                'meta': ex.meta,
+            }, cfg)
+
+        decision_note = ''
+        decision = 'accept'
+
         # Recency/date gating and language sanity for recent events (hardened dateline)
         if recency_gate:
             # Determine date and confidence
@@ -608,30 +640,46 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     date_conf = 'medium'
                     nonlocal dateline_from_path
                     dateline_from_path += 1
-            h = _host(sr.url)
-            is_trusted = _in_list(h, (cfg.allowlist_domains or []) + allow_list)
+            # Decide acceptance for recency
+            if not pub_ts:
+                if use_trust and (not is_allowlisted) and (t_score >= threshold):
+                    decision = 'soft-accept-undated'
+                    decision_note = 'NO_DATE_RECENCY_TRUST_OK'
+                elif is_allowlisted:
+                    # allowlist path: reject undated in recency when dateline_soft_accept is false
+                    if not cfg.dateline_soft_accept:
+                        obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                        decision = 'reject'
+                        decision_note = 'NO_DATE_RECENCY_ALLOWLIST_REJECT'
+                        # log and bail
+                        try:
+                            if cfg.debug_metrics:
+                                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': True, 'score': None, 'decision': decision, 'reason': decision_note})
+                        except Exception:
+                            pass
+                        return None
+                else:
+                    obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                    decision = 'reject'
+                    decision_note = 'NO_DATE_RECENCY_REJECT'
+                    try:
+                        if cfg.debug_metrics:
+                            obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': False, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+                    except Exception:
+                        pass
+                    return None
             if pub_ts:
                 if (now_ts - pub_ts) > window_secs:
                     obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
-                    return None
-            else:
-                if not (cfg.dateline_soft_accept and is_trusted):
-                    obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                    decision = 'reject'
+                    decision_note = 'OUT_OF_WINDOW'
+                    try:
+                        if cfg.debug_metrics:
+                            obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+                    except Exception:
+                        pass
                     return None
             # Record date confidence histogram
-            try:
-                nonlocal date_conf_hist
-                date_conf_hist[date_conf] = date_conf_hist.get(date_conf, 0) + 1
-            except Exception:
-                pass
-            # Language check (prefer English)
-            try:
-                lang = str((ex.meta.get('lang') or '')).lower()
-            except Exception:
-                lang = ''
-            if lang and not lang.startswith('en'):
-                obs_discard_old['lang_mismatch'] = obs_discard_old.get('lang_mismatch', 0) + 1
-                return None
             # If not on allowlist, still okay if dateline present and within window; prefer allowlist otherwise
             # We bias ordering later by deterministic sort; we could also record a flag in citation if needed.
         # Dedupe by URL and content hash (computed on markdown) — within this run only.
@@ -706,9 +754,17 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'browser_used': f.browser_used,
             'kind': ex.kind,
             'date_confidence': ('high' if pub_ts and ex.date else ('medium' if pub_ts else 'low')),
-            'domain_trust': is_trusted,
+            'domain_trust': bool(is_allowlisted or (use_trust and (t_score >= threshold))),
+            'trust_score': (t_score if use_trust else None),
+            'trust_mode': trust_mode,
+            'undated': bool(not ex.date),
             'lines': [],
         }
+        try:
+            if cfg.debug_metrics:
+                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+        except Exception:
+            pass
         for r in ranked:
             lines = []
             for hl in r.get('highlights', [])[:2]:
@@ -862,6 +918,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'date_confidence_histogram': date_conf_hist,
                 'allowlist_fallback_hit': allowlist_fallback_hit,
                 'rerank_softdate_selected': len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high']),
+                'trust_decisions': obs_trust_decisions,
             }
             # One-line summary for quick telemetry
             kept = len(citations[:top_k])

@@ -256,8 +256,11 @@ class WebConfig:
             os.getenv("WEB_ALLOWLIST_DOMAINS", "reuters.com,apnews.com,ft.com,bloomberg.com,wsj.com,spaceflightnow.com,space.com").split(",")
         ) if d.strip()
     ])
-    dateline_soft_accept: bool = field(default_factory=lambda: _env_bool("WEB_DATELINE_SOFT_ACCEPT", True))
+    dateline_soft_accept: bool = field(default_factory=lambda: _env_bool("WEB_DATELINE_SOFT_ACCEPT", False))
     enable_allowlist_news_fallback: bool = field(default_factory=lambda: _env_bool("WEB_ENABLE_ALLOWLIST_NEWS_FALLBACK", True))
+    # Trust subsystem
+    trust_mode: str = field(default_factory=lambda: (os.getenv("WEB_TRUST_MODE", "allowlist").strip().lower()))
+    trust_threshold: float = field(default_factory=lambda: _env_float("WEB_TRUST_THRESHOLD", 0.6))
     # Citation policy
     exclude_citation_domains: list[str] = field(default_factory=lambda: [
         d.strip().lower() for d in (

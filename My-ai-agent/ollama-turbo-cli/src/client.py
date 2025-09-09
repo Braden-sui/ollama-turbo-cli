@@ -917,8 +917,29 @@ class OllamaTurboClient:
             # Avoid duplication if already included in last_N or identical to first_system
             if mem_msg is not first_system and mem_msg not in last_N:
                 new_hist.append(mem_msg)
-        # Extend with last N (may include the memory block already)
-        new_hist.extend(last_N)
+        # Extend with last N, but drop any Mem0 blocks except the selected latest one
+        def _is_mem0(msg: Dict[str, Any]) -> bool:
+            try:
+                if msg.get('role') != 'system':
+                    return False
+                c = str(msg.get('content') or '')
+                return any(c.startswith(p) for p in mem0_prefixes if p)
+            except Exception:
+                return False
+        filtered_last_N: List[Dict[str, Any]] = []
+        for m in last_N:
+            if _is_mem0(m):
+                try:
+                    if latest_mem_idx is not None and m.get('content') == self.conversation_history[latest_mem_idx].get('content'):
+                        filtered_last_N.append(m)
+                    else:
+                        # skip older/different Mem0 blocks
+                        continue
+                except Exception:
+                    continue
+            else:
+                filtered_last_N.append(m)
+        new_hist.extend(filtered_last_N)
         # De-duplicate while preserving order. For Mem0 system blocks, dedupe by content.
         seen = set()
         deduped: List[Dict[str, Any]] = []
