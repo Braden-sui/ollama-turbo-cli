@@ -219,7 +219,9 @@ class ChatTurnOrchestrator:
             ctx.logger.debug(f"consensus skipped: {ce}")
 
         try:
-            if (ctx.reliability.get('check') or 'off') != 'off':
+            # Run validator only when we actually have citation context to validate (web paths).
+            has_citations = bool(getattr(ctx, '_last_context_blocks', []) or getattr(ctx, '_last_citations_map', {}))
+            if has_citations and ((ctx.reliability.get('check') or 'off') != 'off'):
                 report = Validator(mode=str(ctx.reliability.get('check'))).validate(final_out, getattr(ctx, '_last_context_blocks', []))
                 ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
         except Exception as ve:
@@ -405,7 +407,9 @@ class ChatTurnOrchestrator:
                         gate_strict = False
                     reprompt_text = (
                         ctx.prompt.reprompt_after_tools() if gate_strict else (
-                            'Based on the tool results, produce <|channel|>final with a clear answer. Summarize; avoid copying raw tool output.'
+                            'Based on the tool results above, produce <|channel|>final with a clear, concise answer. '
+                            'If you did not use any external sources (web pages or uploaded documents), do not mention citations '
+                            'or lack thereof; simply provide the answer. Avoid copying raw tool output.'
                         )
                     )
                     ctx.conversation_history.append({'role': 'user', 'content': reprompt_text})
@@ -460,7 +464,8 @@ class ChatTurnOrchestrator:
 
                     report = None
                     try:
-                        if (ctx.reliability.get('check') or 'off') != 'off':
+                        has_citations2 = bool(getattr(ctx, '_last_context_blocks', []) or getattr(ctx, '_last_citations_map', {}))
+                        if has_citations2 and ((ctx.reliability.get('check') or 'off') != 'off'):
                             report = Validator(mode=str(ctx.reliability.get('check'))).validate(
                                 final_out,
                                 getattr(ctx, '_last_context_blocks', []),

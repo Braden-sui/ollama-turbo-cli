@@ -44,16 +44,8 @@ def duckduckgo_search(query: str, max_results: int = 3):
             return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "requests not installed"}}
 
         query = (query or "").strip()
-        # Apply YearGuard to strip template-injected years/month-years without touching user quotes
-        try:
-            from ..web.pipeline import _DEFAULT_CFG  # type: ignore
-            from ..web.search import _year_guard  # type: ignore
-            cfg = _DEFAULT_CFG
-            if cfg is not None:
-                sanitized, _ = _year_guard(query, cfg)
-                query = sanitized or query
-        except Exception:
-            pass
+        # Note: Do NOT apply YearGuard here; keep the raw user query for search.
+        # YearGuard is reserved for multi-hop researcher paths.
         if not query:
             return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "query must be provided"}}
 
@@ -243,6 +235,197 @@ def duckduckgo_search(query: str, max_results: int = 3):
                 break
 
         if not unique:
+            # Fallback path when JSON API yields no useful results:
+            # 1) HTML fallback (Lite/HTML endpoints)
+            html_headers = {
+                "User-Agent": ua,
+                "Accept": "text/html",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://duckduckgo.com/",
+                "DNT": "1",
+            }
+            fallback_urls = [
+                "https://duckduckgo.com/lite/",
+                "https://html.duckduckgo.com/html/",
+            ]
+            collected: List[Dict[str, str]] = []
+            for base in fallback_urls:
+                try:
+                    params_html = {"q": query, "kl": "wt-wt"}
+                    r = requests.get(base, params=params_html, headers=html_headers, timeout=8)
+                except Exception:
+                    continue
+                if r.status_code != 200:
+                    continue
+                html = r.text or ""
+                links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I)
+                for href, text in links:
+                    try:
+                        absolute = href if href.lower().startswith("http") else urljoin(base, href)
+                        parsed = urlparse(absolute)
+                        netloc = parsed.netloc or ""
+                    except Exception:
+                        continue
+
+                    resolved_url = None
+                    if netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                        # Decode external URL from uddg param
+                        try:
+                            qs = parse_qs(parsed.query)
+                            uddg = qs.get("uddg", [None])[0]
+                            if uddg:
+                                resolved_url = unquote(uddg)
+                        except Exception:
+                            pass
+                    elif netloc.endswith("duckduckgo.com") or netloc.endswith("duck.com"):
+                        # Skip other DDG internal links
+                        continue
+                    else:
+                        resolved_url = absolute if absolute.lower().startswith("http") else None
+
+                    if not resolved_url:
+                        continue
+                    if resolved_url in [c["url"] for c in collected]:
+                        continue
+
+                    title_text = re.sub(r"<[^>]+>", "", text)[:120].strip() or "(no title)"
+                    snippet2 = re.sub(r"<[^>]+>", "", text)[:180].strip()
+                    collected.append({"title": title_text, "url": resolved_url, "snippet": snippet2})
+                    if len(collected) >= max_results:
+                        break
+                if collected:
+                    break
+
+            if collected:
+                results_fallback = []
+                for i, r2 in enumerate(collected[:max_results], 1):
+                    title2 = re.sub(r"<[^>]+>", "", r2.get("title") or "(no title)")
+                    url2 = r2.get("url") or ""
+                    snippet2 = (r2.get("snippet") or "").strip()
+                    results_fallback.append({"rank": i, "title": title2, "url": url2, "snippet": snippet2})
+                return {"ok": True, "query": query, "engine": "duckduckgo", "results": results_fallback}
+
+            # 2) Internal last-chance fallback via web.search when available
+            try:
+                from ..web.search import _search_duckduckgo_fallback, SearchQuery
+                from ..web.config import WebConfig
+                items2 = _search_duckduckgo_fallback(SearchQuery(query=query), WebConfig())
+                if items2:
+                    results2 = []
+                    for i, it in enumerate(items2[:max_results], 1):
+                        results2.append({
+                            "rank": i,
+                            "title": (it.title or "(no title)"),
+                            "url": it.url,
+                            "snippet": (it.snippet or "").strip(),
+                        })
+                    return {"ok": True, "query": query, "engine": "duckduckgo", "results": results2}
+            except Exception:
+                pass
+
+            # 3) Query variants (e.g., transform "difference between X and Y" -> "X vs Y")
+            def _variants(q: str) -> List[str]:
+                vars: List[str] = []
+                try:
+                    m = re.search(r"difference between\s+(.+?)\s+and\s+(.+)", q, flags=re.I)
+                    if m:
+                        x = m.group(1).strip().strip('?.,;:')
+                        y = m.group(2).strip().strip('?.,;:')
+                        vars.extend([f"{x} vs {y}", f"{x} versus {y}", f'"{x} vs {y}"'])
+                    # Keywords-only compression
+                    toks = re.findall(r"[A-Za-z0-9]+", q)
+                    stop = {
+                        'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as','is','are','was','were','be','being','been','this','that','these','those','it','its','into','between','difference','parliamentary'
+                    }
+                    kw = " ".join([t for t in toks if t.lower() not in stop][:6])
+                    if kw and kw.lower() != q.lower():
+                        vars.append(kw)
+                except Exception:
+                    pass
+                # Deduplicate while preserving order
+                seen_v = set()
+                out_v: List[str] = []
+                for v in vars:
+                    if v and v not in seen_v:
+                        seen_v.add(v)
+                        out_v.append(v)
+                return out_v
+
+            for vq in _variants(query):
+                collected_v: List[Dict[str, str]] = []
+                for base in fallback_urls:
+                    try:
+                        params_html_v = {"q": vq, "kl": "wt-wt"}
+                        r = requests.get(base, params=params_html_v, headers=html_headers, timeout=8)
+                    except Exception:
+                        continue
+                    if r.status_code != 200:
+                        continue
+                    html = r.text or ""
+                    links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I)
+                    for href, text in links:
+                        try:
+                            absolute = href if href.lower().startswith("http") else urljoin(base, href)
+                            parsed = urlparse(absolute)
+                            netloc = parsed.netloc or ""
+                        except Exception:
+                            continue
+
+                        resolved_url = None
+                        if netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                            # Decode external URL from uddg param
+                            try:
+                                qs = parse_qs(parsed.query)
+                                uddg = qs.get("uddg", [None])[0]
+                                if uddg:
+                                    resolved_url = unquote(uddg)
+                            except Exception:
+                                pass
+                        elif netloc.endswith("duckduckgo.com") or netloc.endswith("duck.com"):
+                            # Skip other DDG internal links
+                            continue
+                        else:
+                            resolved_url = absolute if absolute.lower().startswith("http") else None
+
+                        if not resolved_url:
+                            continue
+                        if resolved_url in [c["url"] for c in collected_v]:
+                            continue
+
+                        title_text = re.sub(r"<[^>]+>", "", text)[:120].strip() or "(no title)"
+                        snippet2 = re.sub(r"<[^>]+>", "", text)[:180].strip()
+                        collected_v.append({"title": title_text, "url": resolved_url, "snippet": snippet2})
+                        if len(collected_v) >= max_results:
+                            break
+                    if collected_v:
+                        break
+                if collected_v:
+                    results_v = []
+                    for i, r3 in enumerate(collected_v[:max_results], 1):
+                        title3 = re.sub(r"<[^>]+>", "", r3.get("title") or "(no title)")
+                        url3 = r3.get("url") or ""
+                        snippet3 = (r3.get("snippet") or "").strip()
+                        results_v.append({"rank": i, "title": title3, "url": url3, "snippet": snippet3})
+                    return {"ok": True, "query": vq, "engine": "duckduckgo", "results": results_v}
+                # Last-chance internal fallback for the variant
+                try:
+                    from ..web.search import _search_duckduckgo_fallback, SearchQuery
+                    from ..web.config import WebConfig
+                    items3 = _search_duckduckgo_fallback(SearchQuery(query=vq), WebConfig())
+                    if items3:
+                        results3 = []
+                        for i, it in enumerate(items3[:max_results], 1):
+                            results3.append({
+                                "rank": i,
+                                "title": (it.title or "(no title)"),
+                                "url": it.url,
+                                "snippet": (it.snippet or "").strip(),
+                            })
+                        return {"ok": True, "query": vq, "engine": "duckduckgo", "results": results3}
+                except Exception:
+                    pass
+
+            # If all strategies failed, return empty results (consistent contract)
             return {"ok": True, "query": query, "engine": "duckduckgo", "results": []}
 
         results = []
@@ -258,4 +441,4 @@ def duckduckgo_search(query: str, max_results: int = 3):
 
 TOOL_IMPLEMENTATION = duckduckgo_search
 TOOL_AUTHOR = "core"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "2.0.0"

@@ -603,11 +603,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
 
         decision_note = ''
         decision = 'accept'
+            # Initialize date variables for both recency and evergreen paths
+        pub_ts: Optional[float] = None
+        date_conf: str = 'low'
 
         # Recency/date gating and language sanity for recent events (hardened dateline)
-        if recency_gate:
+        # PDFs are typically evergreen/primary sources; bypass recency gating
+        if recency_gate and ex.kind != 'pdf':
             # Determine date and confidence
-            date_conf = 'low'
             pub_ts = _parse_pub_date(ex.date)
             if pub_ts:
                 date_conf = 'high'
@@ -642,7 +645,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     dateline_from_path += 1
             # Decide acceptance for recency
             if not pub_ts:
-                if use_trust and (not is_allowlisted) and (t_score >= threshold):
+                if use_trust and (not is_allowlisted) and (t_score >= threshold) and bool(getattr(cfg, 'dateline_soft_accept', False)):
                     decision = 'soft-accept-undated'
                     decision_note = 'NO_DATE_RECENCY_TRUST_OK'
                 elif is_allowlisted:
@@ -680,6 +683,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                         pass
                     return None
             # Record date confidence histogram
+            try:
+                date_conf_hist[date_conf] = date_conf_hist.get(date_conf, 0) + 1
+            except Exception:
+                pass
             # If not on allowlist, still okay if dateline present and within window; prefer allowlist otherwise
             # We bias ordering later by deterministic sort; we could also record a flag in citation if needed.
         # Dedupe by URL and content hash (computed on markdown) — within this run only.
@@ -721,6 +728,16 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     archive = save_page_now(f.final_url, cfg=cfg)
             except Exception:
                 archive = {'archive_url': '', 'timestamp': ''}
+        # Final guard: for recency queries, reject undated candidates defensively
+        if recency_gate and (pub_ts is None):
+            obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+            try:
+                if cfg.debug_metrics:
+                    obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': (t_score if use_trust else None), 'decision': 'reject', 'reason': 'NO_DATE_RECENCY_FINAL_GUARD'})
+            except Exception:
+                pass
+            return None
+
         # Build citation entry deterministically
         page_starts = []
         try:
@@ -807,6 +824,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
     citations = dedupe_citations(citations)
+    # Final safety: in recency mode, drop undated citations
+    if recency_gate:
+        citations = [c for c in citations if c.get('date')]
     # Prefer trusted domains and higher date confidence, then by risk/url
     def _conf_val(v: str) -> int:
         return 2 if v == 'high' else (1 if v == 'medium' else 0)
