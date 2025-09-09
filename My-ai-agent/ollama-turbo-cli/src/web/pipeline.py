@@ -216,6 +216,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     obs_extract_fail: int = 0
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
+    # Dateline instrumentation
+    dateline_from_structured = 0
+    dateline_from_path = 0
+    date_conf_hist: Dict[str, int] = {'high': 0, 'medium': 0, 'low': 0}
+    allowlist_fallback_hit = False
     if not results:
         # Heuristic: simplify long/narrow queries and retry once
         try:
@@ -574,6 +579,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pub_ts = _parse_pub_date(ex.date)
             if pub_ts:
                 date_conf = 'high'
+                nonlocal dateline_from_structured
+                dateline_from_structured += 1
             else:
                 # Fallback: parse date from URL path (e.g., /2025/09/08/)
                 def _date_from_path(u: str) -> Optional[float]:
@@ -599,6 +606,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 if path_ts:
                     pub_ts = path_ts
                     date_conf = 'medium'
+                    nonlocal dateline_from_path
+                    dateline_from_path += 1
             h = _host(sr.url)
             is_trusted = _in_list(h, (cfg.allowlist_domains or []) + allow_list)
             if pub_ts:
@@ -609,6 +618,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 if not (cfg.dateline_soft_accept and is_trusted):
                     obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
                     return None
+            # Record date confidence histogram
+            try:
+                nonlocal date_conf_hist
+                date_conf_hist[date_conf] = date_conf_hist.get(date_conf, 0) + 1
+            except Exception:
+                pass
             # Language check (prefer English)
             try:
                 lang = str((ex.meta.get('lang') or '')).lower()
@@ -797,6 +812,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                             citations.append(cit)
                     except Exception:
                         continue
+            allowlist_fallback_hit = bool(citations)
 
 
     answer = {
@@ -841,6 +857,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'year_guard': yg_counters,
                 'resolved_window_days': freshness_final,
                 'relative_span_resolved': bool(resolved_days is not None),
+                'dateline_from_structured': dateline_from_structured,
+                'dateline_from_path': dateline_from_path,
+                'date_confidence_histogram': date_conf_hist,
+                'allowlist_fallback_hit': allowlist_fallback_hit,
+                'rerank_softdate_selected': len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high']),
             }
             # One-line summary for quick telemetry
             kept = len(citations[:top_k])
