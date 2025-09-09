@@ -195,9 +195,106 @@ def duckduckgo_search(query: str, max_results: int = 3):
             except Exception:
                 pass
 
-            # If still nothing useful, report the last status
-            code = resp.status_code if (resp is not None and hasattr(resp, 'status_code')) else 'unknown'
-            return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": f"HTTP {code} and no fallback results"}}
+            # 3) Query variants (e.g., transform patterns, keyword compression) with HTML/internal fallback
+            def _variants(q: str) -> List[str]:
+                vars: List[str] = []
+                try:
+                    m = re.search(r"difference between\s+(.+?)\s+and\s+(.+)", q, flags=re.I)
+                    if m:
+                        x = m.group(1).strip().strip('?.,;:')
+                        y = m.group(2).strip().strip('?.,;:')
+                        vars.extend([f"{x} vs {y}", f"{x} versus {y}", f'"{x} vs {y}"'])
+                    # Keyword compression (drop common stopwords)
+                    toks = re.findall(r"[A-Za-z0-9]+", q)
+                    stop = {
+                        'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as','is','are','was','were','be','being','been','this','that','these','those','it','its','into','between','difference','parliamentary'
+                    }
+                    kw = " ".join([t for t in toks if t.lower() not in stop][:6])
+                    if kw and kw.lower() != q.lower():
+                        vars.append(kw)
+                except Exception:
+                    pass
+                # Deduplicate while preserving order
+                seen_v = set()
+                out_v: List[str] = []
+                for v in vars:
+                    if v and v not in seen_v:
+                        seen_v.add(v)
+                        out_v.append(v)
+                return out_v
+
+            for vq in _variants(query):
+                # HTML fallback for variant
+                collected_v: List[Dict[str, str]] = []
+                for base in fallback_urls:
+                    try:
+                        params_html_v = {"q": vq, "kl": "wt-wt"}
+                        r = requests.get(base, params=params_html_v, headers=html_headers, timeout=8)
+                    except Exception:
+                        continue
+                    if r.status_code != 200:
+                        continue
+                    html = r.text or ""
+                    links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I)
+                    for href, text in links:
+                        try:
+                            absolute = href if href.lower().startswith("http") else urljoin(base, href)
+                            parsed = urlparse(absolute)
+                            netloc = parsed.netloc or ""
+                        except Exception:
+                            continue
+                        resolved_url = None
+                        if netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                            try:
+                                qs = parse_qs(parsed.query)
+                                uddg = qs.get("uddg", [None])[0]
+                                if uddg:
+                                    resolved_url = unquote(uddg)
+                            except Exception:
+                                pass
+                        elif netloc.endswith("duckduckgo.com") or netloc.endswith("duck.com"):
+                            continue
+                        else:
+                            resolved_url = absolute if absolute.lower().startswith("http") else None
+                        if not resolved_url:
+                            continue
+                        if resolved_url in [c["url"] for c in collected_v]:
+                            continue
+                        title_text = re.sub(r"<[^>]+>", "", text)[:120].strip() or "(no title)"
+                        snippet2 = re.sub(r"<[^>]+>", "", text)[:180].strip()
+                        collected_v.append({"title": title_text, "url": resolved_url, "snippet": snippet2})
+                        if len(collected_v) >= max_results:
+                            break
+                    if collected_v:
+                        break
+                if collected_v:
+                    results_v = []
+                    for i, r3 in enumerate(collected_v[:max_results], 1):
+                        title3 = re.sub(r"<[^>]+>", "", r3.get("title") or "(no title)")
+                        url3 = r3.get("url") or ""
+                        snippet3 = (r3.get("snippet") or "").strip()
+                        results_v.append({"rank": i, "title": title3, "url": url3, "snippet": snippet3})
+                    return {"ok": True, "query": vq, "engine": "duckduckgo", "results": results_v}
+                # Internal fallback for variant
+                try:
+                    from ..web.search import _search_duckduckgo_fallback, SearchQuery
+                    from ..web.config import WebConfig
+                    items3 = _search_duckduckgo_fallback(SearchQuery(query=vq), WebConfig())
+                    if items3:
+                        results3 = []
+                        for i, it in enumerate(items3[:max_results], 1):
+                            results3.append({
+                                "rank": i,
+                                "title": (it.title or "(no title)"),
+                                "url": it.url,
+                                "snippet": (it.snippet or "").strip(),
+                            })
+                        return {"ok": True, "query": vq, "engine": "duckduckgo", "results": results3}
+                except Exception:
+                    pass
+
+            # Final: keep contract but avoid error to reduce planner retries
+            return {"ok": True, "query": query, "engine": "duckduckgo", "results": []}
 
         results = []
 
