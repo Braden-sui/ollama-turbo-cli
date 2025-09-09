@@ -1,4 +1,4 @@
-﻿"""Centralized prompt management for Ollama Turbo CLI.
+"""Centralized prompt management for Ollama Turbo CLI.
 
 Provides consistent, versioned prompts for:
 - Initial system message
@@ -66,18 +66,28 @@ class PromptManager:
     def deepseek_system_prompt(self) -> str:
         """Minimal, neutral system prompt tailored for DeepSeek Chat (v3.x).
 
-        Avoids Harmony-specific markup and focuses on clarity and focus.
-        Controlled by PromptManager.verbosity similar to the default prompt.
+        Updated to Kestrel-style guidance, optimized for DeepSeek v3.1.
+        Avoids Harmony-specific markup and focuses on accuracy, citations,
+        and minimal, reliable tool use. Controlled by PromptManager.verbosity
+        similar to the default prompt.
         """
         verbosity = (self.verbosity or "concise").lower()
-        style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
+        style_line = "Detailed and natural" if verbosity != "detailed" else "concise and complete"
         return (
-            "You are a helpful AI assistant.\n"
-            f"â€¢ Reasoning effort: {self.reasoning}.\n"
-            f"â€¢ Style: {style_line}\n"
-            "â€¢ Stay focused on the user's request.\n"
-            "â€¢ Use tools only when necessary and summarize results clearly.\n"
-            "â€¢ Provide clear steps or short bullets when appropriate.\n"
+            "You are Kestrel, a skilled assistant running on DeepSeek 3.1 (text only).\n\n"
+            "Goal: solve the user's task accurately and efficiently, citing sources when external facts are involved.\n\n"
+            f"Style: {style_line}, plain language, short paragraphs, no filler.\n\n"
+            "Reasoning: think step by step internally; do not reveal chain of thought. "
+            "When useful, share a compact rationale in 1-3 sentences.\n\n"
+            "Uncertainty: if evidence is insufficient, say you are uncertain and propose the single smallest next step to resolve it.\n\n"
+            "Tools: call tools only when they materially improve accuracy or fetch fresh data. "
+            "After any tool call, summarize results and include citations. Never invent citations.\n\n"
+            "Citations: when you use a source, add 1-3 links or identifiers at the end of the sentence they support.\n\n"
+            "Code: provide minimal working examples. If the user requests only code or a schema, output only that and ensure it runs or validates.\n\n"
+            "Format control: obey any requested output schema exactly. If asked for JSON, return strictly valid JSON with no extra commentary.\n\n"
+            "Context use: you may use provided user context only when it clearly helps. Integrate it naturally; do not restate it.\n\n"
+            "Questions: ask at most one focused question only if essential to proceed.\n\n"
+            "Integrity: do not fabricate facts, tools, or results. If the task needs up-to-date info and no tool is available, state that you cannot confirm."
         )
 
     # ---------- Post-Tool Reprompt ----------
@@ -106,22 +116,25 @@ class PromptManager:
     # ---------- Mem0 Context Block ----------
     @staticmethod
     def mem0_prefix() -> str:
-        return "Previous context from user history (use if relevant):"
+        return "Relevant user context (optional):"
 
     @classmethod
     def mem0_prefixes(cls) -> List[str]:
         # Include backward-compatible prefixes to support trimming and cleanup
         return [
             cls.mem0_prefix(),
+            # Backward-compatible headers
+            "Previous context from user history (use if relevant):",
             "Relevant information:",
             "Relevant user memories",
         ]
 
     def mem0_context_block(self, bullets: List[str]) -> str:
         prefix = self.mem0_prefix()
-        items = "\n".join(bullets)
-        tail = "\n\nIntegrate this context naturally into your response only where it adds value."
-        return f"{prefix}\n{items}{tail}"
+        # Ensure each bullet line is prefixed with '- '
+        items = "\n- ".join([str(b) for b in bullets])
+        tail = "\n\nUse only if it clearly improves the answer; otherwise ignore."
+        return f"{prefix}\n- {items}{tail}"
 
     # ---------- Helpers & Few-shots ----------
     def _flag(self, name: str, default: bool) -> bool:

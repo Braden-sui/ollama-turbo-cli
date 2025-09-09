@@ -139,7 +139,8 @@ class OllamaTurboClient:
             try:
                 self.mem0_search_timeout_ms = int(cfg.mem0.search_timeout_ms)
             except Exception:
-                self.mem0_search_timeout_ms = 500
+                # Default to 800ms to allow adequate time for Mem0 context to fill
+                self.mem0_search_timeout_ms = 800
         else:
             try:
                 self.mem0_search_timeout_ms: int = int(os.getenv('MEM0_SEARCH_TIMEOUT_MS', '800') or '800')
@@ -673,6 +674,11 @@ class OllamaTurboClient:
         
         # Trim history if needed
         self._trim_history()
+        # Trace Mem0 presence after injection and trimming
+        try:
+            self._trace_mem0_presence(self.conversation_history, f"{'stream' if stream else 'standard'}:r0")
+        except Exception:
+            pass
         
         try:
             if stream:
@@ -872,19 +878,35 @@ class OllamaTurboClient:
             return
 
         first_system = self.conversation_history[0] if self.conversation_history and self.conversation_history[0].get('role') == 'system' else None
-        # Find latest memory system block
+        # Find latest memory system block (use centralized prefixes)
         latest_mem_idx = None
+        try:
+            mem0_prefixes = self.prompt.mem0_prefixes()
+        except Exception:
+            mem0_prefixes = [
+                "Previous context from user history (use if relevant):",
+                "Relevant information:",
+                "Relevant user memories",
+                "Relevant user context (optional):",
+            ]
         for i in range(len(self.conversation_history) - 1, -1, -1):
             msg = self.conversation_history[i]
             if msg.get('role') == 'system':
                 c = msg.get('content') or ''
-                if (
-                    c.startswith("Previous context from user history (use if relevant):")
-                    or c.startswith("Relevant information:")
-                    or c.startswith("Relevant user memories")
-                ):
-                    latest_mem_idx = i
-                    break
+                try:
+                    if any(c.startswith(p) for p in mem0_prefixes if p):
+                        latest_mem_idx = i
+                        break
+                except Exception:
+                    # Fall back to legacy checks if prefixes fail
+                    if (
+                        c.startswith("Previous context from user history (use if relevant):")
+                        or c.startswith("Relevant information:")
+                        or c.startswith("Relevant user memories")
+                        or c.startswith("Relevant user context (optional):")
+                    ):
+                        latest_mem_idx = i
+                        break
 
         last_N = self.conversation_history[-self.max_history:]
         new_hist: List[Dict[str, Any]] = []

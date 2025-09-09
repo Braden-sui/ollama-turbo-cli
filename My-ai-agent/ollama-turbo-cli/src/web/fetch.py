@@ -533,6 +533,33 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
         except Exception as reval_err:
             return FetchResult(False, int(status or 0), url, final_url, headers, content_type, len(data or b''), None, None, False, False, reason=str(reval_err))
         raw = data
+        # Alt UA fallback for HTML shells / small bodies before escalating to browser
+        try:
+            need_alt = False
+            if ('text/html' in (content_type or '')):
+                if (status in (403, 401)) or (len(raw or b'') < 1024):
+                    need_alt = True
+            if need_alt:
+                alt_headers = dict(common_headers)
+                alt_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+                with client.stream("GET", url, headers=alt_headers) as resp2:
+                    st2 = resp2.status_code
+                    buf2 = bytearray()
+                    for chunk in resp2.iter_bytes():
+                        if chunk:
+                            buf2 += chunk
+                            if len(buf2) >= cfg.max_download_bytes:
+                                break
+                    raw2 = bytes(buf2)
+                    ct2 = resp2.headers.get('content-type', '')
+                    if st2 == 200 and ('text/html' in (ct2 or '')) and len(raw2) >= len(raw or b''):
+                        status = st2
+                        content_type = ct2
+                        raw = raw2
+                        final_url = str(resp2.request.url)
+                        headers = {k: v for k, v in resp2.headers.items()}
+        except Exception:
+            pass
         browser_needed = use_browser_if_needed and _should_escalate_to_browser(status, content_type, raw)
     except Exception as e:
         status = 0

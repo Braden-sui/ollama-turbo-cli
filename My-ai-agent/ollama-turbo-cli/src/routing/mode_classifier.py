@@ -20,7 +20,11 @@ def _load_cfg() -> Dict[str, Any]:
             "thresholds": {"promote": 0.62, "demote": 0.42, "referee_band": 0.05},
             "hysteresis": {"lock_turns": 2, "decay": 0.75},
             "signals": {
-                "risky_terms": ["health", "medical", "finance", "trading", "policy", "regulation", "fda", "sec", "lawsuit", "safety", "recall", "compliance", "gdpr"],
+                "risky_terms": [
+                    "health", "medical", "finance", "trading", "policy", "regulation", "fda", "sec", "lawsuit", "safety", "recall", "compliance", "gdpr",
+                    # geopolitics (bias to researcher + strict cited synthesis)
+                    "israel", "gaza", "palestine", "west bank", "hamas", "idf", "hezbollah", "lebanon", "iran"
+                ],
                 "facty_tokens": ["according to", "study", "report", "filed", "launched", "revenue", "patients", "evidence", "cite", "source", "versus", "vs"],
                 "recency_tokens": ["today", "this week", "latest", "breaking", "in 2024", "in 2025"],
                 "style_tokens_standard": ["brainstorm", "imagine", "story", "poem", "outline", "riff", "ideas", "metaphor"],

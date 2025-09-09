@@ -79,6 +79,12 @@ from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
 from .normalize import canonicalize, dedupe_citations
 from .loc import format_loc
+from datetime import datetime, timedelta
+
+try:
+    from dateutil import parser as _date_parser  # type: ignore
+except Exception:  # pragma: no cover
+    _date_parser = None  # type: ignore
 
 _DEFAULT_CFG: Optional[WebConfig] = None
 
@@ -162,6 +168,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     simplified_count = 0
     variant_count = 0
     emergency_count = 0
+    # Observability counters
+    obs_fetch_fail: Dict[str, int] = {}
+    obs_extract_fail: int = 0
+    obs_discard_old: Dict[str, int] = {}
+    obs_source_type: Dict[str, int] = {}
     if not results:
         # Heuristic: simplify long/narrow queries and retry once
         try:
@@ -353,7 +364,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     items: List[Dict[str, Any]] = []
     # Dedupe across URLs and content bodies (current-run only)
     seen_urls: set[str] = set()
-    seen_hashes: set[str] = set()
+    # Scope content-hash dedupe to hostname, so different outlets with similar wire stubs both survive
+    seen_hashes_by_host: Dict[str, set[str]] = {}
     dedupe_lock = threading.Lock()
 
     dedup_skips = 0
@@ -373,6 +385,86 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             return False
         except Exception:
             return False
+    # Policy: allowlist and blocklist for breaking news sources
+    def _host(u: str) -> str:
+        try:
+            return (urlparse(u).hostname or '').lower().strip('.')
+        except Exception:
+            return ''
+    def _in_list(host: str, patterns: List[str]) -> bool:
+        h = host or ''
+        for dom in patterns:
+            d = str(dom or '').lower().strip('.')
+            if not d:
+                continue
+            if h == d or h.endswith('.' + d):
+                return True
+        return False
+    # Defaults (override via WEB_NEWS_SOURCES_ALLOW / WEB_NEWS_SOURCES_BLOCK comma lists)
+    allow_defaults = [
+        'apnews.com','reuters.com','bbc.co.uk','bbc.com','theguardian.com','aljazeera.com','nytimes.com',
+        'wsj.com','haaretz.com','timesofisrael.com','al-monitor.com'
+    ]
+    block_defaults = [
+        'liveuamap.com'
+    ]
+    try:
+        env_allow = os.getenv('WEB_NEWS_SOURCES_ALLOW')
+        if env_allow is not None:
+            allow_list = [d.strip() for d in env_allow.split(',') if d.strip()]
+        else:
+            allow_list = allow_defaults
+    except Exception:
+        allow_list = allow_defaults
+    try:
+        env_block = os.getenv('WEB_NEWS_SOURCES_BLOCK')
+        if env_block is not None:
+            block_list = [d.strip() for d in env_block.split(',') if d.strip()]
+        else:
+            block_list = block_defaults
+    except Exception:
+        block_list = block_defaults
+
+    def _source_type(url: str) -> str:
+        try:
+            p = urlparse(url)
+            h = (p.hostname or '').lower()
+            path = (p.path or '').lower()
+            if h.endswith('liveuamap.com'):
+                return 'map'
+            if any(tok in path for tok in ['/live', 'liveblog', 'live-blog', 'ticker', '/updates/']):
+                return 'liveblog'
+        except Exception:
+            pass
+        return 'article'
+
+    def _recency_required(q: str, fresh_days: Optional[int]) -> bool:
+        try:
+            if fresh_days and int(fresh_days) > 0:
+                return True
+        except Exception:
+            pass
+        t = (q or '').lower()
+        return any(k in t for k in ['today','this week','recent','recently','latest','breaking','past week','last week'])
+
+    recency_gate = _recency_required(query, freshness_days)
+    now_ts = time.time()
+    window_secs = (int(freshness_days) * 86400) if (freshness_days and int(freshness_days) > 0) else (7 * 86400)
+
+    def _parse_pub_date(s: Optional[str]) -> Optional[float]:
+        if not s:
+            return None
+        try:
+            # Try ISO fast-path
+            try:
+                return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                pass
+            if _date_parser is not None:
+                return _date_parser.parse(s).timestamp()  # type: ignore
+        except Exception:
+            return None
+        return None
     def _build_citation(sr) -> Optional[Dict[str, Any]]:
         if site_exclude and site_exclude in (sr.url or ''):
             return None
@@ -380,6 +472,16 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             _progress.emit_current({"stage": "fetch", "status": "start", "url": sr.url})
         except Exception:
             pass
+        # Source-type and policy checks prior to fetch
+        stype = _source_type(sr.url)
+        obs_source_type[stype] = obs_source_type.get(stype, 0) + 1
+        h = _host(sr.url)
+        if _in_list(h, block_list):
+            items.append({'url': sr.url, 'ok': False, 'reason': 'blocked-source'})
+            return None
+        if stype in {'liveblog','map'}:
+            items.append({'url': sr.url, 'ok': False, 'reason': f'blocked-{stype}'})
+            return None
         # Respect exclusion list: allow discovery (search) but skip quoting as a citation
         if _host_in_excluded(sr.url):
             items.append({'url': sr.url, 'ok': False, 'reason': 'excluded-domain'})
@@ -390,6 +492,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
         if not f.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': f.reason or f"HTTP {f.status}"})
+            try:
+                rkey = (f.reason or f"HTTP {f.status}")
+                obs_fetch_fail[rkey] = obs_fetch_fail.get(rkey, 0) + 1
+            except Exception:
+                pass
             try:
                 _progress.emit_current({"stage": "fetch", "status": "error", "url": sr.url, "reason": f.reason or f"HTTP {f.status}"})
             except Exception:
@@ -410,22 +517,48 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         ex = extract_content(meta, cfg=cfg)
         if not ex.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': 'extract-failed'})
+            nonlocal obs_extract_fail
+            obs_extract_fail += 1
             try:
                 _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
             except Exception:
                 pass
             return None
+        # Recency/date gating and language sanity for recent events
+        if recency_gate:
+            pub_ts = _parse_pub_date(ex.date)
+            if not pub_ts:
+                obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                return None
+            if (now_ts - pub_ts) > window_secs:
+                obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
+                return None
+            # Language check (prefer English)
+            try:
+                lang = str((ex.meta.get('lang') or '')).lower()
+            except Exception:
+                lang = ''
+            if lang and not lang.startswith('en'):
+                obs_discard_old['lang_mismatch'] = obs_discard_old.get('lang_mismatch', 0) + 1
+                return None
+            # If not on allowlist, still okay if dateline present and within window; prefer allowlist otherwise
+            # We bias ordering later by deterministic sort; we could also record a flag in citation if needed.
         # Dedupe by URL and content hash (computed on markdown) — within this run only.
         # We intentionally avoid cross-run dedupe via the persistent index because it can
         # eliminate all citations on subsequent runs and produce an empty citations list.
         body_hash = hashlib.sha256((ex.markdown or '').encode('utf-8', 'ignore')).hexdigest()
+        try:
+            host_for_hash = (urlparse(f.final_url).hostname or '').lower().strip('.')
+        except Exception:
+            host_for_hash = ''
         with dedupe_lock:
-            if f.final_url in seen_urls or body_hash in seen_hashes:
+            host_set = seen_hashes_by_host.setdefault(host_for_hash, set())
+            if f.final_url in seen_urls or (body_hash in host_set):
                 nonlocal dedup_skips
                 dedup_skips += 1
                 return None
             seen_urls.add(f.final_url)
-            seen_hashes.add(body_hash)
+            host_set.add(body_hash)
             # Record persistent mapping for future runs
             hash_to_url[body_hash] = f.final_url
 
@@ -585,8 +718,23 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     'dedupe_skips': dedup_skips,
                     'excluded': excluded_skips,
                     'wiki_refs_added': wiki_refs_added,
+                    'fail_reasons': obs_fetch_fail,
                 },
+                'extract': {
+                    'fail_count': obs_extract_fail,
+                },
+                'discard': obs_discard_old,
+                'source_type': obs_source_type,
             }
+            # One-line summary for quick telemetry
+            kept = len(citations[:top_k])
+            line = (
+                f"mode=researcher • fresh={freshness_days or 7}d • hits={len(results)} "
+                f"• kept={kept} • extracted={kept} • sources=[" + ",".join(
+                    sorted({(urlparse(c.get('canonical_url') or '').hostname or '').split(':')[0] for c in citations[:top_k] if c.get('canonical_url')})
+                ) + "]"
+            )
+            answer['debug']['summary_line'] = line
         except Exception:
             pass
 

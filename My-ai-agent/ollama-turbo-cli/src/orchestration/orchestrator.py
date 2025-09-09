@@ -8,6 +8,8 @@ changing behavior. Streaming runner can be phased in next with the same API.
 """
 
 from typing import Any, Dict, List, cast, Optional
+import os
+from datetime import datetime
 from .context import OrchestrationContext
 
 from ..utils import truncate_text
@@ -222,6 +224,14 @@ class ChatTurnOrchestrator:
                 ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
         except Exception as ve:
             ctx.logger.debug(f"validator skipped: {ve}")
+        # Prefix absolute date for recent/cited answers
+        try:
+            if getattr(ctx, '_last_context_blocks', None):
+                if not (final_out or '').strip().lower().startswith('as of '):
+                    prefix = datetime.now().strftime('%Y-%m-%d')
+                    final_out = f"As of {prefix} (local time) —\n\n" + (final_out or '')
+        except Exception:
+            pass
         return final_out
     def handle_standard_chat(self, ctx: OrchestrationContext, *, _suppress_errors: bool = False) -> str:
         """Handle non-streaming chat interaction (delegated from streaming.standard).
@@ -504,6 +514,14 @@ class ChatTurnOrchestrator:
                         prefix = (first_content + "\n\n") if first_content else ""
                         out = f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{final_out}"
                     else:
+                        # Prefix absolute date for recent/cited answers
+                        try:
+                            if getattr(ctx, '_last_context_blocks', None):
+                                if not (final_out or '').strip().lower().startswith('as of '):
+                                    prefix_dt = datetime.now().strftime('%Y-%m-%d')
+                                    final_out = f"As of {prefix_dt} (local time) —\n\n" + (final_out or '')
+                        except Exception:
+                            pass
                         out = final_out
                     # Audit log: store minimal fields
                     try:
@@ -581,6 +599,15 @@ class ChatTurnOrchestrator:
                 ctx.reliability.update({'check': 'enforce', 'consensus': True, 'consensus_k': 3})
             elif profile == 'creative':
                 ctx.reliability.update({'check': 'off'})
+        except Exception:
+            pass
+        # Risk domain routing: geopolitics → strict governance for this turn
+        try:
+            terms = [
+                'israel','gaza','palestine','west bank','hamas','idf','hezbollah','lebanon','iran'
+            ]
+            if any(t in (user_msg or '').lower() for t in terms):
+                ctx.reliability.update({'check': 'enforce', 'consensus': True, 'consensus_k': 3})
         except Exception:
             pass
         # Stash for audit

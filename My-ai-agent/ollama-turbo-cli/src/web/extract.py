@@ -10,6 +10,13 @@ from .config import WebConfig
 import logging
 from .fetch import _httpx_client
 
+# Silence noisy library loggers globally (startup)
+try:
+    logging.getLogger("trafilatura").setLevel(logging.ERROR)
+    logging.getLogger("readability.readability").setLevel(logging.ERROR)
+except Exception:
+    pass
+
 
 @dataclass
 class ExtractResult:
@@ -65,6 +72,9 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     used = {"trafilatura": False, "readability": False, "jina": False}
     meta: Dict[str, Any] = {"title": "", "date": None, "lang": ""}
     markdown = ""
+    if not isinstance(html, str) or not html.strip():
+        # Do not call extractors with empty/None html
+        return "", meta, used
     # Best-effort language detection from html tag
     try:
         mlang = re.search(r"<html[^>]*lang=\"([^\"]+)\"", html, flags=re.I)

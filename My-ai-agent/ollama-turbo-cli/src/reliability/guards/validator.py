@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Dict, Any, Tuple
 import re
 import os
+import logging
 from ..validation.overlap import _tokens as _ovl_tokens
 
 
@@ -52,16 +53,24 @@ class Validator:
             ycfg = {}
         yover = (((ycfg or {}).get('reliability') or {}).get('overlap') or {})
         # Log once
+        global _CFG_LOGGED  # type: ignore
         try:
-            global _CFG_LOGGED  # type: ignore
-        except Exception:
+            _ = _CFG_LOGGED  # type: ignore[name-defined]
+        except NameError:  # pragma: no cover - minimal guard
             _CFG_LOGGED = False  # type: ignore
         if not _CFG_LOGGED:
             prof = (os.getenv('GOVERNANCE_PROFILE') or os.getenv('OVERLAP_PROFILE') or 'balanced')
             th = yover.get('threshold', 0.18)
             pol = yover.get('multi_cite_policy', 'union')
             rvm = yover.get('require_value_match', False)
-            print(f"[reliability/overlap] profile={prof} threshold={th} policy={pol} require_value_match={rvm}")
+            # Only log this line if explicitly enabled to avoid stdout noise
+            try:
+                if (os.getenv('OVERLAP_LOG') or '').strip().lower() in {'1','true','yes','on'}:
+                    logging.getLogger(__name__).info(
+                        f"[reliability/overlap] profile={prof} threshold={th} policy={pol} require_value_match={rvm}"
+                    )
+            except Exception:
+                pass
             _CFG_LOGGED = True  # type: ignore
         def _b(name: str, d: bool) -> bool:
             v = os.getenv(name)
@@ -104,14 +113,22 @@ class Validator:
                         weights[k] = float(v)
         except Exception:
             weights = {}
+        # Profile-aware defaults
+        try:
+            prof_name = (os.getenv('GOVERNANCE_PROFILE') or os.getenv('OVERLAP_PROFILE') or 'balanced').strip().lower()
+        except Exception:
+            prof_name = 'balanced'
+        default_threshold = 0.22 if prof_name == 'strict' else 0.18
+        default_policy = 'any' if prof_name == 'strict' else 'union'
+        default_rvm = True if prof_name == 'strict' else False
         return {
-            'threshold': _f('OVERLAP_THRESHOLD', 0.18),
+            'threshold': _f('OVERLAP_THRESHOLD', default_threshold),
             'discount_word_only_numeric': _f('OVERLAP_DISCOUNT_WORD_ONLY_NUMERIC', 0.25),
             'require_numeric_match': _b('OVERLAP_REQUIRE_NUMERIC_MATCH', False),
-            'require_value_match': _b('OVERLAP_REQUIRE_VALUE_MATCH', False),
+            'require_value_match': _b('OVERLAP_REQUIRE_VALUE_MATCH', default_rvm),
             'min_claim_tokens': _i('OVERLAP_MIN_CLAIM_TOKENS', 3),
             'allow_multi_cite': _b('OVERLAP_ALLOW_MULTI_CITE', True),
-            'policy': os.getenv('OVERLAP_MULTI_CITE_POLICY') or yover.get('multi_cite_policy') or 'union',
+            'policy': os.getenv('OVERLAP_MULTI_CITE_POLICY') or yover.get('multi_cite_policy') or default_policy,
             'token_weights': weights,
         }
 
