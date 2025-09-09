@@ -37,10 +37,10 @@ from .web.pipeline import set_default_config as _web_set_default_config
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: bool = False, k: Optional[int] = None, cite: bool = False, check: str = 'off', consensus: bool = False, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: Optional[bool] = None, k: Optional[int] = None, cite: Optional[bool] = None, check: Optional[str] = None, consensus: Optional[bool] = None, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
                  # Mem0 configuration
-                 mem0_enabled: bool = True,
-                 mem0_local: bool = False,
+                  mem0_enabled: bool = True,
+                  mem0_local: bool = False,
                  mem0_vector_provider: str = 'chroma',
                  mem0_vector_host: str = ':memory:',
                  mem0_vector_port: int = 0,
@@ -192,20 +192,25 @@ class OllamaTurboClient:
             self.warm_models: bool = os.getenv('WARM_MODELS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
             self.ollama_keep_alive_raw: Optional[str] = os.getenv('OLLAMA_KEEP_ALIVE')
         self._current_idempotency_key: Optional[str] = None
-        # Tool results return format (for future API use). Default preserves v1 behavior (strings)
+        # Tool results return format (for future API use). Default: structured objects
         if cfg is not None:
             self.tool_results_format = 'object' if (str(cfg.tooling.results_format).strip().lower() == 'object') else 'string'
         else:
-            trf = (os.getenv('TOOL_RESULTS_FORMAT') or 'string').strip().lower()
+            trf = (os.getenv('TOOL_RESULTS_FORMAT') or 'object').strip().lower()
             self.tool_results_format: str = 'object' if trf == 'object' else 'string'
-        # Reliability mode configuration (no-op placeholders until wired)
+        # Reliability mode configuration (enabled by default for grounded, cited synthesis)
         self.engine: Optional[str] = (cfg.transport.engine if cfg is not None else engine)
+        # Interpret None as "use strong defaults"
+        _ground = True if ground is None else bool(ground)
+        _cite = True if cite is None else bool(cite)
+        _check = ('enforce' if (check is None) else (check if check in {'off', 'warn', 'enforce'} else 'off'))
+        _consensus = bool(consensus) if consensus is not None else False
         self.reliability = {
-            'ground': bool(ground),
+            'ground': _ground,
             'k': k,
-            'cite': bool(cite),
-            'check': check if check in {'off', 'warn', 'enforce'} else 'off',
-            'consensus': bool(consensus),
+            'cite': _cite,
+            'check': _check,
+            'consensus': _consensus,
             'eval_corpus': eval_corpus,
         }
         # Split retrieval vs consensus k to avoid coupling
@@ -291,11 +296,11 @@ class OllamaTurboClient:
                 except Exception:
                     return default
             if self.temperature is None:
-                self.temperature = _env_float('DEEPSEEK_TEMP', 0.6)
+                self.temperature = _env_float('DEEPSEEK_TEMP', 0.725)
             if self.top_p is None:
                 self.top_p = _env_float('DEEPSEEK_TOP_P', 0.95)
             if self.presence_penalty is None:
-                self.presence_penalty = _env_float('DEEPSEEK_PRESENCE_PENALTY', 0.0)
+                self.presence_penalty = _env_float('DEEPSEEK_PRESENCE_PENALTY', 0.05)
             if self.frequency_penalty is None:
                 self.frequency_penalty = _env_float('DEEPSEEK_FREQUENCY_PENALTY', 0.2)
             sys_prompt = self.prompt.deepseek_system_prompt()

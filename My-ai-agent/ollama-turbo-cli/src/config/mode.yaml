@@ -1,0 +1,31 @@
+thresholds:
+  promote: 0.62
+  demote: 0.42
+  referee_band: 0.05
+hysteresis:
+  lock_turns: 2
+  decay: 0.75
+signals:
+  risky_terms: [health, medical, finance, trading, policy, regulation, fda, sec, lawsuit, safety, recall, compliance, gdpr]
+  facty_tokens: [according to, study, report, filed, launched, revenue, patients, evidence, cite, source, versus, vs]
+  recency_tokens: [today, this week, latest, breaking, in 2024, in 2025]
+  style_tokens_standard: [brainstorm, imagine, story, poem, outline, riff, ideas, metaphor]
+  ask_for_sources: [cite, sources, references, footnotes]
+weights:
+  numerals: 0.20
+  risky: 0.25
+  facty: 0.20
+  recency: 0.15
+  qtype: 0.10
+  compare: 0.08
+  ask_src: 0.15
+  link: 0.08
+  style_standard: -0.18
+  prior: 0.25
+  facty_qtype_bonus: 0.35
+tool_bias:
+  web_research: 0.20
+  retrieval: 0.15
+referee:
+  bump_researcher: 0.08
+  bump_standard: -0.08

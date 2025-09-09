@@ -77,6 +77,8 @@ from .fetch import fetch_url, _httpx_client
 from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
+from .normalize import canonicalize, dedupe_citations
+from .loc import format_loc
 
 _DEFAULT_CFG: Optional[WebConfig] = None
 
@@ -100,6 +102,16 @@ def _query_cache_key(query: str, opts: Dict[str, Any]) -> str:
 
 def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, top_k: int = 5, force_refresh: bool = False) -> Dict[str, Any]:
     cfg = cfg or _DEFAULT_CFG or WebConfig()
+    # Honor per-call env overrides for dynamic fields used in tests and runtime tuning
+    try:
+        env_excl = os.getenv("WEB_EXCLUDE_CITATION_DOMAINS")
+        if env_excl is not None:
+            cfg.exclude_citation_domains = [d.strip().lower() for d in env_excl.split(',') if d.strip()]
+        env_cache = os.getenv("WEB_CACHE_ROOT")
+        if env_cache:
+            cfg.cache_root = env_cache
+    except Exception:
+        pass
     os.makedirs(cfg.cache_root, exist_ok=True)
     opts = {
         'site_include': site_include,
@@ -482,6 +494,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 pg = _line_to_page(entry['line'])
                 if pg:
                     entry['page'] = pg
+                loc = format_loc(entry)
+                if loc:
+                    entry['loc'] = loc
                 lines.append(entry)
             if lines:
                 cit['lines'].extend(lines)
@@ -503,8 +518,15 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             except Exception:
                 continue
 
-    # Deterministic order: by score if available then by url hash
-    citations.sort(key=lambda c: (c.get('risk', ''), hashlib.sha256(c.get('canonical_url','').encode()).hexdigest()))
+    # Canonicalize + Deduplicate before ordering/limiting
+    for c in citations:
+        try:
+            c['canonical_url'] = canonicalize(c.get('canonical_url') or c.get('url') or '')
+        except Exception:
+            pass
+    citations = dedupe_citations(citations)
+    # Deterministic order: by risk then url hash
+    citations.sort(key=lambda c: (c.get('risk', ''), hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()))
 
     # Fallback: if no citations were produced, retry once with force_refresh=True to bypass
     # potentially stale caches or transient extraction failures.
@@ -513,7 +535,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             _progress.emit_current({"stage": "fallback", "status": "refresh"})
         except Exception:
             pass
-        return run_research(
+        res2 = run_research(
             query,
             cfg=cfg,
             site_include=site_include,
@@ -522,6 +544,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             top_k=top_k,
             force_refresh=True,
         )
+        try:
+            if isinstance(res2, dict):
+                pol = res2.setdefault('policy', {}) if isinstance(res2.get('policy'), dict) else {}
+                pol['forced_refresh_used'] = True
+                res2['policy'] = pol
+        except Exception:
+            pass
+        return res2
 
     answer = {
         'query': query,
@@ -533,6 +563,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'cache_ttl_seconds': cfg.cache_ttl_seconds,
             'simplified_query_used': simplified_used,
             'emergency_search_used': emergency_used,
+            'forced_refresh_used': bool(force_refresh),
+            'freshness_days': freshness_days,
+            'top_k': top_k,
         },
     }
 

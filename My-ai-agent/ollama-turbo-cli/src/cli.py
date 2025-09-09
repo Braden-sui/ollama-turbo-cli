@@ -90,20 +90,22 @@ Examples:
                        type=int,
                        default=None,
                        help='Character limit when printing tool results inline in CLI (defaults from config).')
-    # Reliability mode flags (no-op until pipeline is wired)
+    # Reliability mode flags (defaults now favor grounded, cited, strict answers)
     parser.add_argument('--ground',
-                       action='store_true',
-                       help='Enable retrieval-grounded reliability mode (adds external context).')
+                       action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help='Enable retrieval-grounded reliability mode (adds external context). Default: on')
     parser.add_argument('--k',
                        type=int,
                        help='Top-k retrieval and/or consensus runs (context-dependent).')
     parser.add_argument('--cite',
-                       action='store_true',
-                       help='Request inline citations in the final answer when reliability mode is active.')
+                       action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help='Request inline citations in the final answer when reliability mode is active. Default: on')
     parser.add_argument('--check',
                        choices=['off', 'warn', 'enforce'],
-                       default='off',
-                       help='Validator/guard mode for reliability: off, warn, or enforce (default: off).')
+                       default=None,
+                       help='Validator/guard mode for reliability: off, warn, or enforce. Default: enforce')
     parser.add_argument('--consensus',
                        action='store_true',
                        help='Enable k-run consensus voting (majority/agree-rate).')

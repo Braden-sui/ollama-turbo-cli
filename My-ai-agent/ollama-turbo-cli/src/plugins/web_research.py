@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 from ..web.pipeline import run_research
+from ..routing.query_profile import defaults_for_query
 
 TOOL_SCHEMA = {
     "type": "function",
@@ -27,6 +28,12 @@ TOOL_SCHEMA = {
 
 def web_research(query: str, top_k: int = 5, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, force_refresh: bool = False) -> str:
     # Backward-compatible call shape (tests patch run_research without cfg)
+    if (freshness_days is None) or (not top_k):
+        dk, df = defaults_for_query(query)
+        if freshness_days is None:
+            freshness_days = df
+        if not top_k:
+            top_k = dk
     res = run_research(
         query,
         top_k=int(top_k or 5),

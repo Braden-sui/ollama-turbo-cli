@@ -143,12 +143,11 @@ async def chat_stream(
                         summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(final, getattr(client, '_last_context_blocks', []))
                 except Exception:
                     pass
-                yield f"event: summary\n"
+                yield "event: summary\n"
                 yield f"data: {json.dumps(summary)}\n\n"
                 return
 
             round_content = ""
-            tool_calls_detected = False
             try:
                 for chunk in stream:
                     message = chunk.get('message', {})
@@ -160,7 +159,6 @@ async def chat_stream(
                             yield f"data: {json.dumps({'type': 'token', 'content': safe_piece})}\n\n"
                     # If tool calls are present, stop streaming and finalize silently
                     if message.get('tool_calls'):
-                        tool_calls_detected = True
                         # Run standard chat (tool execution + synthesis) in background to stream progress
                         channel_id = str(uuid.uuid4())
                         prog_q = _web_progress.register(channel_id)
@@ -226,10 +224,14 @@ async def chat_stream(
                         try:
                             if (payload.check or 'off') != 'off':
                                 from src.reliability.guards.validator import Validator
-                                summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(final, getattr(client, '_last_context_blocks', []))
+                                summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(
+                                    final,
+                                    getattr(client, '_last_context_blocks', []),
+                                    getattr(client, '_last_citations_map', {}),
+                                )
                         except Exception:
                             pass
-                        yield f"event: summary\n"
+                        yield "event: summary\n"
                         yield f"data: {json.dumps(summary)}\n\n"
                         return
             except Exception:
@@ -254,10 +256,14 @@ async def chat_stream(
                 try:
                     if (payload.check or 'off') != 'off':
                         from src.reliability.guards.validator import Validator
-                        summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(final, getattr(client, '_last_context_blocks', []))
+                        summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(
+                            final,
+                            getattr(client, '_last_context_blocks', []),
+                            getattr(client, '_last_citations_map', {}),
+                        )
                 except Exception:
                     pass
-                yield f"event: summary\n"
+                yield "event: summary\n"
                 yield f"data: {json.dumps(summary)}\n\n"
                 return
 
@@ -294,7 +300,11 @@ async def chat_stream(
             try:
                 if (payload.check or 'off') != 'off':
                     from src.reliability.guards.validator import Validator
-                    summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(final_out, getattr(client, '_last_context_blocks', []))
+                    summary['validator'] = Validator(mode=str(payload.check or 'off')).validate(
+                        final_out,
+                        getattr(client, '_last_context_blocks', []),
+                        getattr(client, '_last_citations_map', {}),
+                    )
             except Exception:
                 pass
             # Consensus (trace-only): deterministic settings within client
@@ -332,7 +342,7 @@ async def chat_stream(
                     summary['consensus'] = {'k': 1, 'agree_rate': 1.0}
             except Exception:
                 summary['consensus'] = {'k': int(payload.k or 1), 'agree_rate': None}
-            yield f"event: summary\n"
+            yield "event: summary\n"
             yield f"data: {json.dumps(summary)}\n\n"
         finally:
             # Transport clears idempotency when stream completes

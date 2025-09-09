@@ -1,4 +1,4 @@
-"""Centralized prompt management for Ollama Turbo CLI.
+﻿"""Centralized prompt management for Ollama Turbo CLI.
 
 Provides consistent, versioned prompts for:
 - Initial system message
@@ -39,24 +39,24 @@ class PromptManager:
         style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
         base = (
             "You are GPT-OSS running with Harmony channels.\n\n"
-            "— Reasoning —\n"
-            f"• Reasoning: {self.reasoning}\n\n"
-            "— Safety/Process —\n"
-            "• Keep internal reasoning private (no chain-of-thought). Provide only final answers and short, audit-friendly summaries of steps.\n"
-            "• Cite sources briefly when using web tools.\n"
-            f"• {style_line}\n\n"
-            "— Harmony I/O Protocol —\n"
-            "• To call a tool, emit EXACTLY:\n"
+            "â€” Reasoning â€”\n"
+            f"â€¢ Reasoning: {self.reasoning}\n\n"
+            "â€” Safety/Process â€”\n"
+            "â€¢ Keep internal reasoning private (no chain-of-thought). Provide only final answers and short, audit-friendly summaries of steps.\n"
+            "â€¢ Cite sources briefly when using web tools.\n"
+            f"â€¢ {style_line}\n\n"
+            "â€” Harmony I/O Protocol â€”\n"
+            "â€¢ To call a tool, emit EXACTLY:\n"
             "  <|channel|>commentary to=functions.TOOLNAME\n"
             "  <|message|>{JSON_ARGS}<|call|>\n"
-            "• Always finish with:\n"
+            "â€¢ Always finish with:\n"
             "  <|channel|>final\n"
             "  <|message|>YOUR ANSWER HERE<|end|>\n\n"
-            "— Tool Use Policy —\n"
-            "• Prefer minimal calls that answer the question directly.\n"
-            "• Summarize tool results; avoid dumping raw blobs unless asked.\n\n"
-            "— Formatting —\n"
-            "• Use clear paragraphs or short bullets when synthesizing.\n"
+            "â€” Tool Use Policy â€”\n"
+            "â€¢ Prefer minimal calls that answer the question directly.\n"
+            "â€¢ Summarize tool results; avoid dumping raw blobs unless asked.\n\n"
+            "â€” Formatting â€”\n"
+            "â€¢ Use clear paragraphs or short bullets when synthesizing.\n"
         )
         # Preserve behavior: fewshots off by default; include only when explicitly enabled
         if getattr(self, "fewshots", False):
@@ -73,11 +73,11 @@ class PromptManager:
         style_line = "Be thorough and structured." if verbosity == "detailed" else "Be concise but complete."
         return (
             "You are a helpful AI assistant.\n"
-            f"• Reasoning effort: {self.reasoning}.\n"
-            f"• Style: {style_line}\n"
-            "• Stay focused on the user's request.\n"
-            "• Use tools only when necessary and summarize results clearly.\n"
-            "• Provide clear steps or short bullets when appropriate.\n"
+            f"â€¢ Reasoning effort: {self.reasoning}.\n"
+            f"â€¢ Style: {style_line}\n"
+            "â€¢ Stay focused on the user's request.\n"
+            "â€¢ Use tools only when necessary and summarize results clearly.\n"
+            "â€¢ Provide clear steps or short bullets when appropriate.\n"
         )
 
     # ---------- Post-Tool Reprompt ----------
@@ -86,14 +86,21 @@ class PromptManager:
         if verbose:
             return (
                 "Using the tool results above, produce <|channel|>final with:\n"
-                "1) What you checked (1–2 sentences)\n"
-                "2) Key findings (3–7 bullets with brief inline citations)\n"
+                "1) What you checked (1â€“2 sentences)\n"
+                "2) Key findings (3â€“7 bullets with brief inline citations)\n"
                 "3) Direct answer\n"
                 "4) Important caveats\n"
             )
         return (
             "Based on the tool results above, produce <|channel|>final with a clear, synthesized answer. "
             "Summarize; avoid copying raw tool output."
+        )
+
+    # ---------- Post-Tool Reprompt (override for cited synthesis) ----------
+    def reprompt_after_tools(self) -> str:  # type: ignore[override]
+        return (
+            "Synthesize an answer only from context.docs and citations above. "
+            "Use inline [n] that map to citations[n]. If a claim isn’t supported, say so."
         )
 
     # ---------- Mem0 Context Block ----------

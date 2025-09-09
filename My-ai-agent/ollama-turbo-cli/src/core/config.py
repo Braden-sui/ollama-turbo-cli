@@ -176,10 +176,10 @@ class Mem0Config:
 
 @dataclass
 class ReliabilityConfig:
-    ground: bool = False
+    ground: bool = True
     k: Optional[int] = None
-    cite: bool = False
-    check: str = "off"  # off|warn|enforce
+    cite: bool = True
+    check: str = "enforce"  # off|warn|enforce
     consensus: bool = False
     eval_corpus: Optional[str] = None
 
@@ -248,7 +248,9 @@ class WebConfig:
     allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
     # Citation policy
     exclude_citation_domains: list[str] = field(default_factory=lambda: [
-        d.strip().lower() for d in (os.getenv("WEB_EXCLUDE_CITATION_DOMAINS", "").split(",") if os.getenv("WEB_EXCLUDE_CITATION_DOMAINS") else []) if d.strip()
+        d.strip().lower() for d in (
+            os.getenv("WEB_EXCLUDE_CITATION_DOMAINS", "wikipedia.org,reddit.com").split(",")
+        ) if d.strip()
     ])
     # Debugging / fallbacks
     emergency_bootstrap: bool = field(default_factory=lambda: _env_bool("WEB_EMERGENCY_BOOTSTRAP", True))

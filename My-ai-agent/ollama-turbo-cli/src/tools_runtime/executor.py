@@ -217,22 +217,39 @@ class ToolRuntimeExecutor:
                 try:
                     if not isinstance(obj, dict):
                         return None
-                    results = obj.get('results') or []
-                    if not isinstance(results, list):
-                        return None
                     lines = []
-                    title_head = 'DuckDuckGo' if tool == 'duckduckgo_search' else ('Wikipedia' if tool == 'wikipedia_search' else tool)
-                    lines.append(f"{title_head}: Top {len(results)} results")
-                    for i, r in enumerate(results[:5], 1):
-                        if not isinstance(r, dict):
-                            continue
-                        title = str(r.get('title') or '(no title)')
-                        url = str(r.get('url') or '')
-                        snippet = str(r.get('snippet') or '')
-                        lines.append(f"{i}. {title} - {url}")
-                        if snippet:
-                            lines.append(f"   {snippet[:160]}")
-                    return "\n".join(lines)
+                    # Renderers per tool
+                    if tool in ('duckduckgo_search', 'wikipedia_search'):
+                        results = obj.get('results') or []
+                        if not isinstance(results, list):
+                            return None
+                        title_head = 'DuckDuckGo' if tool == 'duckduckgo_search' else 'Wikipedia'
+                        lines.append(f"{title_head}: Top {len(results)} results")
+                        for i, r in enumerate(results[:5], 1):
+                            if not isinstance(r, dict):
+                                continue
+                            title = str(r.get('title') or '(no title)')
+                            url = str(r.get('url') or '')
+                            snippet = str(r.get('snippet') or '')
+                            lines.append(f"{i}. {title} - {url}")
+                            if snippet:
+                                lines.append(f"   {snippet[:160]}")
+                        return "\n".join(lines)
+                    if tool == 'web_research':
+                        cits = obj.get('citations') or []
+                        if not isinstance(cits, list):
+                            return None
+                        pol = obj.get('policy') or {}
+                        used_refresh = bool(pol.get('forced_refresh_used'))
+                        lines.append(f"web_research: {len(cits)} citations{' (forced refresh)' if used_refresh else ''}")
+                        for i, c in enumerate(cits[:5], 1):
+                            if not isinstance(c, dict):
+                                continue
+                            t = str(c.get('title') or '(no title)')
+                            u = str(c.get('canonical_url') or c.get('url') or '')
+                            lines.append(f"{i}. {t} - {u}")
+                        return "\n".join(lines)
+                    return None
                 except Exception:
                     return None
 
@@ -253,7 +270,7 @@ class ToolRuntimeExecutor:
                     content_str = str(content)
             else:
                 s = str(content) if content is not None else ''
-                if tool in ('duckduckgo_search', 'wikipedia_search') and s.strip().startswith('{'):
+                if tool in ('duckduckgo_search', 'wikipedia_search', 'web_research') and s.strip().startswith('{'):
                     try:
                         parsed_obj = json.loads(s)
                         friendly = _friendly_list(parsed_obj)
