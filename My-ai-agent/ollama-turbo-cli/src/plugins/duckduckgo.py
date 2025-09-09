@@ -44,6 +44,16 @@ def duckduckgo_search(query: str, max_results: int = 3):
             return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "requests not installed"}}
 
         query = (query or "").strip()
+        # Apply YearGuard to strip template-injected years/month-years without touching user quotes
+        try:
+            from ..web.pipeline import _DEFAULT_CFG  # type: ignore
+            from ..web.search import _year_guard  # type: ignore
+            cfg = _DEFAULT_CFG
+            if cfg is not None:
+                sanitized, _ = _year_guard(query, cfg)
+                query = sanitized or query
+        except Exception:
+            pass
         if not query:
             return {"ok": False, "query": query, "engine": "duckduckgo", "results": [], "error": {"message": "query must be provided"}}
 

@@ -246,6 +246,18 @@ class WebConfig:
     # Policies
     respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
     allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
+    # Query policy hardening
+    year_guard_enabled: bool = field(default_factory=lambda: _env_bool("WEB_YEAR_GUARD_ENABLED", True))
+    default_freshness_days: int = field(default_factory=lambda: _env_int("WEB_DEFAULT_FRESHNESS_DAYS", 90, min_value=1))
+    breaking_freshness_days: int = field(default_factory=lambda: _env_int("WEB_BREAKING_FRESHNESS_DAYS", 30, min_value=1))
+    slow_freshness_days: int = field(default_factory=lambda: _env_int("WEB_SLOW_FRESHNESS_DAYS", 365, min_value=1))
+    allowlist_domains: list[str] = field(default_factory=lambda: [
+        d.strip().lower() for d in (
+            os.getenv("WEB_ALLOWLIST_DOMAINS", "reuters.com,apnews.com,ft.com,bloomberg.com,wsj.com,spaceflightnow.com,space.com").split(",")
+        ) if d.strip()
+    ])
+    dateline_soft_accept: bool = field(default_factory=lambda: _env_bool("WEB_DATELINE_SOFT_ACCEPT", True))
+    enable_allowlist_news_fallback: bool = field(default_factory=lambda: _env_bool("WEB_ENABLE_ALLOWLIST_NEWS_FALLBACK", True))
     # Citation policy
     exclude_citation_domains: list[str] = field(default_factory=lambda: [
         d.strip().lower() for d in (
@@ -270,7 +282,7 @@ class WebConfig:
     https_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")))
     all_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("ALL_PROXY") or os.getenv("all_proxy")))
     no_proxy: Optional[str] = field(default_factory=lambda: (os.getenv("NO_PROXY") or os.getenv("no_proxy")))
-    # Storage locationsq
+    # Storage locations
     cache_root: str = field(default_factory=lambda: os.getenv("WEB_CACHE_ROOT", ".sandbox/webcache"))
     archive_enabled: bool = field(default_factory=lambda: _env_bool("WEB_ARCHIVE_ENABLED", True))
     archive_check_memento_first: bool = field(default_factory=lambda: _env_bool("WEB_ARCHIVE_CHECK_FIRST", False))
@@ -352,7 +364,7 @@ class ClientRuntimeConfig:
         cfg.streaming.idle_reconnect_secs = _env_int("CLI_STREAM_IDLE_RECONNECT_SECS", 90, min_value=10)
 
         # Tooling
-        cfg.tooling.context_cap = _env_int("TOOL_CONTEXT_MAX_CHARS", 4000)
+        cfg.tooling.context_cap = _env_int("TOOL_CONTEXT_MAX_CHARS", 12000)
         cfg.tooling.multi_round = _env_bool("MULTI_ROUND_TOOLS", True)
         cfg.tooling.max_rounds = max(1, _env_int("TOOL_MAX_ROUNDS", 6))
         trf = (os.getenv("TOOL_RESULTS_FORMAT") or "string").strip().lower()

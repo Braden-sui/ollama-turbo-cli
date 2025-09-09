@@ -94,30 +94,40 @@ def _is_recency_trigger(text: str, freshness_days: Optional[int]) -> bool:
     return any(k in t for k in ["today", "this week", "recent", "recently", "latest", "breaking", "past week", "last week"])
 
 
-def _strip_stale_years(q: str) -> str:
-    """Remove explicit years older than the current year to avoid stale searches."""
+def _year_guard(q: str, cfg: WebConfig) -> tuple[str, Dict[str, int]]:
+    """Strip templated year artifacts without touching genuine user constraints.
+
+    Minimal policy:
+    - Remove a trailing "Mon YYYY" or "YYYY" token often appended by templates.
+    - Do nothing if feature is disabled.
+    Returns sanitized query and counters.
+    """
+    counters = {"stripped_year_tokens": 0}
     try:
-        now_y = datetime.now().year
+        if not getattr(cfg, 'year_guard_enabled', True):
+            return q, counters
+        s = q.strip()
+        # Strip trailing "Mon YYYY" (e.g., "Sep 2025")
+        if re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+20\d{2}$", s, flags=re.I):
+            s = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+20\d{2}$", "", s, flags=re.I).strip()
+            counters["stripped_year_tokens"] += 1
+        # Strip trailing standalone year token (e.g., "2024")
+        if re.search(r"\b20\d{2}$", s):
+            s = re.sub(r"\b20\d{2}$", "", s).strip()
+            counters["stripped_year_tokens"] += 1
+        return s, counters
     except Exception:
-        now_y = 2025
-    # Remove 2010..(current_year-1)
-    years = [str(y) for y in range(2010, max(2010, now_y))]
-    pat = re.compile(r"\b(" + "|".join(map(re.escape, years)) + r")\b") if years else None
-    return pat.sub("", q) if pat else q
+        return q, counters
 
 
-def _recency_augmented_query(q: SearchQuery) -> str:
-    """Rewrite query for recency: strip stale years and append current month/year token."""
-    base = q.query or ""
-    if _is_recency_trigger(base, q.freshness_days):
-        try:
-            base = _strip_stale_years(base)
-            # Append an absolute month/year token to bias engines
-            label = datetime.now().strftime("%b %Y")  # e.g., "Sep 2025"
-            base = (base.strip() + f" {label}").strip()
-        except Exception:
-            pass
-    return base
+def _recency_augmented_query(q: SearchQuery, cfg: WebConfig) -> str:
+    """Return the query without injecting years; apply YearGuard to remove templated tails."""
+    base = (q.query or "").strip()
+    try:
+        sanitized, _ = _year_guard(base, cfg)
+        return sanitized
+    except Exception:
+        return base
 
 
 def _discover_sitemaps_for_site(site: str, cfg: WebConfig) -> List[str]:
@@ -253,7 +263,7 @@ def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchRe
     This avoids external API keys and keeps network policy centralized via WebConfig.
     """
     try:
-        aug = _recency_augmented_query(q)
+        aug = _recency_augmented_query(q, cfg)
         qtext = f"site:{q.site} {aug}" if q.site else aug
         headers_json = {"Accept": "application/json", "User-Agent": cfg.user_agent}
         params = {"q": qtext, "format": "json", "no_html": "1", "no_redirect": "1", "t": "ollama-turbo-cli"}
@@ -355,7 +365,7 @@ def _search_brave(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        aug = _recency_augmented_query(q)
+        aug = _recency_augmented_query(q, cfg)
         params = {"q": aug, "count": 10}
         if q.site:
             params["q"] = f"site:{q.site} {aug}"
@@ -409,7 +419,7 @@ def _search_tavily(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        aug = _recency_augmented_query(q)
+        aug = _recency_augmented_query(q, cfg)
         payload = {"query": aug, "search_depth": "basic", "max_results": 10}
         if q.site:
             payload["query"] = f"site:{q.site} {aug}"
@@ -430,7 +440,7 @@ def _search_exa(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key:
         return []
     try:
-        aug = _recency_augmented_query(q)
+        aug = _recency_augmented_query(q, cfg)
         payload = {"query": aug, "numResults": 10}
         if q.site:
             payload["query"] = f"site:{q.site} {aug}"
@@ -451,7 +461,7 @@ def _search_google_pse(q: SearchQuery, cfg: WebConfig) -> List[SearchResult]:
     if not key or not cx:
         return []
     try:
-        aug = _recency_augmented_query(q)
+        aug = _recency_augmented_query(q, cfg)
         qtext = f"site:{q.site} {aug}" if q.site else aug
         with _httpx_client(cfg) as c:
             r = c.get("https://www.googleapis.com/customsearch/v1", params={"key": key, "cx": cx, "q": qtext}, timeout=cfg.timeout_read)

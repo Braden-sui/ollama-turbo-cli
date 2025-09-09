@@ -99,6 +99,24 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
                     m2 = re.search(r"<time[^>]+datetime=\"([^\"]+)\"", html, flags=re.I)
                     if m2:
                         meta["date"] = m2.group(1)
+                # OpenGraph published/updated time
+                if not meta.get('date'):
+                    m3 = re.search(r"<meta[^>]+property=\"og:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                    if m3:
+                        meta["date"] = m3.group(1)
+                if not meta.get('date'):
+                    m4 = re.search(r"<meta[^>]+property=\"og:updated_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                    if m4:
+                        meta["date"] = m4.group(1)
+                # itemprop and common name fallbacks
+                if not meta.get('date'):
+                    m5 = re.search(r"<meta[^>]+itemprop=\"datePublished\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                    if m5:
+                        meta["date"] = m5.group(1)
+                if not meta.get('date'):
+                    m6 = re.search(r"<meta[^>]+name=\"(date|pubdate|publishdate)\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                    if m6:
+                        meta["date"] = m6.group(2)
                 if not meta.get('date'):
                     for js in re.findall(r"<script[^>]+type=\"application/ld\+json\"[^>]*>(.*?)</script>", html, flags=re.I|re.S):
                         try:
