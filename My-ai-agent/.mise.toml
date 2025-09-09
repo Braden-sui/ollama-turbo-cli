@@ -1,0 +1,9 @@
+[tools]
+node = "22.9.0"
+python = "3.12.10"
+rust = "1.89.0"
+go = "1.22.5"
+
+[env]
+PIP_DISABLE_PIP_VERSION_CHECK = "1"
+UVLOOP_NO_EXTENSIONS = "0"
