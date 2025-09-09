@@ -72,7 +72,7 @@ except Exception:
     except Exception:
         pass
 from . import progress as _progress
-from .search import search, SearchResult
+from .search import search, SearchResult, _year_guard
 from .fetch import fetch_url, _httpx_client
 from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
@@ -119,13 +119,56 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
+    # YearGuard: strip templated year tails (no injection of month/year)
+    try:
+        q_sanitized, yg_counters = _year_guard(query, cfg)
+    except Exception:
+        q_sanitized, yg_counters = (query, {"stripped_year_tokens": 0})
+    # Resolve freshness by policy when not explicitly provided
+    def _resolve_relative_span_days(qtext: str) -> Optional[int]:
+        try:
+            s = (qtext or '').lower()
+            now = datetime.now()
+            # past N days/weeks/months
+            m = re.search(r"\b(past|last)\s+(\d{1,3})\s*(day|days|week|weeks|month|months)\b", s)
+            if m:
+                n = int(m.group(2))
+                unit = m.group(3)
+                if unit.startswith('day'):
+                    return max(1, n)
+                if unit.startswith('week'):
+                    return max(1, n * 7)
+                if unit.startswith('month'):
+                    return max(1, n * 30)
+            if 'this year' in s:
+                start = datetime(now.year, 1, 1)
+                return max(1, (now - start).days or 1)
+            if 'last year' in s:
+                return 365
+            return None
+        except Exception:
+            return None
+    resolved_days = _resolve_relative_span_days(q_sanitized)
+    # Breaking/slow topic heuristics (keywords)
+    s_low = (q_sanitized or '').lower()
+    is_breaking = any(k in s_low for k in ['breaking', 'latest', 'today', 'this week', 'recent'])
+    is_slow = any(k in s_low for k in ['standard', 'standards', 'textbook', 'backgrounder', 'overview'])
+    freshness_final = (
+        int(freshness_days) if (freshness_days is not None) else (
+            resolved_days if (resolved_days is not None) else (
+                cfg.breaking_freshness_days if is_breaking else (
+                    cfg.slow_freshness_days if is_slow else cfg.default_freshness_days
+                )
+            )
+        )
+    )
     opts = {
         'site_include': site_include,
         'site_exclude': site_exclude,
-        'freshness_days': freshness_days,
+        'freshness_days': freshness_final,
         'top_k': top_k,
     }
-    key = _query_cache_key(query, opts)
+    key = _query_cache_key(q_sanitized, opts)
     cache_path = os.path.join(cfg.cache_root, f"query_{key}.json")
     now = time.time()
     # Load persistent dedupe index (hash -> url)
@@ -155,7 +198,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         _progress.emit_current({"stage": "search", "status": "start", "query": query})
     except Exception:
         pass
-    results = search(query, cfg=cfg, site=site_include, freshness_days=freshness_days)
+    results = search(q_sanitized, cfg=cfg, site=site_include, freshness_days=freshness_final)
     try:
         _progress.emit_current({"stage": "search", "status": "done", "count": len(results)})
     except Exception:
@@ -177,22 +220,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         # Heuristic: simplify long/narrow queries and retry once
         try:
             import re as _re
-            toks = _re.findall(r"[A-Za-z0-9]+", query)
+            toks = _re.findall(r"[A-Za-z0-9]+", q_sanitized)
             stop = {
                 'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
-                'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
-                '2023','2024','2025'
+                'is','are','was','were','be','being','been','this','that','these','those','it','its','into'
             }
             key_toks = [t for t in toks if t.lower() not in stop]
-            short_q = " ".join(key_toks[:6]) or query[:80]
+            short_q = " ".join(key_toks[:6]) or q_sanitized[:80]
         except Exception:
-            short_q = query[:80]
+            short_q = q_sanitized[:80]
         if short_q and short_q.strip().lower() != query.strip().lower():
             try:
                 _progress.emit_current({"stage": "search", "status": "retry", "query": short_q})
             except Exception:
                 pass
-            results = search(short_q, cfg=cfg, site=site_include, freshness_days=freshness_days)
+            results = search(short_q, cfg=cfg, site=site_include, freshness_days=freshness_final)
             simplified_used = True
             simplified_count = len(results)
 
@@ -200,7 +242,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         # Final variant fallback: try "<ProperNoun> political makeup 2024" style seed
         try:
             import re as _re
-            toks = _re.findall(r"[A-Za-z][A-Za-z0-9-]*", query)
+            toks = _re.findall(r"[A-Za-z][A-Za-z0-9-]*", q_sanitized)
             proper = None
             for t in toks:
                 if t[0].isupper():
@@ -208,12 +250,13 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     break
             core = proper or (toks[0] if toks else "")
             if core:
-                variant_q = f"{core} political makeup 2024"
+                # Avoid hardcoding a year; use generic variant without years
+                variant_q = f"{core} political makeup"
                 try:
                     _progress.emit_current({"stage": "search", "status": "variant", "query": variant_q})
                 except Exception:
                     pass
-                results = search(variant_q, cfg=cfg, site=site_include, freshness_days=freshness_days)
+                results = search(variant_q, cfg=cfg, site=site_include, freshness_days=freshness_final)
                 variant_count = len(results)
         except Exception:
             pass
@@ -447,9 +490,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         t = (q or '').lower()
         return any(k in t for k in ['today','this week','recent','recently','latest','breaking','past week','last week'])
 
-    recency_gate = _recency_required(query, freshness_days)
+    recency_gate = _recency_required(q_sanitized, freshness_final)
     now_ts = time.time()
-    window_secs = (int(freshness_days) * 86400) if (freshness_days and int(freshness_days) > 0) else (7 * 86400)
+    window_secs = (int(freshness_final) * 86400) if (freshness_final and int(freshness_final) > 0) else (cfg.default_freshness_days * 86400)
 
     def _parse_pub_date(s: Optional[str]) -> Optional[float]:
         if not s:
@@ -524,15 +567,48 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             except Exception:
                 pass
             return None
-        # Recency/date gating and language sanity for recent events
+        # Recency/date gating and language sanity for recent events (hardened dateline)
         if recency_gate:
+            # Determine date and confidence
+            date_conf = 'low'
             pub_ts = _parse_pub_date(ex.date)
-            if not pub_ts:
-                obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
-                return None
-            if (now_ts - pub_ts) > window_secs:
-                obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
-                return None
+            if pub_ts:
+                date_conf = 'high'
+            else:
+                # Fallback: parse date from URL path (e.g., /2025/09/08/)
+                def _date_from_path(u: str) -> Optional[float]:
+                    try:
+                        p = urlparse(u)
+                        path = (p.path or '')
+                        m = re.search(r"/20(\d{2})/(\d{2})/(\d{2})/", path)
+                        if m:
+                            y, mo, da = int('20'+m.group(1)), int(m.group(2)), int(m.group(3))
+                            return datetime(y, mo, da).timestamp()
+                        m2 = re.search(r"/20(\d{2})-(\d{2})-(\d{2})", path)
+                        if m2:
+                            y, mo, da = int('20'+m2.group(1)), int(m2.group(2)), int(m2.group(3))
+                            return datetime(y, mo, da).timestamp()
+                        m3 = re.search(r"/20(\d{2})/(\d{2})/", path)
+                        if m3:
+                            y, mo = int('20'+m3.group(1)), int(m3.group(2))
+                            return datetime(y, mo, 1).timestamp()
+                    except Exception:
+                        return None
+                    return None
+                path_ts = _date_from_path(f.final_url)
+                if path_ts:
+                    pub_ts = path_ts
+                    date_conf = 'medium'
+            h = _host(sr.url)
+            is_trusted = _in_list(h, (cfg.allowlist_domains or []) + allow_list)
+            if pub_ts:
+                if (now_ts - pub_ts) > window_secs:
+                    obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
+                    return None
+            else:
+                if not (cfg.dateline_soft_accept and is_trusted):
+                    obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                    return None
             # Language check (prefer English)
             try:
                 lang = str((ex.meta.get('lang') or '')).lower()
@@ -614,6 +690,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'risk_reasons': ex.risk_reasons,
             'browser_used': f.browser_used,
             'kind': ex.kind,
+            'date_confidence': ('high' if pub_ts and ex.date else ('medium' if pub_ts else 'low')),
+            'domain_trust': is_trusted,
             'lines': [],
         }
         for r in ranked:
@@ -658,8 +736,15 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
     citations = dedupe_citations(citations)
-    # Deterministic order: by risk then url hash
-    citations.sort(key=lambda c: (c.get('risk', ''), hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()))
+    # Prefer trusted domains and higher date confidence, then by risk/url
+    def _conf_val(v: str) -> int:
+        return 2 if v == 'high' else (1 if v == 'medium' else 0)
+    citations.sort(key=lambda c: (
+        -1 if c.get('domain_trust') else 0,
+        -_conf_val(str(c.get('date_confidence','low'))),
+        c.get('risk',''),
+        hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
+    ))
 
     # Fallback: if no citations were produced, retry once with force_refresh=True to bypass
     # potentially stale caches or transient extraction failures.
@@ -669,11 +754,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
         res2 = run_research(
-            query,
+            q_sanitized,
             cfg=cfg,
             site_include=site_include,
             site_exclude=site_exclude,
-            freshness_days=freshness_days,
+            freshness_days=freshness_final,
             top_k=top_k,
             force_refresh=True,
         )
@@ -686,8 +771,36 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
         return res2
 
+    # Allowlist news fallback: query tier-one outlets directly when empty
+    if not citations and cfg.enable_allowlist_news_fallback:
+        try:
+            _progress.emit_current({"stage": "fallback", "status": "allowlist"})
+        except Exception:
+            pass
+        allow_candidates: List[SearchResult] = []
+        try:
+            for dom in (cfg.allowlist_domains or [])[:6]:
+                try:
+                    allow_candidates.extend(search(q_sanitized, cfg=cfg, site=dom, freshness_days=freshness_final))
+                except Exception:
+                    continue
+        except Exception:
+            allow_candidates = []
+        if allow_candidates:
+            # Build citations for allowlist set
+            with ThreadPoolExecutor(max_workers=max_workers) as exr2:
+                futs2 = [exr2.submit(_build_citation, sr) for sr in allow_candidates[: top_k * 2]]
+                for fut in as_completed(futs2):
+                    try:
+                        cit = fut.result()
+                        if cit:
+                            citations.append(cit)
+                    except Exception:
+                        continue
+
+
     answer = {
-        'query': query,
+        'query': q_sanitized,
         'top_k': top_k,
         'citations': citations[:top_k],
         'policy': {
@@ -697,7 +810,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'simplified_query_used': simplified_used,
             'emergency_search_used': emergency_used,
             'forced_refresh_used': bool(force_refresh),
-            'freshness_days': freshness_days,
+            'freshness_days': freshness_final,
             'top_k': top_k,
         },
     }
@@ -725,11 +838,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 },
                 'discard': obs_discard_old,
                 'source_type': obs_source_type,
+                'year_guard': yg_counters,
+                'resolved_window_days': freshness_final,
+                'relative_span_resolved': bool(resolved_days is not None),
             }
             # One-line summary for quick telemetry
             kept = len(citations[:top_k])
             line = (
-                f"mode=researcher • fresh={freshness_days or 7}d • hits={len(results)} "
+                f"mode=researcher • fresh={freshness_final or cfg.default_freshness_days}d • hits={len(results)} "
                 f"• kept={kept} • extracted={kept} • sources=[" + ",".join(
                     sorted({(urlparse(c.get('canonical_url') or '').hostname or '').split(':')[0] for c in citations[:top_k] if c.get('canonical_url')})
                 ) + "]"

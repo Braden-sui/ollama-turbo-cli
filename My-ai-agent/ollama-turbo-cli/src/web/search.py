@@ -107,15 +107,29 @@ def _year_guard(q: str, cfg: WebConfig) -> tuple[str, Dict[str, int]]:
         if not getattr(cfg, 'year_guard_enabled', True):
             return q, counters
         s = q.strip()
-        # Strip trailing "Mon YYYY" (e.g., "Sep 2025")
-        if re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+20\d{2}$", s, flags=re.I):
-            s = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+20\d{2}$", "", s, flags=re.I).strip()
+        # Split on quoted segments; operate only on the final unquoted tail
+        parts = re.split(r'(".*?"|\'.*?\')', s)
+        if not parts:
+            return s, counters
+        # Identify last unquoted segment index
+        last_idx = len(parts) - 1
+        # If the last segment is quoted, do nothing
+        tail = parts[last_idx]
+        if (tail.startswith('"') and tail.endswith('"')) or (tail.startswith("'") and tail.endswith("'")):
+            return s, counters
+        # Strip trailing "Mon YYYY" and then trailing standalone year in the tail only
+        before = tail
+        tail = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+20\d{2}$", "", tail, flags=re.I).strip()
+        if before != tail:
             counters["stripped_year_tokens"] += 1
-        # Strip trailing standalone year token (e.g., "2024")
-        if re.search(r"\b20\d{2}$", s):
-            s = re.sub(r"\b20\d{2}$", "", s).strip()
+        before2 = tail
+        tail = re.sub(r"\b20\d{2}$", "", tail).strip()
+        if before2 != tail:
             counters["stripped_year_tokens"] += 1
-        return s, counters
+        parts[last_idx] = tail
+        s2 = "".join(parts)
+        s2 = re.sub(r"\s{2,}", " ", s2).strip()
+        return s2, counters
     except Exception:
         return q, counters
 
