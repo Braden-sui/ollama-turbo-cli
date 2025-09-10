@@ -571,17 +571,25 @@ class ChatTurnOrchestrator:
                     except Exception:
                         pass
 
-                    # Build output with optional snippets after the answer
-                    prefix = (first_content + "\n\n") if first_content else ""
-                    out = f"{prefix}{final_out}"
+                    # Build output with optional snippets after the answer (Phase 0)
                     try:
                         import os as _os
                         _vis2 = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
                     except Exception:
                         _vis2 = True
                     show_snips = bool(getattr(ctx, 'show_snippets', False))
-                    if all_tool_results and show_snips and _vis2:
-                        out = out + "\n\nSources (raw snippets)\n" + '\n'.join(all_tool_results)
+                    if all_tool_results:
+                        if show_snips and _vis2:
+                            # New behavior: place sources after the answer (do not drop legacy path)
+                            prefix = (first_content + "\n\n") if first_content else ""
+                            out = f"{prefix}{final_out}\n\nSources (raw snippets)\n" + '\n'.join(all_tool_results)
+                        else:
+                            # Back-compat default: legacy banner before the answer
+                            prefix = (first_content + "\n\n") if first_content else ""
+                            out = f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{final_out}"
+                    else:
+                        # No tool results: return the (possibly prefixed) final answer only
+                        out = final_out
                     # Audit log: store minimal fields
                     try:
                         mode_meta = getattr(ctx, '_turn_mode_meta', {}) or {}

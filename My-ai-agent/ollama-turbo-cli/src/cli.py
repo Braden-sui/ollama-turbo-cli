@@ -63,7 +63,11 @@ Examples:
     parser.add_argument('--show-snippets',
                        action='store_true',
                        default=False,
-                       help='Show a Sources (raw snippets) section after the final answer when tools were used (Phase 0). Default: off')
+                       help='Show a Sources (raw snippets) section after the final answer when tools were used (Phase 0). Default: on unless --legacy is set')
+    parser.add_argument('--legacy',
+                       action='store_true',
+                       default=False,
+                       help='Use legacy CLI layout: print [Tool Results] before the answer instead of the new Sources-after-answer UX')
     parser.add_argument('--quiet',
                        action='store_true',
                        help='Reduce CLI output (suppress helper prints)')
@@ -247,13 +251,32 @@ Examples:
         )
         cfg = merge_cli_overrides(cfg, args)
 
+        # Resolve effective show_snippets default (new UX default):
+        #   - If --legacy is present: force False (legacy behavior)
+        #   - Else if --show-snippets is explicitly present: True
+        #   - Else: True (default-on for CLI)
+        try:
+            has_legacy_flag = any(tok == "--legacy" for tok in sys.argv)
+        except Exception:
+            has_legacy_flag = bool(args.legacy)
+        try:
+            has_show_snippets_flag = any(tok == "--show-snippets" for tok in sys.argv)
+        except Exception:
+            has_show_snippets_flag = bool(args.show_snippets)
+        if has_legacy_flag:
+            effective_show_snippets = False
+        elif has_show_snippets_flag:
+            effective_show_snippets = True
+        else:
+            effective_show_snippets = True
+
         # Initialize client (inject cfg)
         client = OllamaTurboClient(
             api_key=args.api_key,
             model=args.model,
             enable_tools=not args.no_tools,
             show_trace=args.show_trace,
-            show_snippets=bool(args.show_snippets),
+            show_snippets=bool(effective_show_snippets),
             reasoning=args.reasoning,
             reasoning_mode=args.reasoning_mode,
             protocol=args.protocol,

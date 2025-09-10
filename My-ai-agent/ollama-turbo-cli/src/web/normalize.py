@@ -10,10 +10,13 @@ def canonicalize(url: str) -> str:
     p = urlparse(url)
     scheme = 'https'
     host = (p.hostname or '').lower()
-    # Strip default ports
-    netloc = hostpy
-    if p.port and p.port not in (80, 443):
-        netloc = f"{host}:{p.port}"
+    # Strip default ports and normalize netloc
+    netloc = host
+    try:
+        if p.port and p.port not in (80, 443):
+            netloc = f"{host}:{p.port}"
+    except Exception:
+        netloc = host
     path = p.path or '/'
     if path != '/' and path.endswith('/'):
         path = path[:-1]

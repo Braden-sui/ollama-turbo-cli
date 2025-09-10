@@ -713,13 +713,14 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
             ctx._mem0_add_after_response(ctx._last_user_message, final_out)
 
             if aggregated_results:
-                # Optionally print and/or append snippets after the answer
+                # Optionally print and/or append snippets, mirroring standard path behavior
                 try:
                     import os as _os
                     _vis2 = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
                 except Exception:
                     _vis2 = True
                 show_snips = bool(getattr(ctx, 'show_snippets', False))
+                prefix = (preface_content + "\n\n") if preface_content else ""
                 if show_snips and _vis2:
                     # Print after the answer for CLI UX
                     if not ctx.quiet:
@@ -736,19 +737,19 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                                 print(out_s)
                         except Exception:
                             pass
-                    # Also append to return value for non-CLI consumers
-                    prefix = (preface_content + "\n\n") if preface_content else ""
+                    # Return answer followed by sources (new path)
                     try:
                         ctx._trace("stream:end")
                     except Exception:
                         pass
                     return f"{prefix}{final_out}\n\nSources (raw snippets)\n" + '\n'.join(aggregated_results)
-                # If disabled, just return the final answer
-                try:
-                    ctx._trace("stream:end")
-                except Exception:
-                    pass
-                return final_out
+                else:
+                    # Back-compat default: legacy banner before the answer
+                    try:
+                        ctx._trace("stream:end")
+                    except Exception:
+                        pass
+                    return f"{prefix}[Tool Results]\n" + '\n'.join(aggregated_results) + f"\n\n{final_out}"
             try:
                 ctx._trace("stream:end")
             except Exception:
