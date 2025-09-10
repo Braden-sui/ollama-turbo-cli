@@ -8,10 +8,12 @@ behind a small class without changing behavior.
 """
 
 from typing import Any, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 # Import existing reliability pipeline/builders
 from ..reliability.retrieval.pipeline import RetrievalPipeline
+from ..reliability.retrieval.research_ingest import citations_to_docs
 from ..reliability.grounding.context_builder import ContextBuilder
 
 
@@ -105,45 +107,62 @@ class ReliabilityIntegration:
                 if web_research is not None:
                     try:
                         tw0 = _time.perf_counter()
-                        raw = web_research(user_message, top_k=int(topk or 4))
+                        # Query fanout: generate a few safe variants to broaden coverage
+                        base_q = str(user_message or '').strip()
+                        variants = [base_q]
+                        # Deterministic, lightweight variants
+                        for suf in (' overview', ' latest', ' explained'):
+                            v = (base_q + suf).strip()
+                            if v not in variants:
+                                variants.append(v)
+                        # Run calls concurrently with a small worker pool
+                        cits_all = []
                         import json as _json
-                        obj = _json.loads(raw) if isinstance(raw, str) else raw
-                        cits = obj.get('citations') if isinstance(obj, dict) else []
-                        context_blocks = []
-                        citations_map = {}
-                        if isinstance(cits, list):
-                            for i, c in enumerate(cits[:topk], 1):
+                        fan_topk = max(4, int(topk or 4))
+                        max_workers = min(4, len(variants))
+                        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                            futs = [ex.submit(web_research, v, fan_topk) for v in variants]
+                            for fut in as_completed(futs):
                                 try:
-                                    title = str(c.get('title') or '')
-                                    url = str(c.get('canonical_url') or c.get('url') or '')
-                                    lines = c.get('lines') or []
-                                    quotes = []
-                                    if isinstance(lines, list):
-                                        for hl in lines[:3]:
-                                            q = (hl or {}).get('quote') or ''
-                                            if q:
-                                                quotes.append(q)
-                                    block = {
-                                        'id': str(i),
-                                        'title': title or (url or f'source {i}'),
-                                        'url': url,
-                                        'source': 'web',
-                                        'text': ('\n'.join(quotes) if quotes else ''),
-                                    }
-                                    context_blocks.append(block)
-                                    citations_map[str(i)] = {'url': url, 'title': (title or url)}
+                                    raw = fut.result()
+                                    obj = _json.loads(raw) if isinstance(raw, str) else raw
+                                    cits = obj.get('citations') if isinstance(obj, dict) else []
+                                    if isinstance(cits, list):
+                                        cits_all.extend(cits)
                                 except Exception:
                                     continue
-                        ctx._last_context_blocks = context_blocks
-                        ctx._last_citations_map = citations_map
+                        cits = cits_all
+                        # Normalize citations -> docs and route through retrieval pipeline (ephemeral)
+                        docs_mem = citations_to_docs(cits, max_docs=100)
+                        rp2 = RetrievalPipeline()
+                        tr0 = _time.perf_counter()
+                        ranked = rp2.run(user_message, k=topk, docs_in_memory=docs_mem, min_score=None, ephemeral=True)
+                        # Recompute retrieval metrics for web-backed docs
+                        try:
+                            avg_score2 = 0.0
+                            if ranked:
+                                avg_score2 = sum(float((d or {}).get('score') or 0.0) for d in ranked) / max(1, len(ranked))
+                            hit_rate2 = min(1.0, len(ranked) / max(1, topk))
+                            ctx._trace(f"retrieval.topk={len(ranked)}")
+                            ctx._trace(f"retrieval.avg_score={avg_score2:.4f}")
+                            ctx._trace(f"retrieval.hit_rate={hit_rate2:.4f}")
+                            ctx._trace("retrieval.fallback_used=1")
+                            ctx._trace(f"retrieval.latency_ms={int((_time.perf_counter()-tr0)*1000)}")
+                        except Exception:
+                            pass
+                        # If no ranked matches (e.g., quotes don't overlap query terms), fall back to raw docs
+                        context_input = ranked if ranked else docs_mem[:topk]
+                        built2 = cb.build(ctx.conversation_history, context_input, max_tokens=max_tokens)
+                        ctx._last_context_blocks = built2.get('context_blocks') or []
+                        ctx._last_citations_map = built2.get('citations_map') or {}
                         system_add = ''
-                        if ctx.reliability.get('cite') and context_blocks:
+                        if ctx.reliability.get('cite') and ctx._last_context_blocks:
                             cited = self.load_system_cited(ctx)
                             system_add = cited or ''
                         if system_add:
                             ctx.conversation_history.append({'role': 'system', 'content': system_add})
                         web_latency_ms = int((_time.perf_counter() - tw0) * 1000)
-                        ctx._trace(f"reliability:context fallback=web sources={len(context_blocks)}")
+                        ctx._trace(f"reliability:context fallback=web sources={len(ctx._last_context_blocks)}")
                         ctx._trace(f"web.latency_ms={web_latency_ms}")
                         fallback_used = True
                     except Exception as fe:

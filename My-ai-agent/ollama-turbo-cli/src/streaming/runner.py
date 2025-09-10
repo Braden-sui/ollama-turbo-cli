@@ -614,11 +614,7 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                 # Reprompt model to synthesize an answer using tool details
                 # Gate strict cited synthesis to contexts with citations or special tools (parity with non-streaming)
                 ctx._trace("reprompt:after-tools")
-                gate_strict = False
-                try:
-                    gate_strict = bool(getattr(ctx, '_last_citations_map', {}) or []) or any((n or '') in {'web_research','retrieval'} for n in (names or []))
-                except Exception:
-                    gate_strict = False
+                gate_strict = should_gate_strict(ctx, names)
                 reprompt_text = (
                     ctx.prompt.reprompt_after_tools() if gate_strict else (
                         'Based on the tool results above, produce <|channel|>final with a clear, concise answer. '
@@ -783,3 +779,19 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
         except Exception:
             pass
         return full_content or ""
+
+# ------------------------- Test helpers -------------------------
+def should_gate_strict(ctx, tool_names):
+    """Return True if strict cited synthesis should be used after tools.
+
+    Gate when:
+    - Citation map is present (web/retrieval context)
+    - Or tool names include web_research/retrieval
+    """
+    try:
+        if bool(getattr(ctx, '_last_citations_map', {}) or []):
+            return True
+        names = tool_names or []
+        return any((n or '') in {'web_research', 'retrieval'} for n in names)
+    except Exception:
+        return False
