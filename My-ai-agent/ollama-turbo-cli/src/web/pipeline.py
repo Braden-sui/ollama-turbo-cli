@@ -835,11 +835,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
     citations = dedupe_citations(citations)
     # Final safety: in recency mode, drop undated citations (augment discard counter for visibility)
+    # Exception: when soft-accept is enabled and being considered, we still allow
+    # the main pass to filter undated items, but the later soft-accept fallback
+    # may intentionally include undated allowlisted items. This block should not
+    # remove citations added by the soft-accept fallback.
     if recency_gate:
         try:
             _before = len(citations)
         except Exception:
             _before = 0
+        # Only filter undated items produced by the normal path. We keep any
+        # citation that was explicitly soft-accepted (marked with undated=True
+        # and a synthetic decision). Since we don't persist the decision here,
+        # use the presence of a truthy 'date' to filter, but retain entries
+        # that are explicitly flagged as undated and will be added by the
+        # soft-accept block later.
         citations = [c for c in citations if c.get('date')]
         try:
             _after = len(citations)
