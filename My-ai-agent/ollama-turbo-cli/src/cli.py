@@ -60,6 +60,10 @@ Examples:
     parser.add_argument('--show-trace',
                        action='store_true',
                        help='Show a separated reasoning trace (tools and steps) after the output')
+    parser.add_argument('--show-snippets',
+                       action='store_true',
+                       default=False,
+                       help='Show a Sources (raw snippets) section after the final answer when tools were used (Phase 0). Default: off')
     parser.add_argument('--quiet',
                        action='store_true',
                        help='Reduce CLI output (suppress helper prints)')
@@ -179,6 +183,12 @@ Examples:
     # Setup logging
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
+    # Optional startup notice when jsonschema is missing (tool schema validation partially disabled)
+    try:
+        import jsonschema  # type: ignore
+    except Exception:
+        if not args.quiet:
+            print("ℹ️ Tool schema validation is partially disabled (jsonschema not installed). Run: pip install \"ollama-turbo-cli[tools]\"")
     
     # Auto-select model based on --protocol when --model is not explicitly provided.
     # We treat an explicit --model flag as authoritative and only warn on mismatches.
@@ -243,6 +253,7 @@ Examples:
             model=args.model,
             enable_tools=not args.no_tools,
             show_trace=args.show_trace,
+            show_snippets=bool(args.show_snippets),
             reasoning=args.reasoning,
             reasoning_mode=args.reasoning_mode,
             protocol=args.protocol,

@@ -37,7 +37,7 @@ from .web.pipeline import set_default_config as _web_set_default_config
 class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
-    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: Optional[bool] = None, k: Optional[int] = None, cite: Optional[bool] = None, check: Optional[str] = None, consensus: Optional[bool] = None, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
+    def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, show_snippets: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: Optional[bool] = None, k: Optional[int] = None, cite: Optional[bool] = None, check: Optional[str] = None, consensus: Optional[bool] = None, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
                  # Mem0 configuration
                   mem0_enabled: bool = True,
                   mem0_local: bool = False,
@@ -75,6 +75,11 @@ class OllamaTurboClient:
         except Exception:
             # Never fail client init due to optional web config propagation
             pass
+        # Phase 0 visibility flags
+        self.show_snippets: bool = bool(show_snippets)
+        # Turn-local/control flags
+        self.flags: Dict[str, Any] = {'ground_degraded': False}
+
         if cfg is not None:
             self.model = cfg.model
             self.enable_tools = enable_tools

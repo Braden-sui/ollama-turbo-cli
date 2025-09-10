@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 try:
     from jsonschema import validate as jsonschema_validate  # type: ignore
     from jsonschema import Draft202012Validator  # type: ignore
-except Exception as e:  # pragma: no cover - import error will be raised when validating
+except Exception as e:  # pragma: no cover - degrade gracefully without jsonschema
     jsonschema_validate = None  # type: ignore
     Draft202012Validator = None  # type: ignore
 
@@ -160,8 +160,23 @@ class PluginManager:
         return module
 
     def _validate_tool_schema(self, schema: Dict[str, Any]) -> None:
+        # Graceful degrade: skip validation when jsonschema is unavailable
         if jsonschema_validate is None or Draft202012Validator is None:
-            raise PluginLoadError("jsonschema is required to validate tool schemas. Please install jsonschema.")
+            try:
+                # Log once per process to avoid noisy repeats
+                global _JSONSCHEMA_WARNED
+            except Exception:
+                _JSONSCHEMA_WARNED = False  # type: ignore[assignment]
+            try:
+                if not globals().get('_JSONSCHEMA_WARNED', False):
+                    self._logger.warning(
+                        "Tool schema validation is partially disabled (jsonschema not installed). "
+                        "Run: pip install \"ollama-turbo-cli[tools]\""
+                    )
+                    globals()['_JSONSCHEMA_WARNED'] = True
+            except Exception:
+                pass
+            return
         try:
             jsonschema_validate(instance=schema, schema=_TOOL_DEFINITION_SCHEMA)
         except Exception as e:

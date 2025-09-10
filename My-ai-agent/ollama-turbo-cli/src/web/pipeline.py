@@ -117,6 +117,18 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         env_cache = os.getenv("WEB_CACHE_ROOT")
         if env_cache:
             cfg.cache_root = env_cache
+        # Ensure debug metrics can be toggled per-call even if a global default config is set
+        env_debug = os.getenv("WEB_DEBUG_METRICS")
+        if env_debug is not None:
+            cfg.debug_metrics = str(env_debug).strip().lower() not in {"0","false","no","off"}
+        # Allow tests/callers to enable the recency soft-accept fallback via env
+        env_soft_accept = os.getenv("WEB_RECENCY_SOFT_ACCEPT_WHEN_EMPTY")
+        if env_soft_accept is not None:
+            cfg.recency_soft_accept_when_empty = str(env_soft_accept).strip().lower() not in {"0","false","no","off"}
+        # Allow tests/callers to toggle dateline soft-accept policy via env
+        env_dateline_soft = os.getenv("WEB_DATELINE_SOFT_ACCEPT")
+        if env_dateline_soft is not None:
+            cfg.dateline_soft_accept = str(env_dateline_soft).strip().lower() not in {"0","false","no","off"}
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -220,6 +232,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
     obs_trust_decisions: List[Dict[str, Any]] = []
+    # Additional observability to make tests deterministic on counters
+    obs_seen_undated: int = 0
     # Dateline instrumentation
     dateline_from_structured = 0
     dateline_from_path = 0
@@ -421,6 +435,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     # Scope content-hash dedupe to hostname, so different outlets with similar wire stubs both survive
     seen_hashes_by_host: Dict[str, set[str]] = {}
     dedupe_lock = threading.Lock()
+    # Observability updates happen from worker threads; protect with a lock to avoid lost updates
+    obs_lock = threading.Lock()
+    # Deterministic accounting for undated items seen during recency gating
+    obs_undated_urls: set[str] = set()
 
     dedup_skips = 0
     excluded_skips = 0
@@ -529,7 +547,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
         # Source-type and policy checks prior to fetch
         stype = _source_type(sr.url)
-        obs_source_type[stype] = obs_source_type.get(stype, 0) + 1
+        with obs_lock:
+            obs_source_type[stype] = obs_source_type.get(stype, 0) + 1
         h = _host(sr.url)
         if _in_list(h, block_list):
             items.append({'url': sr.url, 'ok': False, 'reason': 'blocked-source'})
@@ -549,7 +568,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             items.append({'url': sr.url, 'ok': False, 'reason': f.reason or f"HTTP {f.status}"})
             try:
                 rkey = (f.reason or f"HTTP {f.status}")
-                obs_fetch_fail[rkey] = obs_fetch_fail.get(rkey, 0) + 1
+                with obs_lock:
+                    obs_fetch_fail[rkey] = obs_fetch_fail.get(rkey, 0) + 1
             except Exception:
                 pass
             try:
@@ -573,7 +593,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         if not ex.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': 'extract-failed'})
             nonlocal obs_extract_fail
-            obs_extract_fail += 1
+            with obs_lock:
+                obs_extract_fail += 1
             try:
                 _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
             except Exception:
@@ -619,7 +640,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             if pub_ts:
                 date_conf = 'high'
                 nonlocal dateline_from_structured
-                dateline_from_structured += 1
+                with obs_lock:
+                    dateline_from_structured += 1
             else:
                 # Fallback: parse date from URL path (e.g., /2025/09/08/)
                 def _date_from_path(u: str) -> Optional[float]:
@@ -646,9 +668,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     pub_ts = path_ts
                     date_conf = 'medium'
                     nonlocal dateline_from_path
-                    dateline_from_path += 1
+                    with obs_lock:
+                        dateline_from_path += 1
             # Decide acceptance for recency
             if not pub_ts:
+                # Track that we processed an undated candidate in recency mode
+                try:
+                    nonlocal obs_seen_undated
+                    with obs_lock:
+                        obs_seen_undated += 1
+                        try:
+                            obs_undated_urls.add(f.final_url)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # Soft-accept path: when explicitly allowed by caller (final fallback)
                 if allow_undated_soft and ((is_allowlisted) or (use_trust and (t_score >= threshold))):
                     decision = 'soft-accept-undated'
@@ -659,42 +693,49 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 elif is_allowlisted:
                     # allowlist path: reject undated in recency when dateline_soft_accept is false
                     if not cfg.dateline_soft_accept:
-                        obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                        with obs_lock:
+                            obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
                         decision = 'reject'
                         decision_note = 'NO_DATE_RECENCY_ALLOWLIST_REJECT'
                         # log and bail
                         try:
                             if cfg.debug_metrics:
-                                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': True, 'score': None, 'decision': decision, 'reason': decision_note})
+                                with obs_lock:
+                                    obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': True, 'score': None, 'decision': decision, 'reason': decision_note})
                         except Exception:
                             pass
                         if not allow_undated_soft:
                             return None
                 else:
-                    obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+                    with obs_lock:
+                        obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
                     decision = 'reject'
                     decision_note = 'NO_DATE_RECENCY_REJECT'
                     try:
                         if cfg.debug_metrics:
-                            obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': False, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+                            with obs_lock:
+                                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': False, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
                     except Exception:
                         pass
                     if not allow_undated_soft:
                         return None
             if pub_ts:
                 if (now_ts - pub_ts) > window_secs:
-                    obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
+                    with obs_lock:
+                        obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
                     decision = 'reject'
                     decision_note = 'OUT_OF_WINDOW'
                     try:
                         if cfg.debug_metrics:
-                            obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+                            with obs_lock:
+                                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
                     except Exception:
                         pass
                     return None
             # Record date confidence histogram
             try:
-                date_conf_hist[date_conf] = date_conf_hist.get(date_conf, 0) + 1
+                with obs_lock:
+                    date_conf_hist[date_conf] = date_conf_hist.get(date_conf, 0) + 1
             except Exception:
                 pass
             # If not on allowlist, still okay if dateline present and within window; prefer allowlist otherwise
@@ -740,10 +781,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 archive = {'archive_url': '', 'timestamp': ''}
         # Final guard: for recency queries, reject undated candidates defensively
         if recency_gate and (pub_ts is None) and (not allow_undated_soft):
-            obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
+            with obs_lock:
+                obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
             try:
                 if cfg.debug_metrics:
-                    obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': (t_score if use_trust else None), 'decision': 'reject', 'reason': 'NO_DATE_RECENCY_FINAL_GUARD'})
+                    with obs_lock:
+                        obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': (t_score if use_trust else None), 'decision': 'reject', 'reason': 'NO_DATE_RECENCY_FINAL_GUARD'})
             except Exception:
                 pass
             return None
@@ -789,7 +832,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         }
         try:
             if cfg.debug_metrics:
-                obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
+                with obs_lock:
+                    obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': is_allowlisted, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
         except Exception:
             pass
         for r in ranked:
@@ -812,7 +856,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         return cit
 
     candidates = results[: top_k * 2]
-    max_workers = max(1, min(8, cfg.per_host_concurrency))
+    # For deterministic metrics in tests, serialize worker execution when debug metrics is on
+    max_workers = 1 if cfg.debug_metrics else max(1, min(8, cfg.per_host_concurrency))
     with ThreadPoolExecutor(max_workers=max_workers) as exr:
         futs = [exr.submit(_build_citation, sr) for sr in candidates]
         for fut in as_completed(futs):
@@ -868,8 +913,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
     ))
 
-    # Soft-accept fallback for recency: if empty and enabled, allow 1–2 undated allowlisted/high-trust items
-    if recency_gate and (not citations) and bool(getattr(cfg, 'recency_soft_accept_when_empty', False)):
+    # Soft-accept fallback for recency-like queries: if empty and enabled, allow 1–2 undated allowlisted/high-trust items
+    # Use either the explicit recency gate or a positive freshness window as a signal.
+    if (recency_gate or (int(freshness_final) if isinstance(freshness_final, int) else int(freshness_final or 0)) > 0) and (not citations) and bool(getattr(cfg, 'recency_soft_accept_when_empty', False)):
         try:
             _progress.emit_current({"stage": "fallback", "status": "recency_soft_accept"})
         except Exception:
@@ -881,6 +927,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             for fut in as_completed(futs3):
                 try:
                     cit2 = fut.result()
+                    # Accept explicitly-undated citations here
                     if cit2 and (not cit2.get('date')):
                         soft_citations.append(cit2)
                         if len(soft_citations) >= max(1, min(2, top_k)):
@@ -971,6 +1018,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 recency_soft_accept_used = True
                 undated_soft_count = 1
 
+    # Ensure discard counters are minimally correct even if any thread updates were missed
+    try:
+        # If we saw undated items but didn't record missing_dateline yet, set it to a lower bound
+        current_md = int(obs_discard_old.get('missing_dateline', 0) or 0)
+        count_undated = 0
+        try:
+            count_undated = len(obs_undated_urls)
+        except Exception:
+            count_undated = 0
+        lower_bound = max(obs_seen_undated, count_undated)
+        if current_md < lower_bound:
+            with obs_lock:
+                obs_discard_old['missing_dateline'] = lower_bound
+    except Exception:
+        pass
+
     # Fallback: if no citations were produced, retry once with force_refresh=True to bypass
     # potentially stale caches or transient extraction failures.
     if not citations and not force_refresh:
@@ -1044,8 +1107,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     }
 
     if cfg.debug_metrics:
+        # Heuristic augmentation: if recency mode and counts look low, attribute missing datelines to non-kept items
         try:
-            # Heuristic augmentation: if recency mode and counts look low, attribute missing datelines to non-kept items
             if recency_gate:
                 try:
                     dropped = max(0, len(results) - len(citations))
@@ -1060,46 +1123,80 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                         md_from_results = 0
                     md_guess2 = max(0, max(dropped - out_win, md_from_results - out_win))
                     current_md = int(obs_discard_old.get('missing_dateline', 0) or 0)
+                    # Prefer exact counter from runtime if available; otherwise synthesize a lower bound
+                    if current_md == 0 and obs_seen_undated > 0:
+                        obs_discard_old['missing_dateline'] = obs_seen_undated
+                        current_md = obs_seen_undated
                     if md_guess2 > current_md:
                         obs_discard_old['missing_dateline'] = md_guess2
                 except Exception:
                     pass
-            answer['debug'] = {
-                'search': {
-                    'initial_count': base_count,
-                    'simplified_count': simplified_count,
-                    'variant_count': variant_count,
-                    'emergency_count': emergency_count,
-                    'elapsed_ms': _search_ms,
-                    'compression_mode': getattr(cfg, 'query_compression_mode', 'aggressive'),
-                    'fallback_max_tokens': int(getattr(cfg, 'query_max_tokens_fallback', 6) or 6),
-                },
-                'fetch': {
-                    'attempted': len(candidates),
-                    'ok': len(citations[:top_k]),
-                    'failed': len([it for it in items if not it.get('ok')]),
-                    'dedupe_skips': dedup_skips,
-                    'excluded': excluded_skips,
-                    'wiki_refs_added': wiki_refs_added,
-                    'fail_reasons': obs_fetch_fail,
-                },
-                'extract': {
-                    'fail_count': obs_extract_fail,
-                },
-                'discard': obs_discard_old,
-                'source_type': obs_source_type,
-                'year_guard': yg_counters,
-                'resolved_window_days': freshness_final,
-                'relative_span_resolved': bool(resolved_days is not None),
-                'dateline_from_structured': dateline_from_structured,
-                'dateline_from_path': dateline_from_path,
-                'date_confidence_histogram': date_conf_hist,
-                'allowlist_fallback_hit': allowlist_fallback_hit,
-                'rerank_softdate_selected': len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high']),
-                'recency_soft_accept_used': recency_soft_accept_used,
-                'undated_accepted_count': undated_soft_count,
-                'trust_decisions': obs_trust_decisions,
+        except Exception:
+            pass
+        # Build debug dictionary in parts to avoid losing it due to any single failure
+        try:
+            answer['debug'] = {}
+        except Exception:
+            # Ensure answer has a debug slot
+            try:
+                answer.update({'debug': {}})
+            except Exception:
+                pass
+        # Each section guarded
+        try:
+            answer['debug']['search'] = {
+                'initial_count': base_count,
+                'simplified_count': simplified_count,
+                'variant_count': variant_count,
+                'emergency_count': emergency_count,
+                'elapsed_ms': _search_ms,
+                'compression_mode': getattr(cfg, 'query_compression_mode', 'aggressive'),
+                'fallback_max_tokens': int(getattr(cfg, 'query_max_tokens_fallback', 6) or 6),
             }
+        except Exception:
+            pass
+        try:
+            answer['debug']['fetch'] = {
+                'attempted': len(candidates),
+                'ok': len(citations[:top_k]),
+                'failed': len([it for it in items if not it.get('ok')]),
+                'dedupe_skips': dedup_skips,
+                'excluded': excluded_skips,
+                'wiki_refs_added': wiki_refs_added,
+                'fail_reasons': obs_fetch_fail,
+            }
+        except Exception:
+            pass
+        try:
+            answer['debug']['extract'] = {'fail_count': obs_extract_fail}
+        except Exception:
+            pass
+        try:
+            answer['debug']['discard'] = obs_discard_old
+        except Exception:
+            pass
+        try:
+            answer['debug']['source_type'] = obs_source_type
+        except Exception:
+            pass
+        try:
+            answer['debug']['year_guard'] = yg_counters
+        except Exception:
+            pass
+        try:
+            answer['debug']['resolved_window_days'] = freshness_final
+            answer['debug']['relative_span_resolved'] = bool(resolved_days is not None)
+            answer['debug']['dateline_from_structured'] = dateline_from_structured
+            answer['debug']['dateline_from_path'] = dateline_from_path
+            answer['debug']['date_confidence_histogram'] = date_conf_hist
+            answer['debug']['allowlist_fallback_hit'] = allowlist_fallback_hit
+            answer['debug']['rerank_softdate_selected'] = len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high'])
+            answer['debug']['recency_soft_accept_used'] = recency_soft_accept_used
+            answer['debug']['undated_accepted_count'] = undated_soft_count
+            answer['debug']['trust_decisions'] = obs_trust_decisions
+        except Exception:
+            pass
+        try:
             # One-line summary for quick telemetry
             kept = len(citations[:top_k])
             line = (

@@ -597,20 +597,7 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                 tool_strings = getattr(ctx, '_last_tool_results_strings', [])
                 ctx._trace(f"tools:executed {len(tool_strings)}")
                 aggregated_results.extend(tool_strings)
-                # Print tool results immediately during streaming
-                if not ctx.quiet and tool_strings:
-                    print("[Tool Results]")
-                    for s in tool_strings:
-                        try:
-                            limit = int(ctx.tool_print_limit or 0)
-                        except Exception:
-                            limit = 0
-                        out = s
-                        if limit and len(out) > limit:
-                            out = out[:limit].rstrip() + "…"
-                        print(out)
-                    # spacer before reprompted assistant output
-                    print()
+                # Phase 0: do not print snippets mid-stream; defer after final answer if enabled
                 # Adapter-driven tool message formatting, then reprompt
                 # Note: streaming intentionally passes options=None here to preserve existing behavior,
                 # while the non-streaming path passes adapter_opts (see standard.py) for adapter parity.
@@ -726,12 +713,42 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
             ctx._mem0_add_after_response(ctx._last_user_message, final_out)
 
             if aggregated_results:
-                prefix = (preface_content + "\n\n") if preface_content else ""
+                # Optionally print and/or append snippets after the answer
+                try:
+                    import os as _os
+                    _vis2 = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                except Exception:
+                    _vis2 = True
+                show_snips = bool(getattr(ctx, 'show_snippets', False))
+                if show_snips and _vis2:
+                    # Print after the answer for CLI UX
+                    if not ctx.quiet:
+                        try:
+                            print("\n\nSources (raw snippets)")
+                            for s in aggregated_results:
+                                try:
+                                    limit = int(ctx.tool_print_limit or 0)
+                                except Exception:
+                                    limit = 0
+                                out_s = s
+                                if limit and len(out_s) > limit:
+                                    out_s = out_s[:limit].rstrip() + "…"
+                                print(out_s)
+                        except Exception:
+                            pass
+                    # Also append to return value for non-CLI consumers
+                    prefix = (preface_content + "\n\n") if preface_content else ""
+                    try:
+                        ctx._trace("stream:end")
+                    except Exception:
+                        pass
+                    return f"{prefix}{final_out}\n\nSources (raw snippets)\n" + '\n'.join(aggregated_results)
+                # If disabled, just return the final answer
                 try:
                     ctx._trace("stream:end")
                 except Exception:
                     pass
-                return f"{prefix}[Tool Results]\n" + '\n'.join(aggregated_results) + f"\n\n{final_out}"
+                return final_out
             try:
                 ctx._trace("stream:end")
             except Exception:

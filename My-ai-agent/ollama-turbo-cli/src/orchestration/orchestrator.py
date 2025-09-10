@@ -144,6 +144,38 @@ class ChatTurnOrchestrator:
                         ctx._trace(f"reliability:web:citations={len(citations_map)}")
                     except Exception:
                         pass
+                    # Phase 0: Grounding auto-degrade when no context was found
+                    try:
+                        import os as _os
+                        vis_on = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                    except Exception:
+                        vis_on = True
+                    try:
+                        if bool(ctx.reliability.get('ground')) and not context_blocks:
+                            # Mark degrade for this turn and disable ground (in-memory only)
+                            try:
+                                flags = getattr(ctx, 'flags', {}) or {}
+                                flags['ground_degraded'] = True
+                                setattr(ctx, 'flags', flags)
+                            except Exception:
+                                pass
+                            try:
+                                ctx.reliability['ground'] = False
+                            except Exception:
+                                pass
+                            # Single CLI notice (respect --quiet) when visibility gate is on
+                            try:
+                                if vis_on and (not getattr(ctx, 'quiet', False)):
+                                    print("⚠️ No grounding context found; answering from model knowledge.")
+                            except Exception:
+                                pass
+                            # Trace for tests/diagnostics
+                            try:
+                                ctx._trace("ground:auto-degrade")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     # Only process the first web_research result per turn
                     break
         except Exception:
@@ -226,10 +258,20 @@ class ChatTurnOrchestrator:
                 ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
         except Exception as ve:
             ctx.logger.debug(f"validator skipped: {ve}")
-        # Prefix absolute date for recent/cited answers
+        # Phase 0: Date prefix heuristics (gate + any source date or time-sensitive query)
         try:
-            if getattr(ctx, '_last_context_blocks', None):
-                if not (final_out or '').strip().lower().startswith('as of '):
+            import os as _os
+            _vis = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+        except Exception:
+            _vis = True
+        try:
+            if _vis:
+                has_any_date = any(bool((b or {}).get('date')) for b in (getattr(ctx, '_last_context_blocks', []) or []))
+                q = (getattr(ctx, '_last_user_message', '') or '')
+                ql = q.lower()
+                terms = {'today','latest','news','price','weather','release','update'}
+                time_sens = any(t in ql for t in terms)
+                if (has_any_date or time_sens) and not (final_out or '').strip().lower().startswith('as of '):
                     prefix = datetime.now().strftime('%Y-%m-%d')
                     final_out = f"As of {prefix} (local time) —\n\n" + (final_out or '')
         except Exception:
@@ -380,14 +422,9 @@ class ChatTurnOrchestrator:
                     ctx._trace(f"tools:executed {len(tool_strings)}")
                     all_tool_results.extend(tool_strings)
 
-                    # Adapter-driven tool message formatting, then reprompt
+                    # Adapter-driven tool message formatting via orchestrator wrapper (Phase 0 hooks inside)
                     try:
-                        new_msgs, _ovr = ctx.adapter.format_reprompt_after_tools(
-                            ctx.conversation_history,
-                            payload,
-                            options=adapter_opts if isinstance(adapter_opts, dict) else None,
-                        )
-                        ctx.conversation_history = new_msgs
+                        self.format_reprompt_after_tools(ctx, payload, prebuilt_msgs, streaming=False)
                     except Exception:
                         # Fallback: if we have prebuilt messages, use them; otherwise a single aggregated string
                         if prebuilt_msgs:
@@ -515,19 +552,36 @@ class ChatTurnOrchestrator:
                     # Persist memory to Mem0
                     ctx._mem0_add_after_response(ctx._last_user_message, final_out)
 
-                    if all_tool_results:
-                        prefix = (first_content + "\n\n") if first_content else ""
-                        out = f"{prefix}[Tool Results]\n" + '\n'.join(all_tool_results) + f"\n\n{final_out}"
-                    else:
-                        # Prefix absolute date for recent/cited answers
-                        try:
-                            if getattr(ctx, '_last_context_blocks', None):
-                                if not (final_out or '').strip().lower().startswith('as of '):
-                                    prefix_dt = datetime.now().strftime('%Y-%m-%d')
-                                    final_out = f"As of {prefix_dt} (local time) —\n\n" + (final_out or '')
-                        except Exception:
-                            pass
-                        out = final_out
+                    # Phase 0: Date prefix heuristics (env gate + keywords or any dated source)
+                    try:
+                        import os as _os
+                        _vis = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                    except Exception:
+                        _vis = True
+                    try:
+                        if _vis:
+                            has_any_date = any(bool((b or {}).get('date')) for b in (getattr(ctx, '_last_context_blocks', []) or []))
+                            q = (getattr(ctx, '_last_user_message', '') or '')
+                            ql = q.lower()
+                            terms = {'today','latest','news','price','weather','release','update'}
+                            time_sens = any(t in ql for t in terms)
+                            if (has_any_date or time_sens) and not (final_out or '').strip().lower().startswith('as of '):
+                                prefix_dt = datetime.now().strftime('%Y-%m-%d')
+                                final_out = f"As of {prefix_dt} (local time) —\n\n" + (final_out or '')
+                    except Exception:
+                        pass
+
+                    # Build output with optional snippets after the answer
+                    prefix = (first_content + "\n\n") if first_content else ""
+                    out = f"{prefix}{final_out}"
+                    try:
+                        import os as _os
+                        _vis2 = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                    except Exception:
+                        _vis2 = True
+                    show_snips = bool(getattr(ctx, 'show_snippets', False))
+                    if all_tool_results and show_snips and _vis2:
+                        out = out + "\n\nSources (raw snippets)\n" + '\n'.join(all_tool_results)
                     # Audit log: store minimal fields
                     try:
                         mode_meta = getattr(ctx, '_turn_mode_meta', {}) or {}
