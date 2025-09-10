@@ -52,7 +52,14 @@ def normalize_args(schema: Optional[Dict[str, Any]], raw: Any) -> Dict[str, Any]
     if not isinstance(obj, dict):
         raise ValueError("Tool arguments must be a JSON object")
 
-    # 2) Validate against schema if provided and jsonschema is available
+    # 2) Normalize optional fields: drop keys with value None so optional schema
+    #    properties don't fail validation when models emit explicit nulls.
+    try:
+        obj = {k: v for k, v in obj.items() if v is not None}
+    except Exception:
+        pass
+
+    # 3) Validate against schema if provided and jsonschema is available
     if schema and jsonschema_validate is not None:
         try:
             jsonschema_validate(instance=obj, schema=schema)

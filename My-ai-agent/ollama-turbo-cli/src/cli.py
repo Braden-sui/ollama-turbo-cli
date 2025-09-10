@@ -329,6 +329,10 @@ Examples:
         
         if args.message:
             # Single message mode
+            # Force streaming by default for --message to avoid upstream 502s some providers return
+            # on non-streaming endpoints. Users can still toggle behavior later if needed.
+            if not args.stream:
+                args.stream = True
             if not args.quiet:
                 print(f"🔄 Sending message to {getattr(client, 'model', args.model)}...")
             response = client.chat(args.message, stream=args.stream)

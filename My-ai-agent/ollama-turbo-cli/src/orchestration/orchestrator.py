@@ -74,6 +74,12 @@ class ChatTurnOrchestrator:
         streaming: bool,
     ) -> None:
         """Adapter-driven tool message formatting with streaming/non-streaming parity."""
+        # Reset per-turn citation/context state to avoid stale carryover across different tool paths
+        try:
+            setattr(ctx, '_last_context_blocks', [])
+            setattr(ctx, '_last_citations_map', {})
+        except Exception:
+            pass
         # Best-effort: if web_research ran, extract citations/highlights into ctx for grounded reprompt
         try:
             structured: Optional[List[Dict[str, Any]]] = getattr(ctx, '_last_tool_results_structured', None)  # type: ignore

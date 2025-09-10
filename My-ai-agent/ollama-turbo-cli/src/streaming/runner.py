@@ -612,10 +612,23 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                 # Adapter-driven tool message formatting (streaming preserves options=None)
                 orch.format_reprompt_after_tools(ctx, payload, prebuilt_msgs, streaming=True)
                 # Reprompt model to synthesize an answer using tool details
+                # Gate strict cited synthesis to contexts with citations or special tools (parity with non-streaming)
                 ctx._trace("reprompt:after-tools")
+                gate_strict = False
+                try:
+                    gate_strict = bool(getattr(ctx, '_last_citations_map', {}) or []) or any((n or '') in {'web_research','retrieval'} for n in (names or []))
+                except Exception:
+                    gate_strict = False
+                reprompt_text = (
+                    ctx.prompt.reprompt_after_tools() if gate_strict else (
+                        'Based on the tool results above, produce <|channel|>final with a clear, concise answer. '
+                        'If you did not use any external sources (web pages or uploaded documents), do not mention citations '
+                        'or lack thereof; simply provide the answer. Avoid copying raw tool output.'
+                    )
+                )
                 ctx.conversation_history.append({
                     'role': 'user',
-                    'content': ctx.prompt.reprompt_after_tools()
+                    'content': reprompt_text
                 })
                 rounds += 1
                 # Next loop iteration may include tools again if multi-round enabled
