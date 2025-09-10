@@ -15,8 +15,9 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Braden-sui/ollama-turbo-cli",
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
+    # Align with pyproject: install the 'src' package directly (no remapping)
+    packages=find_packages(where=".", include=["src*"]),
+    package_dir={},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",

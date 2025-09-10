@@ -7,13 +7,13 @@ name = "ollama-turbo-cli"
 version = "0.1.0"
 description = "Ollama Turbo CLI: agentic research + tools with modern UX"
 readme = "README.md"
-authors = [{ name = "Windsurf", email = "support@windsurf.ai" }]
-license = { text = "MIT" }
+authors = [{ name = "Braden", email = "braden.yig@gmail.com" }]
+license = { text = "Apache 2.0" }
 requires-python = ">=3.9"
 keywords = ["AI", "CLI", "LLM", "research", "tools"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache 2.0 License",
   "Operating System :: OS Independent",
 ]
 
@@ -25,8 +25,8 @@ Issues = "https://github.com/Braden-sui/ollama-turbo-cli/issues"
 ollama-turbo = "src.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["src*"]
