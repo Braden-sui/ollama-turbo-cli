@@ -38,8 +38,12 @@ class OllamaTurboClient:
     """Client for interacting with gpt-oss:120b via Ollama Turbo."""
     
     def __init__(self, api_key: str, model: str = "gpt-oss:120b", enable_tools: bool = True, show_trace: bool = False, show_snippets: bool = False, reasoning: str = "high", quiet: bool = False, max_output_tokens: Optional[int] = None, ctx_size: Optional[int] = None, tool_print_limit: int = 200, multi_round_tools: bool = True, tool_max_rounds: Optional[int] = None, *, ground: Optional[bool] = None, k: Optional[int] = None, cite: Optional[bool] = None, check: Optional[str] = None, consensus: Optional[bool] = None, engine: Optional[str] = None, eval_corpus: Optional[str] = None, reasoning_mode: str = 'system', protocol: str = 'auto', temperature: Optional[float] = None, top_p: Optional[float] = None, presence_penalty: Optional[float] = None, frequency_penalty: Optional[float] = None, 
+                 # Retrieval controls
+                 docs_glob: Optional[str] = None,
+                 rag_min_score: Optional[float] = None,
+                 ground_fallback: Optional[str] = None,
                  # Mem0 configuration
-                  mem0_enabled: bool = True,
+                 mem0_enabled: bool = True,
                   mem0_local: bool = False,
                  mem0_vector_provider: str = 'chroma',
                  mem0_vector_host: str = ':memory:',
@@ -231,6 +235,22 @@ class OllamaTurboClient:
         except Exception:
             consensus_k_val = None
         self.reliability.update({'rag_k': rag_k_val, 'consensus_k': consensus_k_val})
+        # Wire retrieval knobs from constructor
+        try:
+            if docs_glob is not None:
+                self.reliability['docs_glob'] = docs_glob
+        except Exception:
+            pass
+        try:
+            if rag_min_score is not None:
+                self.reliability['rag_min_score'] = float(rag_min_score)
+        except Exception:
+            pass
+        try:
+            if ground_fallback is not None:
+                self.reliability['ground_fallback'] = str(ground_fallback)
+        except Exception:
+            pass
         # Reliability runtime state
         self._last_context_blocks: List[Dict[str, Any]] = []
         self._last_citations_map: Dict[str, Any] = {}

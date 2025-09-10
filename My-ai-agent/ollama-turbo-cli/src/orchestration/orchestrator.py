@@ -262,6 +262,13 @@ class ChatTurnOrchestrator:
             if has_citations and ((ctx.reliability.get('check') or 'off') != 'off'):
                 report = Validator(mode=str(ctx.reliability.get('check'))).validate(final_out, getattr(ctx, '_last_context_blocks', []))
                 ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
+                try:
+                    details = report.get('details') or []
+                    if isinstance(details, list) and details:
+                        avg = sum(float(d.get('overlap_score') or 0.0) for d in details) / max(1, len(details))
+                        ctx._trace(f"citations.coverage_pct={avg:.4f}")
+                except Exception:
+                    pass
         except Exception as ve:
             ctx.logger.debug(f"validator skipped: {ve}")
         # Phase 0: Date prefix heuristics (gate + any source date or time-sensitive query)
@@ -515,6 +522,13 @@ class ChatTurnOrchestrator:
                                 getattr(ctx, '_last_citations_map', {}),
                             )
                             ctx._trace(f"validate:mode={report.get('mode')} citations={report.get('citations_present')}")
+                            try:
+                                details = report.get('details') or []
+                                if isinstance(details, list) and details:
+                                    avg = sum(float(d.get('overlap_score') or 0.0) for d in details) / max(1, len(details))
+                                    ctx._trace(f"citations.coverage_pct={avg:.4f}")
+                            except Exception:
+                                pass
                     except Exception as ve:
                         ctx.logger.debug(f"validator skipped: {ve}")
                     # Auto-repair (enforce mode only): one pass

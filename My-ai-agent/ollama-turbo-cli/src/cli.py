@@ -133,6 +133,18 @@ Examples:
     parser.add_argument('--consensus',
                        action='store_true',
                        help='Enable k-run consensus voting (majority/agree-rate).')
+    # Retrieval controls
+    parser.add_argument('--docs-glob',
+                       default=None,
+                       help='Glob pattern for local corpus files (JSON/JSONL). Supports multiple via comma-separated globs.')
+    parser.add_argument('--rag-min-score',
+                       type=float,
+                       default=None,
+                       help='Minimum BM25 score threshold; below this is considered no reliable support.')
+    parser.add_argument('--ground-fallback',
+                       choices=['off', 'web'],
+                       default=None,
+                       help='If no local hits or below threshold, fallback path: off | web (invoke web_research). Default: off')
     parser.add_argument('--engine',
                        help='Target engine: cloud | local | full URL (http[s]://...). Default: cloud / OLLAMA_HOST.')
     parser.add_argument('--eval',
@@ -320,6 +332,9 @@ Examples:
             cite=args.cite,
             check=args.check,
             consensus=args.consensus,
+            docs_glob=args.docs_glob,
+            rag_min_score=args.rag_min_score,
+            ground_fallback=args.ground_fallback,
             engine=args.engine,
             eval_corpus=args.eval,
             cfg=cfg,
