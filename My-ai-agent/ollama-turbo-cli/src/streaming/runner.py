@@ -580,7 +580,15 @@ def handle_streaming_response(ctx: OrchestrationContext, response_stream, tools_
                     pass
 
             if tool_calls:
-                if not ctx.quiet:
+                # New UX: suppress mid-stream progress banner unless in legacy mode
+                try:
+                    import os as _os
+                    _vis = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                except Exception:
+                    _vis = True
+                show_snips_flag = bool(getattr(ctx, 'show_snippets', False))
+                legacy_mode = (not show_snips_flag) or (not _vis)
+                if legacy_mode and not ctx.quiet:
                     print("\n🔧 Processing tool calls...")
                 names = [tc.get('function', {}).get('name') for tc in tool_calls]
                 ctx._trace(f"tools:detected {len(tool_calls)} -> {', '.join(n for n in names if n)}")

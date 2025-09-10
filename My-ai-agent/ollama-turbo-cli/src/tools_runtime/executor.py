@@ -86,7 +86,15 @@ class ToolRuntimeExecutor:
                         return ', '.join(f'{k}={safe[k]}' for k in safe)
                     except Exception:
                         return ''
-                if not getattr(ctx, 'quiet', False):
+                # New UX: suppress verbose tool execution lines unless in legacy mode
+                try:
+                    import os as _os
+                    _vis = (_os.getenv('CLI_EXPERIMENTAL_VIS', '1').strip().lower() not in {'0','false','no','off'})
+                except Exception:
+                    _vis = True
+                _show_snips = bool(getattr(ctx, 'show_snippets', False))
+                _legacy_mode = (not _show_snips) or (not _vis)
+                if _legacy_mode and not getattr(ctx, 'quiet', False):
                     print(f"   {i}. Executing {function_name}({_fmt_tool_args(function_args)})")
                 ctx._trace(f"tool:exec {function_name}")
 
@@ -155,7 +163,7 @@ class ToolRuntimeExecutor:
 
                         if sensitive or function_name == 'execute_shell' or len(display) > getattr(ctx, 'tool_context_cap', 4000):
                             ctx._skip_mem0_after_turn = True
-                        if not getattr(ctx, 'show_trace', False) and not getattr(ctx, 'quiet', False):
+                        if _legacy_mode and (not getattr(ctx, 'show_trace', False)) and (not getattr(ctx, 'quiet', False)):
                             print(f"      ✅ Result: {truncate_text(display, getattr(ctx, 'tool_print_limit', 200))}")
                         ctx._trace(f"tool:ok {function_name}")
                         structured: Dict[str, Any] = {

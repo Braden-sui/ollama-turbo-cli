@@ -8,6 +8,7 @@ import os
 import sys
 import logging
 from dotenv import load_dotenv, find_dotenv
+import warnings
 
 # Load environment variables from the closest .env.local then .env (searching upward)
 try:
@@ -23,6 +24,21 @@ except Exception:
     pass
 
 # Import after loading env vars to ensure proper configuration
+# Suppress noisy SWIG DeprecationWarnings from third-party bindings
+try:
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r".*SwigPy.*has no __module__ attribute.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r".*swigvarlink has no __module__ attribute.*",
+    )
+except Exception:
+    pass
+
 from .client import OllamaTurboClient
 from .config import from_env as build_config, merge_cli_overrides
 from .utils import setup_logging, validate_api_key
