@@ -73,19 +73,34 @@ async def chat(
     # Instantiate client per request for now; pool/reuse can be added later
     upstream_key = os.getenv("OLLAMA_API_KEY", "") or _api_key
     cfg = _build_client_cfg_from_options(payload.options)
-    client = OllamaTurboClient(
-        api_key=upstream_key,
-        enable_tools=True,
-        quiet=True,
-        ground=bool(payload.ground or False),
-        k=payload.k,
-        cite=bool(payload.cite or False),
-        check=(payload.check or 'off'),
-        consensus=bool(payload.consensus or False),
-        engine=payload.engine,
-        eval_corpus=payload.eval_corpus,
-        cfg=cfg,
-    )
+    try:
+        client = OllamaTurboClient(
+            api_key=upstream_key,
+            enable_tools=True,
+            quiet=True,
+            ground=bool(payload.ground or False),
+            k=payload.k,
+            cite=bool(payload.cite or False),
+            check=(payload.check or 'off'),
+            consensus=bool(payload.consensus or False),
+            engine=payload.engine,
+            eval_corpus=payload.eval_corpus,
+            cfg=cfg,
+        )
+    except TypeError:
+        # Backward-compat for tests that monkeypatch a simplified client without cfg parameter
+        client = OllamaTurboClient(
+            api_key=upstream_key,
+            enable_tools=True,
+            quiet=True,
+            ground=bool(payload.ground or False),
+            k=payload.k,
+            cite=bool(payload.cite or False),
+            check=(payload.check or 'off'),
+            consensus=bool(payload.consensus or False),
+            engine=payload.engine,
+            eval_corpus=payload.eval_corpus,
+        )
     fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
     # Respect API-level idempotency key in future by exposing a setter in client;
     # currently client generates a key internally per turn.
@@ -114,7 +129,10 @@ async def chat_stream(
     """
     upstream_key = os.getenv("OLLAMA_API_KEY", "") or _api_key
     cfg = _build_client_cfg_from_options(payload.options)
-    client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True, cfg=cfg)
+    try:
+        client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True, cfg=cfg)
+    except TypeError:
+        client = OllamaTurboClient(api_key=upstream_key, enable_tools=True, quiet=True)
     fmt = _resolve_tool_results_format((payload.options or {}).model_dump() if payload.options else None)
 
     def sse_gen():

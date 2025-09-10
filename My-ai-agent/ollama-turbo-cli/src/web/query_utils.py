@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import List, Set
+from datetime import datetime
 
 
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
@@ -103,12 +104,22 @@ def generate_variants(q: str, mode: str = "aggressive", max_tokens: int = 6, sto
             variants.append(candidate)
         return variants
 
-    # aggressive (legacy): emulate current behavior — strip years + strong stopwords, cap tokens
-    toks = [t for t in _tokenize(q) if not _YEAR_RE.match(t)]
-    pruned = [t for t in toks if t.lower() not in stopwords]
+    # aggressive (legacy): emulate current fallback behavior precisely
+    # Build dynamic stop set: legacy stopwords + dynamic year strings 2010..(now-1)
+    try:
+        now_y = datetime.now().year
+    except Exception:
+        now_y = 2025
+    years = {str(y) for y in range(2010, max(2010, now_y))}
+    legacy_stop = {
+        'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
+        'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
+    } | years
+    # Legacy tokenization: alphanumeric tokens only
+    toks = re.findall(r"[A-Za-z0-9]+", q or "")
+    pruned = [t for t in toks if t.lower() not in legacy_stop]
     pruned = pruned[:max_tokens]
     candidate = " ".join(pruned)
     if candidate and candidate not in variants:
         variants.append(candidate)
     return variants
-

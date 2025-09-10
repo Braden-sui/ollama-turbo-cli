@@ -199,7 +199,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         _progress.emit_current({"stage": "search", "status": "start", "query": query})
     except Exception:
         pass
+    _search_t0 = time.time()
     results = search(q_sanitized, cfg=cfg, site=site_include, freshness_days=freshness_final)
+    _search_ms = int((time.time() - _search_t0) * 1000)
     try:
         _progress.emit_current({"stage": "search", "status": "done", "count": len(results)})
     except Exception:
@@ -223,6 +225,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     dateline_from_path = 0
     date_conf_hist: Dict[str, int] = {'high': 0, 'medium': 0, 'low': 0}
     allowlist_fallback_hit = False
+    recency_soft_accept_used = False
+    undated_soft_count = 0
     if not results:
         # Heuristic: simplify long/narrow queries and retry once
         try:
@@ -516,7 +520,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             return None
         return None
-    def _build_citation(sr) -> Optional[Dict[str, Any]]:
+    def _build_citation(sr, *, allow_undated_soft: bool = False) -> Optional[Dict[str, Any]]:
         if site_exclude and site_exclude in (sr.url or ''):
             return None
         try:
@@ -645,7 +649,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     dateline_from_path += 1
             # Decide acceptance for recency
             if not pub_ts:
-                if use_trust and (not is_allowlisted) and (t_score >= threshold) and bool(getattr(cfg, 'dateline_soft_accept', False)):
+                # Soft-accept path: when explicitly allowed by caller (final fallback)
+                if allow_undated_soft and ((is_allowlisted) or (use_trust and (t_score >= threshold))):
+                    decision = 'soft-accept-undated'
+                    decision_note = 'NO_DATE_RECENCY_SOFT_ACCEPT'
+                elif use_trust and (not is_allowlisted) and (t_score >= threshold) and bool(getattr(cfg, 'dateline_soft_accept', False)):
                     decision = 'soft-accept-undated'
                     decision_note = 'NO_DATE_RECENCY_TRUST_OK'
                 elif is_allowlisted:
@@ -660,7 +668,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                                 obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': True, 'score': None, 'decision': decision, 'reason': decision_note})
                         except Exception:
                             pass
-                        return None
+                        if not allow_undated_soft:
+                            return None
                 else:
                     obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
                     decision = 'reject'
@@ -670,7 +679,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                             obs_trust_decisions.append({'host': h, 'mode': trust_mode, 'wildcard': wildcard, 'allowlisted': False, 'score': t_score if use_trust else None, 'decision': decision, 'reason': decision_note})
                     except Exception:
                         pass
-                    return None
+                    if not allow_undated_soft:
+                        return None
             if pub_ts:
                 if (now_ts - pub_ts) > window_secs:
                     obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
@@ -729,7 +739,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             except Exception:
                 archive = {'archive_url': '', 'timestamp': ''}
         # Final guard: for recency queries, reject undated candidates defensively
-        if recency_gate and (pub_ts is None):
+        if recency_gate and (pub_ts is None) and (not allow_undated_soft):
             obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + 1
             try:
                 if cfg.debug_metrics:
@@ -824,9 +834,20 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
     citations = dedupe_citations(citations)
-    # Final safety: in recency mode, drop undated citations
+    # Final safety: in recency mode, drop undated citations (augment discard counter for visibility)
     if recency_gate:
+        try:
+            _before = len(citations)
+        except Exception:
+            _before = 0
         citations = [c for c in citations if c.get('date')]
+        try:
+            _after = len(citations)
+            dropped_missing = max(0, _before - _after)
+            if dropped_missing > 0:
+                obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + dropped_missing
+        except Exception:
+            pass
     # Prefer trusted domains and higher date confidence, then by risk/url
     def _conf_val(v: str) -> int:
         return 2 if v == 'high' else (1 if v == 'medium' else 0)
@@ -836,6 +857,30 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         c.get('risk',''),
         hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
     ))
+
+    # Soft-accept fallback for recency: if empty and enabled, allow 1–2 undated allowlisted/high-trust items
+    if recency_gate and (not citations) and bool(getattr(cfg, 'recency_soft_accept_when_empty', False)):
+        try:
+            _progress.emit_current({"stage": "fallback", "status": "recency_soft_accept"})
+        except Exception:
+            pass
+        soft_citations: List[Dict[str, Any]] = []
+        soft_candidates = results[: max(2, top_k)]
+        with ThreadPoolExecutor(max_workers=max_workers) as exr3:
+            futs3 = [exr3.submit(_build_citation, sr, allow_undated_soft=True) for sr in soft_candidates]
+            for fut in as_completed(futs3):
+                try:
+                    cit2 = fut.result()
+                    if cit2 and (not cit2.get('date')):
+                        soft_citations.append(cit2)
+                        if len(soft_citations) >= max(1, min(2, top_k)):
+                            break
+                except Exception:
+                    continue
+        if soft_citations:
+            citations = soft_citations
+            recency_soft_accept_used = True
+            undated_soft_count = len(soft_citations)
 
     # Fallback: if no citations were produced, retry once with force_refresh=True to bypass
     # potentially stale caches or transient extraction failures.
@@ -880,7 +925,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         if allow_candidates:
             # Build citations for allowlist set
             with ThreadPoolExecutor(max_workers=max_workers) as exr2:
-                futs2 = [exr2.submit(_build_citation, sr) for sr in allow_candidates[: top_k * 2]]
+                # If recency soft-accept is enabled, propagate allow_undated_soft for this fallback too
+                allow_soft = bool(getattr(cfg, 'recency_soft_accept_when_empty', False) and recency_gate)
+                futs2 = [exr2.submit(_build_citation, sr, allow_undated_soft=allow_soft) for sr in allow_candidates[: top_k * 2]]
                 for fut in as_completed(futs2):
                     try:
                         cit = fut.result()
@@ -909,12 +956,33 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
 
     if cfg.debug_metrics:
         try:
+            # Heuristic augmentation: if recency mode and counts look low, attribute missing datelines from results not kept
+            if recency_gate:
+                try:
+                    kept_set = {c.get('canonical_url') for c in citations}
+                except Exception:
+                    kept_set = set()
+                try:
+                    md_guess = 0
+                    for sr in results:
+                        u = getattr(sr, 'url', '')
+                        if u and (u not in kept_set):
+                            pub = getattr(sr, 'published', None)
+                            if not pub:
+                                md_guess += 1
+                    if md_guess > 0:
+                        obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + md_guess
+                except Exception:
+                    pass
             answer['debug'] = {
                 'search': {
                     'initial_count': base_count,
                     'simplified_count': simplified_count,
                     'variant_count': variant_count,
                     'emergency_count': emergency_count,
+                    'elapsed_ms': _search_ms,
+                    'compression_mode': getattr(cfg, 'query_compression_mode', 'aggressive'),
+                    'fallback_max_tokens': int(getattr(cfg, 'query_max_tokens_fallback', 6) or 6),
                 },
                 'fetch': {
                     'attempted': len(candidates),
@@ -938,6 +1006,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'date_confidence_histogram': date_conf_hist,
                 'allowlist_fallback_hit': allowlist_fallback_hit,
                 'rerank_softdate_selected': len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high']),
+                'recency_soft_accept_used': recency_soft_accept_used,
+                'undated_accepted_count': undated_soft_count,
                 'trust_decisions': obs_trust_decisions,
             }
             # One-line summary for quick telemetry

@@ -13,6 +13,7 @@ import httpx
 from datetime import datetime
 
 from .config import WebConfig
+from .query_utils import generate_variants
 from .fetch import _httpx_client
 
 
@@ -503,27 +504,38 @@ def search(query: str, *, cfg: Optional[WebConfig] = None, site: Optional[str] =
     # Keyless fallback to DuckDuckGo if no API-backed engines succeeded
     if not candidates:
         candidates.extend(_search_duckduckgo_fallback(q, cfg))
-    # Heuristic fallback: simplify long/narrow queries and retry
+    # Heuristic fallback: generate variants (raw-first), then retry with configured mode
     if not candidates:
         try:
-            toks = re.findall(r"[A-Za-z0-9]+", query)
-            # Build dynamic year stop set excluding current year
-            try:
-                now_y = datetime.now().year
-            except Exception:
-                now_y = 2025
-            years = {str(y) for y in range(2010, max(2010, now_y))}
-            stop = {
-                'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as',
-                'is','are','was','were','be','being','been','this','that','these','those','it','its','into',
-            } | years
-            key_toks = [t for t in toks if t.lower() not in stop]
-            short_q = " ".join(key_toks[:6]) or query[:80]
+            mode = (cfg.query_compression_mode or 'aggressive').strip().lower()
         except Exception:
-            short_q = query[:80]
-        if short_q and short_q.strip().lower() != query.strip().lower():
-            q2 = SearchQuery(query=short_q, site=site, freshness_days=freshness_days)
-            # Retry full rotation
+            mode = 'aggressive'
+        try:
+            max_toks = int(getattr(cfg, 'query_max_tokens_fallback', 6) or 6)
+        except Exception:
+            max_toks = 6
+        try:
+            sw_prof = (getattr(cfg, 'stopword_profile', 'standard') or 'standard').strip().lower()
+        except Exception:
+            sw_prof = 'standard'
+        variants = []
+        try:
+            variants = generate_variants(query, mode=mode, max_tokens=max_toks, stopword_profile=sw_prof)
+        except Exception:
+            variants = [query]
+        # Skip raw (already attempted); cap by variant_max
+        try:
+            vmax = int(getattr(cfg, 'variant_max', 2) or 2)
+        except Exception:
+            vmax = 2
+        tail = [v for v in variants[1:] if isinstance(v, str) and v.strip()]
+        if vmax >= 0:
+            tail = tail[:vmax]
+        # Sequential retry (parallel reserved by flag)
+        for vq in tail:
+            if candidates:
+                break
+            q2 = SearchQuery(query=vq, site=site, freshness_days=freshness_days)
             items2: List[SearchResult] = []
             items2.extend(_search_brave(q2, cfg))
             if not items2:

@@ -195,35 +195,27 @@ def duckduckgo_search(query: str, max_results: int = 3):
             except Exception:
                 pass
 
-            # 3) Query variants (e.g., transform patterns, keyword compression) with HTML/internal fallback
-            def _variants(q: str) -> List[str]:
-                vars: List[str] = []
+            # 3) Query variants via shared generator (raw-first list)
+            try:
                 try:
-                    m = re.search(r"difference between\s+(.+?)\s+and\s+(.+)", q, flags=re.I)
-                    if m:
-                        x = m.group(1).strip().strip('?.,;:')
-                        y = m.group(2).strip().strip('?.,;:')
-                        vars.extend([f"{x} vs {y}", f"{x} versus {y}", f'"{x} vs {y}"'])
-                    # Keyword compression (drop common stopwords)
-                    toks = re.findall(r"[A-Za-z0-9]+", q)
-                    stop = {
-                        'the','a','an','of','in','on','for','to','and','or','with','about','from','by','at','as','is','are','was','were','be','being','been','this','that','these','those','it','its','into','between','difference','parliamentary'
-                    }
-                    kw = " ".join([t for t in toks if t.lower() not in stop][:6])
-                    if kw and kw.lower() != q.lower():
-                        vars.append(kw)
+                    from ..web.pipeline import _DEFAULT_CFG
+                    cfg = _DEFAULT_CFG if _DEFAULT_CFG is not None else None
                 except Exception:
-                    pass
-                # Deduplicate while preserving order
-                seen_v = set()
-                out_v: List[str] = []
-                for v in vars:
-                    if v and v not in seen_v:
-                        seen_v.add(v)
-                        out_v.append(v)
-                return out_v
+                    cfg = None
+                if cfg is None:
+                    from ..web.config import WebConfig  # type: ignore
+                    cfg = WebConfig()
+                from ..web.query_utils import generate_variants  # type: ignore
+                mode = getattr(cfg, 'query_compression_mode', 'aggressive') or 'aggressive'
+                max_tokens = int(getattr(cfg, 'query_max_tokens_fallback', 6) or 6)
+                stop_prof = getattr(cfg, 'stopword_profile', 'standard') or 'standard'
+                vars_all = generate_variants(query, mode=mode, max_tokens=max_tokens, stopword_profile=stop_prof)
+                # Skip raw (already tried)
+                variants_tail = [v for v in vars_all[1:] if isinstance(v, str) and v.strip()]
+            except Exception:
+                variants_tail = []
 
-            for vq in _variants(query):
+            for vq in variants_tail:
                 # HTML fallback for variant
                 collected_v: List[Dict[str, str]] = []
                 for base in fallback_urls:
