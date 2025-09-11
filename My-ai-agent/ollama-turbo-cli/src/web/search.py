@@ -555,4 +555,4 @@ def search(query: str, *, cfg: Optional[WebConfig] = None, site: Optional[str] =
             pass
     # Deduplicate
     out = _dedupe([it for it in candidates if it.url])
-    return out[:15]
+    return out[:20]

@@ -107,7 +107,7 @@ def _query_cache_key(query: str, opts: Dict[str, Any]) -> str:
     return h.hexdigest()
 
 
-def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, top_k: int = 5, force_refresh: bool = False) -> Dict[str, Any]:
+def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, top_k: int = 8, force_refresh: bool = False) -> Dict[str, Any]:
     cfg = cfg or _DEFAULT_CFG or WebConfig()
     # Honor per-call env overrides for dynamic fields used in tests and runtime tuning
     try:

@@ -47,9 +47,9 @@ class ReliabilityIntegration:
             t0 = _time.perf_counter()
             rp = RetrievalPipeline()
             try:
-                topk = int(ctx.reliability.get('rag_k') or int(os.getenv('RAG_TOPK', '5') or '5'))
+                topk = int(ctx.reliability.get('rag_k') or int(os.getenv('RAG_TOPK', '8') or '8'))
             except Exception:
-                topk = 5
+                topk = 8
             # Retrieval knobs
             docs_glob = None
             try:
@@ -110,16 +110,20 @@ class ReliabilityIntegration:
                         # Query fanout: generate a few safe variants to broaden coverage
                         base_q = str(user_message or '').strip()
                         variants = [base_q]
-                        # Deterministic, lightweight variants
-                        for suf in (' overview', ' latest', ' explained'):
+                        # Deterministic, lightweight variants (expanded)
+                        for suf in (
+                            ' overview', ' latest', ' explained',
+                            ' background', ' reference', ' guide'
+                        ):
                             v = (base_q + suf).strip()
                             if v not in variants:
                                 variants.append(v)
                         # Run calls concurrently with a small worker pool
                         cits_all = []
                         import json as _json
-                        fan_topk = max(4, int(topk or 4))
-                        max_workers = min(4, len(variants))
+                        # Widen per-variant breadth but keep sane limits
+                        fan_topk = max(6, min(12, int(topk or 6) * 2))
+                        max_workers = min(6, len(variants))
                         with ThreadPoolExecutor(max_workers=max_workers) as ex:
                             futs = [ex.submit(web_research, v, fan_topk) for v in variants]
                             for fut in as_completed(futs):

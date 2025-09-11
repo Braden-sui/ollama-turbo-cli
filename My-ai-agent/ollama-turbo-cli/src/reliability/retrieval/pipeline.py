@@ -32,7 +32,7 @@ class RetrievalPipeline:
     def run(
         self,
         query: str,
-        k: int = 5,
+        k: int = 8,
         *,
         docs_glob: Optional[str] = None,
         eval_corpus: Optional[str] = None,

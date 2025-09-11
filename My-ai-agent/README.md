@@ -395,6 +395,61 @@ pytest -q
 
 Includes plugin system tests and parity tests across standard/streaming, tool loops, fallback breadcrumbs, etc.
 
+## Retrieval (RAG) controls and determinism
+
+The CLI supports a lightweight, dependency-free retrieval layer for local corpora and web research. Key flags:
+
+- `--docs-glob` — Glob for local JSON/JSONL corpora. Each row/object should include `id`, `title`, `url`, `timestamp`, `text`.
+- `--rag-min-score` — Minimum BM25 score threshold; below this is treated as “no reliable support.”
+- `--ground-fallback` — `off | web`. If retrieval returns no hits or the best score is below the threshold, `web` triggers a web research fallback and injects cited context.
+- `--k` — Top‑k retrieval. Defaults to 5 (can also be overridden via `RAG_TOPK`).
+
+Determinism
+
+- Chunking: defaults to 1000 tokens per chunk with 200‑token overlap (configurable).
+- Tokenizer/stopwords are fixed in `src/reliability/retrieval/pipeline.py`.
+- The index includes a fingerprint derived from the full corpus content plus chunking params. Changing files or params changes the fingerprint; touching mtime alone does not.
+- `get_index_meta()` exposes `fingerprint`, `num_chunks`, `avgdl`, and `load_warnings` for observability.
+
+Ephemeral web research ingest
+
+- Web citations are normalized into in‑memory doc objects and optionally routed through the retrieval pipeline for BM25 ranking, dedupe, and thresholding. No files are written unless explicitly requested.
+- A hard cap (100 docs per query) prevents runaway memory growth. After each run with `ephemeral=True`, the retrieval index is cleared.
+
+## Trace schema and metrics snapshots
+
+For quick, pinned observability, the runtime emits single‑line trace keys:
+
+- `retrieval.topk=N`
+- `retrieval.avg_score=0.####`
+- `retrieval.hit_rate=0.####`
+- `retrieval.fallback_used=0|1`
+- `retrieval.latency_ms=###`
+- `web.latency_ms=###`
+- `citations.count=N`
+- `citations.coverage_pct=0.####`
+
+Generate a snapshot artifact with these steps:
+
+PowerShell (Windows)
+
+```powershell
+Set-Location ollama-turbo-cli
+$env:GENERATE_METRICS_SNAPSHOT = '1'
+pytest -q tests/test_metrics_snapshot.py
+Get-Content tests/artifacts/metrics_snapshot.txt
+```
+
+Make (macOS/Linux)
+
+```bash
+cd ollama-turbo-cli
+make metrics-snapshot
+cat tests/artifacts/metrics_snapshot.txt
+```
+
+The snapshot contains the subset of trace lines for both standard and streaming runs so you can diff across model/provider updates.
+
 CLI options
 --api-key        Ollama API key
 --model          Model name (default: gpt-oss:120b)

@@ -211,15 +211,15 @@ class WebConfig:
     retry_backoff_base: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_BASE", 0.4))
     retry_backoff_max: float = field(default_factory=lambda: _env_float("WEB_RETRY_BACKOFF_MAX", 6.0))
     # Concurrency
-    max_connections: int = field(default_factory=lambda: _env_int("WEB_MAX_CONNECTIONS", 20, min_value=1))
-    max_keepalive: int = field(default_factory=lambda: _env_int("WEB_MAX_KEEPALIVE", 10, min_value=0))
-    per_host_concurrency: int = field(default_factory=lambda: _env_int("WEB_PER_HOST_CONCURRENCY", 4, min_value=1))
+    max_connections: int = field(default_factory=lambda: _env_int("WEB_MAX_CONNECTIONS", 32, min_value=1))
+    max_keepalive: int = field(default_factory=lambda: _env_int("WEB_MAX_KEEPALIVE", 20, min_value=0))
+    per_host_concurrency: int = field(default_factory=lambda: _env_int("WEB_PER_HOST_CONCURRENCY", 6, min_value=1))
     # Fetch behavior
     follow_redirects: bool = field(default_factory=lambda: _env_bool("WEB_FOLLOW_REDIRECTS", True))
     head_gating_enabled: bool = field(default_factory=lambda: _env_bool("WEB_HEAD_GATING", True))
     max_download_bytes: int = field(default_factory=lambda: _env_int("WEB_MAX_DOWNLOAD_BYTES", 10 * 1024 * 1024, min_value=1024))
     accept_header_override: str = field(default_factory=lambda: os.getenv("WEB_ACCEPT_HEADER", ""))
-    client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 16, min_value=1))
+    client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 32, min_value=1))
     # Caching and robots
     cache_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SECONDS", 86400, min_value=0))
     robots_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_ROBOTS_TTL_SECONDS", 3600, min_value=0))
@@ -307,7 +307,7 @@ class WebConfig:
         default_factory=lambda: (os.getenv("WEB_QUERY_COMPRESSION_MODE", "aggressive") or "aggressive").strip().lower()
     )
     query_max_tokens_fallback: int = field(
-        default_factory=lambda: _env_int("WEB_QUERY_MAX_TOKENS_FALLBACK", 6, min_value=1)
+        default_factory=lambda: _env_int("WEB_QUERY_MAX_TOKENS_FALLBACK", 12, min_value=1)
     )
     stopword_profile: str = field(
         default_factory=lambda: (os.getenv("WEB_STOPWORD_PROFILE", "standard") or "standard").strip().lower()
@@ -319,7 +319,7 @@ class WebConfig:
         default_factory=lambda: _env_bool("WEB_VARIANT_PARALLEL", False)
     )
     variant_max: int = field(
-        default_factory=lambda: _env_int("WEB_VARIANT_MAX", 2, min_value=0)
+        default_factory=lambda: _env_int("WEB_VARIANT_MAX", 3, min_value=0)
     )
 
 @dataclass

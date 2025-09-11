@@ -225,11 +225,11 @@ class OllamaTurboClient:
         }
         # Split retrieval vs consensus k to avoid coupling
         try:
-            rag_k_env = os.getenv('RAG_TOPK', '5')
+            rag_k_env = os.getenv('RAG_TOPK', '8')
             cons_k_env = os.getenv('CONSENSUS_K', '')
-            rag_k_val = int(self.reliability.pop('k', None) or (rag_k_env if rag_k_env.isdigit() else 5))
+            rag_k_val = int(self.reliability.pop('k', None) or (rag_k_env if rag_k_env.isdigit() else 8))
         except Exception:
-            rag_k_val = 5
+            rag_k_val = 8
         try:
             consensus_k_val = int(cons_k_env) if cons_k_env.isdigit() else None
         except Exception:

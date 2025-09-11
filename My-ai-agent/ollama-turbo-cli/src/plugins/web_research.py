@@ -2,7 +2,6 @@ from __future__ import annotations
 import json
 from typing import Optional
 from ..web.pipeline import run_research
-from ..routing.query_profile import defaults_for_query
 
 TOOL_SCHEMA = {
     "type": "function",
@@ -14,7 +13,7 @@ TOOL_SCHEMA = {
             "additionalProperties": False,
             "properties": {
                 "query": {"type": "string", "description": "User question or query to research."},
-                "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 8},
                 "site_include": {"type": "string", "description": "Optional site/domain to include (e.g., 'site:arxiv.org')."},
                 "site_exclude": {"type": "string", "description": "Optional domain snippet to exclude."},
                 "freshness_days": {"type": "integer", "minimum": 1, "maximum": 3650},
@@ -26,15 +25,15 @@ TOOL_SCHEMA = {
 }
 
 
-def web_research(query: str, top_k: int = 5, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, force_refresh: bool = False) -> str:
+def web_research(query: str, top_k: int = 8, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, force_refresh: bool = False) -> str:
     # Relax strict date requirements by not defaulting freshness_days from query_profile.
     # Only default top_k when not provided. If callers want recency gating, they pass freshness_days explicitly.
     if not top_k:
-        dk, _df = defaults_for_query(query)
-        top_k = dk
+        # Keep a simple, robust default locally; planners/callers may override
+        top_k = 8
     res = run_research(
         query,
-        top_k=int(top_k or 5),
+        top_k=int(top_k or 8),
         site_include=site_include,
         site_exclude=site_exclude,
         freshness_days=freshness_days,
