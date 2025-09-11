@@ -150,6 +150,17 @@ class ChatTurnOrchestrator:
                         ctx._trace(f"reliability:web:citations={len(citations_map)}")
                     except Exception:
                         pass
+                    # If citing is requested and we actually have context, append cited system prompt
+                    try:
+                        if bool(getattr(ctx, 'reliability', {}).get('cite')) and context_blocks:
+                            from ..reliability_integration.integration import ReliabilityIntegration as _RI
+                            _ri = _RI()
+                            cited_sys = _ri.load_system_cited(ctx) or ""
+                            if cited_sys:
+                                ctx.conversation_history.append({'role': 'system', 'content': cited_sys})
+                                ctx._trace("reliability:web:cited-system-appended")
+                    except Exception:
+                        pass
                     # Phase 0: Grounding auto-degrade when no context was found
                     try:
                         import os as _os

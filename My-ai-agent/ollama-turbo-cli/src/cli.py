@@ -36,6 +36,25 @@ try:
         category=DeprecationWarning,
         message=r".*swigvarlink has no __module__ attribute.*",
     )
+    # Broad fallback: silence any DeprecationWarning mentioning missing __module__ attribute
+    # across SWIG-backed builtins (e.g., SwigPyObject, SwigPyPacked, swigvarlink), regardless of casing
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r".*has no __module__ attribute.*",
+    )
+    # Silence Pydantic v2.11 deprecation from ollama client (model_fields on instance)
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r"Accessing the 'model_fields' attribute on the instance is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        module=r"ollama\._types",
+        message=r".*model_fields.*deprecated.*",
+    )
 except Exception:
     pass
 
