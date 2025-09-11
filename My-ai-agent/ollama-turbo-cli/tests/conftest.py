@@ -51,6 +51,10 @@ try:
     os.environ.setdefault("WEB_DEBUG_METRICS", "0")
     # Use a shorter read timeout to fail fast if something accidentally reaches the network
     os.environ.setdefault("WEB_TIMEOUT_READ", "5.0")
+    # Orchestration/streaming budgets (keep small to speed up parity tests; tests can override)
+    os.environ.setdefault("CLI_STREAM_IDLE_RECONNECT_SECS", "10")
+    os.environ.setdefault("TOOL_MAX_ROUNDS", "3")
+    os.environ.setdefault("MAX_OUTPUT_TOKENS", "128")
 except Exception:
     pass
 
