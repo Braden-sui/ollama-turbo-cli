@@ -50,22 +50,68 @@ class TieredAllowlist:
         return None
 
     def category_for_host(self, host: str) -> Optional[str]:
-        """Return the first matching category name for a host based on seeds first, then patterns."""
+        """Return the best-matching category name for a host.
+        
+        When multiple categories match (e.g., a regulator like 'sec.gov' appearing in both
+        a broad government bucket and a finance-specific bucket), prefer the more specific
+        category by applying a simple name-based ranking heuristic.
+        """
         h = (host or '').lower().strip('.')
         if not h:
             return None
-        for seed, tier, cat in self.seeds_by_cat:
+
+        matches: List[str] = []
+
+        # Collect all matching seed categories (normalized to host level)
+        for seed, _tier, cat in self.seeds_by_cat:
             s = seed.lower().strip()
             if not s:
                 continue
             if '/' in s:
                 s = s.split('/', 1)[0]
             if h == s or h.endswith('.' + s):
-                return cat
-        for pat, tier, cat in self.patterns_by_cat:
+                matches.append(cat)
+
+        # Collect all matching wildcard pattern categories
+        for pat, _tier, cat in self.patterns_by_cat:
             if _match_host_pattern(h, pat):
-                return cat
-        return None
+                matches.append(cat)
+
+        if not matches:
+            return None
+
+        # Rank categories to prefer more specific domains of knowledge (e.g., finance regulators)
+        def _rank(name: str) -> int:
+            n = (name or '').lower()
+            score = 0
+            # Strong specificity buckets
+            if 'finance' in n:
+                score += 100
+            if 'regulator' in n or 'registries' in n:
+                score += 20
+            if ('law' in n) or ('court' in n) or ('legislation' in n):
+                score += 90
+            if 'health' in n:
+                score += 85
+            if 'science' in n:
+                score += 80
+            if 'standards' in n:
+                score += 70
+            if 'tech_docs' in n or 'developer' in n:
+                score += 60
+            if 'weather' in n or 'hazard' in n or 'geology' in n:
+                score += 65
+            if 'news' in n or 'wires' in n or 'media' in n:
+                score += 55
+            # Broad buckets get a smaller base score
+            if 'government' in n:
+                score += 10
+            # Tie-breaker on string length: more specific names tend to be longer
+            score += min(20, max(0, len(n) - 10))
+            return score
+
+        best = max(matches, key=_rank)
+        return best
 
     def staleness_days_for_category(self, category_name: Optional[str]) -> Optional[int]:
         """Map category names to policy staleness buckets from the loaded policy.
