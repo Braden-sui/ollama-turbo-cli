@@ -251,6 +251,17 @@ class OllamaTurboClient:
                 self.reliability['ground_fallback'] = str(ground_fallback)
         except Exception:
             pass
+        # Ensure a default ground_fallback is set (opt-out behavior via config/env)
+        try:
+            if not self.reliability.get('ground_fallback'):
+                default_gf = None
+                if cfg is not None and getattr(cfg, 'reliability', None):
+                    default_gf = getattr(cfg.reliability, 'ground_fallback', None)
+                if default_gf is None:
+                    default_gf = (os.getenv('RAG_GROUND_FALLBACK', 'web') or 'web')
+                self.reliability['ground_fallback'] = str(default_gf).strip().lower()
+        except Exception:
+            pass
         # Reliability runtime state
         self._last_context_blocks: List[Dict[str, Any]] = []
         self._last_citations_map: Dict[str, Any] = {}

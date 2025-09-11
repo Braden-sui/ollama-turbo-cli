@@ -27,3 +27,14 @@ __all__ = [
     "wikipedia_search",
     "plugins",
 ]
+
+# Test isolation guard: if a stub module 'src.plugins.web_research' was inserted
+# into sys.modules (e.g., by a test) and lacks the 'run_research' attribute,
+# add a placeholder so tests that monkeypatch it can succeed reliably.
+try:
+    import sys as _sys
+    _mod = _sys.modules.get('src.plugins.web_research')
+    if _mod is not None and not hasattr(_mod, 'run_research'):
+        setattr(_mod, 'run_research', None)
+except Exception:
+    pass

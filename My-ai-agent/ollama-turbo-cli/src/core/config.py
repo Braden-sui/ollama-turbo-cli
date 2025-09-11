@@ -182,6 +182,9 @@ class ReliabilityConfig:
     check: str = "enforce"  # off|warn|enforce
     consensus: bool = False
     eval_corpus: Optional[str] = None
+    # Default research fallback behavior when local retrieval is insufficient
+    # Values: 'web' (use web_research), 'off' (no fallback)
+    ground_fallback: str = field(default_factory=lambda: (os.getenv("RAG_GROUND_FALLBACK", "web").strip().lower()))
 
 
 @dataclass

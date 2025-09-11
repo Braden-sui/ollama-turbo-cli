@@ -75,14 +75,37 @@ class RetrievalPipeline:
     # ---------------------------- Indexing -----------------------------
     def _resolve_sources(self, docs_glob: Optional[str], eval_corpus: Optional[str]) -> List[str]:
         paths: List[str] = []
+        # Compute a stable project root relative to this file (src/…/pipeline.py -> project root two dirs up)
+        try:
+            _here = os.path.abspath(os.path.dirname(__file__))
+            _src_root = os.path.abspath(os.path.join(_here, "..", ".."))  # .../ollama-turbo-cli
+            _proj_root = os.path.abspath(os.path.join(_src_root, ".."))     # .../My-ai-agent
+        except Exception:
+            _src_root = os.getcwd()
+            _proj_root = os.getcwd()
         if docs_glob:
             try:
-                paths.extend(sorted(glob.glob(docs_glob)))
+                # First: as provided (relative to current working directory)
+                matches = sorted(glob.glob(docs_glob))
+                if not matches and not os.path.isabs(docs_glob):
+                    # Second: relative to package root (ollama-turbo-cli)
+                    alt1 = os.path.join(_src_root, docs_glob)
+                    matches = sorted(glob.glob(alt1))
+                if not matches and not os.path.isabs(docs_glob):
+                    # Third: relative to repository root
+                    alt2 = os.path.join(_proj_root, docs_glob)
+                    matches = sorted(glob.glob(alt2))
+                paths.extend(matches)
             except Exception:
                 pass
         path_env = os.getenv('RAG_LOCAL_DOCS') or os.getenv('EVAL_CORPUS') or eval_corpus
         if path_env:
-            paths.append(path_env)
+            p = path_env
+            if not os.path.isabs(p):
+                cand = os.path.join(_proj_root, p)
+                if os.path.isfile(cand):
+                    p = cand
+            paths.append(p)
         # Keep only existing files
         uniq: List[str] = []
         seen = set()
