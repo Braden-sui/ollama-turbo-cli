@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv, find_dotenv
 from .router_v1 import router as router_v1
+# Import core.config for global logging/warning silencers
+from ..core import config as _core_config  # noqa: F401  (import for side effects)
 
 
 def create_app() -> FastAPI:

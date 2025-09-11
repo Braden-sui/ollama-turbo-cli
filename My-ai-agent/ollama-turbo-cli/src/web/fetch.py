@@ -97,9 +97,22 @@ def _check_ip_blocks(host: str) -> None:
 
 
 def _cache_paths(cfg: WebConfig, url: str) -> Tuple[str, str]:
-    os.makedirs(cfg.cache_root, exist_ok=True)
+    # Optional per-worker sharding to reduce parallel contention
+    try:
+        root = cfg.cache_root
+        if (os.getenv('WEB_CACHE_PER_WORKER', '0').strip().lower() not in {'0','false','no','off'}):
+            worker = os.getenv('PYTEST_XDIST_WORKER') or os.getenv('WORKER_ID')
+            if worker:
+                root = os.path.join(root, worker)
+        os.makedirs(root, exist_ok=True)
+    except Exception:
+        root = cfg.cache_root
+        try:
+            os.makedirs(root, exist_ok=True)
+        except Exception:
+            pass
     key = hashlib.sha256(_canonicalize_url(url).encode()).hexdigest()
-    return os.path.join(cfg.cache_root, f"{key}.bin"), os.path.join(cfg.cache_root, f"{key}.json")
+    return os.path.join(root, f"{key}.bin"), os.path.join(root, f"{key}.json")
 
 
 def _idna_ascii(host: str) -> str:
@@ -398,9 +411,11 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
     cached = False
     if not force_refresh and os.path.isfile(meta_path) and os.path.isfile(body_path):
         try:
-            meta = json.loads(open(meta_path, 'r', encoding='utf-8').read())
+            with open(meta_path, 'r', encoding='utf-8') as _mf:
+                meta = json.load(_mf)
             if now - float(meta.get('ts', 0)) <= cfg.cache_ttl_seconds:
-                raw = open(body_path, 'rb').read()
+                with open(body_path, 'rb') as _bf:
+                    raw = _bf.read()
                 return FetchResult(True, int(meta.get('status', 200)), url, meta.get('final_url', url), dict(meta.get('headers', {})), meta.get('content_type', ''), len(raw), body_path, meta_path, True, bool(meta.get('browser_used', False)))
         except Exception:
             pass
@@ -411,7 +426,8 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
     prev_lm = None
     try:
         if os.path.isfile(meta_path):
-            prev_meta = json.loads(open(meta_path, 'r', encoding='utf-8').read())
+            with open(meta_path, 'r', encoding='utf-8') as _pmf:
+                prev_meta = json.load(_pmf)
             hdrs = dict(prev_meta.get('headers', {}))
             prev_etag = hdrs.get('etag')
             prev_lm = hdrs.get('last-modified')
@@ -475,7 +491,8 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
                     # Handle 304 revalidation
                     if status == 304 and prev_meta and os.path.isfile(body_path):
                         try:
-                            raw = open(body_path, 'rb').read()
+                            with open(body_path, 'rb') as _bf2:
+                                raw = _bf2.read()
                         except Exception:
                             raw = b''
                         pm_headers = dict(prev_meta.get('headers', {}))
@@ -593,8 +610,29 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             'content_type': content_type,
             'browser_used': browser_used,
         }
-        open(body_path, 'wb').write(raw)
-        open(meta_path, 'w', encoding='utf-8').write(json.dumps(meta))
+        # Atomic writes to avoid partial reads by parallel workers
+        tmp_body = body_path + ".tmp"
+        tmp_meta = meta_path + ".tmp"
+        try:
+            with open(tmp_body, 'wb') as _bfo:
+                _bfo.write(raw)
+            os.replace(tmp_body, body_path)
+        finally:
+            try:
+                if os.path.exists(tmp_body):
+                    os.remove(tmp_body)
+            except Exception:
+                pass
+        try:
+            with open(tmp_meta, 'w', encoding='utf-8') as _mfo:
+                json.dump(meta, _mfo)
+            os.replace(tmp_meta, meta_path)
+        finally:
+            try:
+                if os.path.exists(tmp_meta):
+                    os.remove(tmp_meta)
+            except Exception:
+                pass
         cached = False
     except Exception:
         body_path = None
@@ -622,7 +660,8 @@ def fetch_with_browser(url: str, *, cfg: Optional[WebConfig] = None) -> Optional
     status = 200
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Use conservative launch args for CI/parallel stability
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])  # args ignored if not supported
         context = browser.new_context(user_agent=cfg.user_agent)
         # Light stealth: tweak navigator properties where safe
         if cfg.browser_stealth_light:
@@ -680,6 +719,11 @@ def fetch_with_browser(url: str, *, cfg: Optional[WebConfig] = None) -> Optional
                 after = page.content()
                 if before == after:
                     break
+            # Try to reach network idle to reduce teardown races
+            try:
+                page.wait_for_load_state("networkidle", timeout=int(max(500, cfg.browser_wait_ms)))
+            except Exception:
+                pass
             html = page.content()
             final_url = page.url
             try:
@@ -688,13 +732,23 @@ def fetch_with_browser(url: str, *, cfg: Optional[WebConfig] = None) -> Optional
                 pass
             # Screenshot for debugging
             try:
-                shot_path = os.path.join(cfg.cache_root, 'last_screenshot.png')
+                import time as _t, threading as _th, os as _os
+                ts = int(_t.time() * 1000)
+                pid = _os.getpid()
+                tid = getattr(_th.current_thread(), 'ident', 0)
+                shot_name = f"last_screenshot_{pid}_{tid}_{ts}.png"
+                shot_path = os.path.join(cfg.cache_root, shot_name)
                 page.screenshot(path=shot_path)
             except Exception:
                 pass
         finally:
             try:
-                context.close(); browser.close()
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                context.close()
+                browser.close()
             except Exception:
                 pass
 
@@ -709,8 +763,28 @@ def fetch_with_browser(url: str, *, cfg: Optional[WebConfig] = None) -> Optional
             'content_type': headers.get('content-type', ''),
             'browser_used': True,
         }
-        open(body_path, 'wb').write(raw)
-        open(meta_path, 'w', encoding='utf-8').write(json.dumps(meta))
+        tmp_body = body_path + ".tmp"
+        tmp_meta = meta_path + ".tmp"
+        try:
+            with open(tmp_body, 'wb') as _bfo:
+                _bfo.write(raw)
+            os.replace(tmp_body, body_path)
+        finally:
+            try:
+                if os.path.exists(tmp_body):
+                    os.remove(tmp_body)
+            except Exception:
+                pass
+        try:
+            with open(tmp_meta, 'w', encoding='utf-8') as _mfo:
+                json.dump(meta, _mfo)
+            os.replace(tmp_meta, meta_path)
+        finally:
+            try:
+                if os.path.exists(tmp_meta):
+                    os.remove(tmp_meta)
+            except Exception:
+                pass
     except Exception:
         pass
     return FetchResult(True, status, url, final_url, headers, headers.get('content-type', ''), len(raw), body_path, meta_path, False, True)

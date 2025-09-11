@@ -1,7 +1,7 @@
 import os
 import json
 from types import SimpleNamespace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -27,9 +27,10 @@ def _env(monkeypatch, tmp_path):
 
 
 def test_recent_window_filters_by_date(monkeypatch):
-    now = datetime.utcnow()
-    within = (now - timedelta(days=2)).isoformat() + "Z"
-    outside = (now - timedelta(days=10)).isoformat() + "Z"
+    # Use timezone-aware UTC timestamps; keep trailing 'Z' for iso strings
+    now = datetime.now(timezone.utc)
+    within = (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    outside = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     u1 = "https://www.reuters.com/world/middle-east/example-1"
     u2 = "https://www.bbc.com/news/example-2"
@@ -131,7 +132,7 @@ def test_liveblog_page_is_discarded_pre_fetch(monkeypatch):
     monkeypatch.setattr(
         pipeline_mod,
         "extract_content",
-        lambda meta, **k: SimpleNamespace(ok=True, kind="html", markdown="x\n", title="T", date=datetime.utcnow().isoformat()+"Z", meta={"lang": "en"}, used={}, risk="LOW", risk_reasons=[]),
+        lambda meta, **k: SimpleNamespace(ok=True, kind="html", markdown="x\n", title="T", date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), meta={"lang": "en"}, used={}, risk="LOW", risk_reasons=[]),
         raising=True,
     )
     monkeypatch.setattr(pipeline_mod, "chunk_text", lambda s: [s], raising=True)
@@ -181,7 +182,7 @@ def test_js_map_source_is_discarded(monkeypatch):
     monkeypatch.setattr(
         pipeline_mod,
         "extract_content",
-        lambda meta, **k: SimpleNamespace(ok=True, kind="html", markdown="x\n", title="T", date=datetime.utcnow().isoformat()+"Z", meta={"lang": "en"}, used={}, risk="LOW", risk_reasons=[]),
+        lambda meta, **k: SimpleNamespace(ok=True, kind="html", markdown="x\n", title="T", date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), meta={"lang": "en"}, used={}, risk="LOW", risk_reasons=[]),
         raising=True,
     )
     monkeypatch.setattr(pipeline_mod, "chunk_text", lambda s: [s], raising=True)
@@ -199,8 +200,8 @@ def test_js_map_source_is_discarded(monkeypatch):
 
 
 def test_only_articles_with_valid_dates_survive(monkeypatch):
-    now = datetime.utcnow()
-    within = (now - timedelta(days=3)).isoformat() + "Z"
+    now = datetime.now(timezone.utc)
+    within = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     u1 = "https://www.haaretz.com/middle-east-news/example-6"
     u2 = "https://www.timesofisrael.com/example-7"

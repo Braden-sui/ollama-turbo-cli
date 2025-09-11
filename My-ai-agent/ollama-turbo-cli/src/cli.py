@@ -8,7 +8,6 @@ import os
 import sys
 import logging
 from dotenv import load_dotenv, find_dotenv
-import warnings
 
 # Load environment variables from the closest .env.local then .env (searching upward)
 try:
@@ -23,40 +22,7 @@ except Exception:
     # Fail-closed if dotenv is unavailable or search fails
     pass
 
-# Import after loading env vars to ensure proper configuration
-# Suppress noisy SWIG DeprecationWarnings from third-party bindings
-try:
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        message=r".*SwigPy.*has no __module__ attribute.*",
-    )
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        message=r".*swigvarlink has no __module__ attribute.*",
-    )
-    # Broad fallback: silence any DeprecationWarning mentioning missing __module__ attribute
-    # across SWIG-backed builtins (e.g., SwigPyObject, SwigPyPacked, swigvarlink), regardless of casing
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        message=r".*has no __module__ attribute.*",
-    )
-    # Silence Pydantic v2.11 deprecation from ollama client (model_fields on instance)
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        message=r"Accessing the 'model_fields' attribute on the instance is deprecated.*",
-    )
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        module=r"ollama\._types",
-        message=r".*model_fields.*deprecated.*",
-    )
-except Exception:
-    pass
+# Warning silencers are centralized in core.config
 
 from .client import OllamaTurboClient
 from .config import from_env as build_config, merge_cli_overrides

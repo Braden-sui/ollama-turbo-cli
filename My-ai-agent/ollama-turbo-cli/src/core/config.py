@@ -15,6 +15,108 @@ non-invasive adoption later.
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import os
+import logging
+import warnings
+
+_LOG_SILENCERS = (os.getenv("LOG_SILENCERS", "1").strip().lower() not in {"0","false","no","off"})
+_BACKOFF_SILENCE = (os.getenv("BACKOFF_SILENCE", "1").strip().lower() not in {"0","false","no","off"})
+
+# Debug banner (emits only when LOG_LEVEL=DEBUG)
+_BANNER_EMITTED = False
+def _emit_debug_banner_if_needed() -> None:
+    global _BANNER_EMITTED
+    try:
+        lvl = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper()
+        if lvl != "DEBUG" or _BANNER_EMITTED:
+            return
+        worker = os.getenv("PYTEST_XDIST_WORKER") or os.getenv("WORKER_ID") or ""
+        cache_root = os.getenv("WEB_CACHE_ROOT", ".sandbox/webcache")
+        per_worker = (os.getenv("WEB_CACHE_PER_WORKER", "0").strip().lower() not in {"0","false","no","off"})
+        effective_cache_root = os.path.join(cache_root, worker) if (per_worker and worker) else cache_root
+        lines = [
+            "=== debug: core.config ===",
+            f"LOG_LEVEL={lvl}",
+            f"LOG_SILENCERS={'on' if _LOG_SILENCERS else 'off'}",
+            f"BACKOFF_SILENCE={'on' if _BACKOFF_SILENCE else 'off'}",
+            f"WEB_CACHE_PER_WORKER={'on' if per_worker else 'off'}",
+            f"PYTEST_XDIST_WORKER={worker or 'n/a'}",
+            f"effective_cache_root={effective_cache_root}",
+        ]
+        try:
+            import sys as _sys
+            print("\n".join(lines), file=_sys.stderr)
+        except Exception:
+            pass
+        _BANNER_EMITTED = True
+    except Exception:
+        pass
+
+# Configure backoff to be less noisy (if enabled)
+if _BACKOFF_SILENCE:
+    logging.getLogger('backoff').addHandler(logging.NullHandler())
+    logging.getLogger('backoff').propagate = False
+_emit_debug_banner_if_needed()
+
+
+# Global silencers for noisy third-party loggers and known deprecations.
+# Keep behavior backward compatible with previous scattered locations.
+if _LOG_SILENCERS:
+    try:
+        # Only dampen noise when not in DEBUG
+        if (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper() != "DEBUG":
+            for name in ("httpx", "ollama", "urllib3", "requests", "trafilatura", "readability.readability"):
+                try:
+                    logging.getLogger(name).setLevel(logging.WARNING)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+# Warning filters that were previously applied in CLI; relocate here to centralize behavior.
+if _LOG_SILENCERS:
+    try:
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*SwigPy.*has no __module__ attribute.*",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*swigvarlink has no __module__ attribute.*",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*has no __module__ attribute.*",
+        )
+        # Silence Pydantic v2.11 deprecation from ollama client (model_fields on instance)
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r"Accessing the 'model_fields' attribute on the instance is deprecated.*",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            module=r"ollama\._types",
+            message=r".*model_fields.*deprecated.*",
+        )
+        # Silence Pydantic V2 deprecation about class-based `config` (originates in third-party libs)
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r"Support for class-based `config` is deprecated, use ConfigDict instead.*",
+        )
+        # Same message, but pydantic uses a custom warning type; match by module + generic Warning
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Support for class-based `config` is deprecated, use ConfigDict instead.*",
+            category=Warning,
+            module=r"pydantic\._internal\._config",
+        )
+    except Exception:
+        pass
 
 
 # ----------------------------- Helpers -----------------------------

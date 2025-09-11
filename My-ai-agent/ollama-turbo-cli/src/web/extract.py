@@ -7,15 +7,9 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 from .config import WebConfig
-import logging
 from .fetch import _httpx_client
 
-# Silence noisy library loggers globally (startup)
-try:
-    logging.getLogger("trafilatura").setLevel(logging.ERROR)
-    logging.getLogger("readability.readability").setLevel(logging.ERROR)
-except Exception:
-    pass
+# Logging noise control is centralized in core.config
 
 
 @dataclass
@@ -63,12 +57,7 @@ def _assess_risk(text: str) -> tuple[str, list[str]]:
 
 
 def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
-    # Silence noisy library loggers
-    try:
-        logging.getLogger("trafilatura").setLevel(logging.ERROR)
-        logging.getLogger("readability.readability").setLevel(logging.ERROR)
-    except Exception:
-        pass
+    # Logging noise control is centralized in core.config
     used = {"trafilatura": False, "readability": False, "jina": False}
     meta: Dict[str, Any] = {"title": "", "date": None, "lang": ""}
     markdown = ""
