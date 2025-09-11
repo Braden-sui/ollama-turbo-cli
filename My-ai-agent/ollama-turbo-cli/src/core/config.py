@@ -273,6 +273,10 @@ class WebConfig:
     # Debugging / fallbacks
     emergency_bootstrap: bool = field(default_factory=lambda: _env_bool("WEB_EMERGENCY_BOOTSTRAP", True))
     debug_metrics: bool = field(default_factory=lambda: _env_bool("WEB_DEBUG_METRICS", False))
+    # Tier sweep (multi-turn allowlist/tier-first pass)
+    enable_tier_sweep: bool = field(default_factory=lambda: _env_bool("WEB_TIER_SWEEP", True))
+    tier_sweep_max_sites: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_MAX_SITES", 12, min_value=1))
+    tier_sweep_strict: bool = field(default_factory=lambda: _env_bool("WEB_TIER_SWEEP_STRICT", False))
     # Rate limiting
     rate_tokens_per_host: int = field(default_factory=lambda: _env_int("WEB_RATE_TOKENS_PER_HOST", 4, min_value=1))
     rate_refill_per_sec: float = field(default_factory=lambda: _env_float("WEB_RATE_REFILL_PER_SEC", 0.5, min_value=0.01))

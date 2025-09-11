@@ -129,6 +129,45 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         env_dateline_soft = os.getenv("WEB_DATELINE_SOFT_ACCEPT")
         if env_dateline_soft is not None:
             cfg.dateline_soft_accept = str(env_dateline_soft).strip().lower() not in {"0","false","no","off"}
+        # Tier sweep (multi-turn allowlist/tier-first search) — default ON; disable with WEB_TIER_SWEEP=0
+        env_tier_sweep = os.getenv("WEB_TIER_SWEEP")
+        try:
+            if env_tier_sweep is not None:
+                cfg.enable_tier_sweep = str(env_tier_sweep).strip().lower() not in {"0","false","no","off"}
+            else:
+                # default to True if not explicitly set on cfg
+                if getattr(cfg, 'enable_tier_sweep', None) is None:
+                    cfg.enable_tier_sweep = True
+        except Exception:
+            try:
+                cfg.enable_tier_sweep = True
+            except Exception:
+                pass
+        # Sweep caps and strictness
+        env_sweep_max = os.getenv("WEB_TIER_SWEEP_MAX_SITES")
+        try:
+            if env_sweep_max is not None:
+                cfg.tier_sweep_max_sites = max(1, int(env_sweep_max))
+            else:
+                if getattr(cfg, 'tier_sweep_max_sites', None) is None:
+                    cfg.tier_sweep_max_sites = 12
+        except Exception:
+            try:
+                cfg.tier_sweep_max_sites = 12
+            except Exception:
+                pass
+        env_sweep_strict = os.getenv("WEB_TIER_SWEEP_STRICT")
+        try:
+            if env_sweep_strict is not None:
+                cfg.tier_sweep_strict = str(env_sweep_strict).strip().lower() not in {"0","false","no","off"}
+            else:
+                if getattr(cfg, 'tier_sweep_strict', None) is None:
+                    cfg.tier_sweep_strict = False
+        except Exception:
+            try:
+                cfg.tier_sweep_strict = False
+            except Exception:
+                pass
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -472,30 +511,72 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             if h == d or h.endswith('.' + d):
                 return True
         return False
-    # Defaults (override via WEB_NEWS_SOURCES_ALLOW / WEB_NEWS_SOURCES_BLOCK comma lists)
-    allow_defaults = [
-        'apnews.com','reuters.com','bbc.co.uk','bbc.com','theguardian.com','aljazeera.com','nytimes.com',
-        'wsj.com','haaretz.com','timesofisrael.com','al-monitor.com'
-    ]
-    block_defaults = [
-        'liveuamap.com'
-    ]
+    # Defaults and comprehensive allowlist (merged from module + cfg + env)
+    try:
+        from .allowlist_data import DEFAULT_ALLOWLIST as _DEFAULT_ALLOWLIST, DEFAULT_BLOCKLIST as _DEFAULT_BLOCKLIST  # type: ignore
+    except Exception:
+        _DEFAULT_ALLOWLIST = [
+            'apnews.com','reuters.com','bbc.co.uk','bbc.com','theguardian.com','aljazeera.com','nytimes.com',
+            'wsj.com','haaretz.com','timesofisrael.com','al-monitor.com'
+        ]
+        _DEFAULT_BLOCKLIST = ['liveuamap.com']
+
+    def _merge_lists(*lists):
+        seen = set()
+        out = []
+        for lst in lists:
+            for d in (lst or []):
+                ds = str(d or '').strip().lower().strip('.')
+                if not ds or ds in seen:
+                    continue
+                seen.add(ds)
+                out.append(ds)
+        return out
+
+    # Base from module
+    allow_list = list(_DEFAULT_ALLOWLIST)
+    block_list = list(_DEFAULT_BLOCKLIST)
+    # Extend from cfg.allowlist_domains (if provided)
+    try:
+        cfg_allow2 = list(getattr(cfg, 'allowlist_domains', []) or [])
+    except Exception:
+        cfg_allow2 = []
+    allow_list = _merge_lists(allow_list, cfg_allow2)
+    # Extend from env comma-lists (do not replace; merge)
     try:
         env_allow = os.getenv('WEB_NEWS_SOURCES_ALLOW')
-        if env_allow is not None:
-            allow_list = [d.strip() for d in env_allow.split(',') if d.strip()]
-        else:
-            allow_list = allow_defaults
+        if env_allow:
+            allow_env_list = [d.strip() for d in env_allow.split(',') if d.strip()]
+            allow_list = _merge_lists(allow_list, allow_env_list)
     except Exception:
-        allow_list = allow_defaults
+        pass
     try:
         env_block = os.getenv('WEB_NEWS_SOURCES_BLOCK')
-        if env_block is not None:
-            block_list = [d.strip() for d in env_block.split(',') if d.strip()]
-        else:
-            block_list = block_defaults
+        if env_block:
+            block_env_list = [d.strip() for d in env_block.split(',') if d.strip()]
+            block_list = _merge_lists(block_list, block_env_list)
     except Exception:
-        block_list = block_defaults
+        pass
+    # Optional file-based allowlist (one domain/glob per line)
+    try:
+        allow_file = os.getenv('WEB_ALLOWLIST_FILE')
+        if allow_file and os.path.isfile(allow_file):
+            try:
+                with open(allow_file, 'r', encoding='utf-8') as _f:
+                    file_list = [ln.strip() for ln in _f if ln.strip() and not ln.strip().startswith('#')]
+                allow_list = _merge_lists(allow_list, file_list)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Optional tiered allowlist: provides trust tiers (0,1,2) and discouraged patterns
+    _tiered = None
+    try:
+        from .allowlist_tiered import load_tiered_allowlist  # type: ignore
+        _tiered = load_tiered_allowlist()
+    except Exception:
+        _tiered = None
 
     def _source_type(url: str) -> str:
         try:
@@ -550,6 +631,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         with obs_lock:
             obs_source_type[stype] = obs_source_type.get(stype, 0) + 1
         h = _host(sr.url)
+        # Tiered category name for policy mapping
+        cat_name: Optional[str] = None
+        try:
+            if _tiered is not None and h:
+                cat_name = _tiered.category_for_host(h)
+        except Exception:
+            cat_name = None
+
+        # Tiered discouraged domains: drop early
+        try:
+            if _tiered is not None and h and _tiered.discouraged_host(h):
+                items.append({'url': sr.url, 'ok': False, 'reason': 'discouraged-domain'})
+                return None
+        except Exception:
+            pass
         if _in_list(h, block_list):
             items.append({'url': sr.url, 'ok': False, 'reason': 'blocked-source'})
             return None
@@ -611,6 +707,45 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             cfg_allow2 = []
         wildcard = ('*' in cfg_allow) or ('*' in cfg_allow2)
         is_allowlisted = (not wildcard) and (_in_list(h, cfg_allow) or _in_list(h, cfg_allow2))
+        # Tiered trust (0/1 trusted; 2 requires corroboration)
+        tier_val: Optional[int] = None
+        trusted_by_tier = False
+        try:
+            if _tiered is not None:
+                tier_val = _tiered.tier_for_host(h)
+                trusted_by_tier = (tier_val is not None) and int(tier_val) in {0, 1}
+        except Exception:
+            tier_val = None
+            trusted_by_tier = False
+        # Apply "first-party rule" override if policy indicates and URL path suggests newsroom/press/IR/blog
+        try:
+            if _tiered is not None and h:
+                # Detect first-party newsroom-style path
+                _p = ''
+                try:
+                    _p = (urlparse(sr.url).path or '').lower()
+                except Exception:
+                    _p = ''
+                if any(seg in _p for seg in ['/press', '/newsroom', '/news-room', '/ir', '/investors', '/blog', '/about']):
+                    # Elevate to Tier 0 for first-party communications
+                    tier_val = 0
+                    trusted_by_tier = True
+        except Exception:
+            pass
+        # Social platforms: treat as Tier 2 (never trusted by tier)
+        try:
+            if _tiered is not None and h:
+                social = (((_tiered.policy or {}).get('social_sources') or {}).get('platforms') or [])
+                for sp in social:
+                    s = (sp or '').strip().lower()
+                    if not s:
+                        continue
+                    if h == s or h.endswith('.' + s):
+                        tier_val = 2
+                        trusted_by_tier = False
+                        break
+        except Exception:
+            pass
         trust_mode = (getattr(cfg, 'trust_mode', 'allowlist') or 'allowlist').strip().lower()
         use_trust = wildcard or (trust_mode in {'heuristic','ml','open'})
         threshold = float(getattr(cfg, 'trust_threshold', 0.6) or 0.6)
@@ -720,7 +855,17 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     if not allow_undated_soft:
                         return None
             if pub_ts:
-                if (now_ts - pub_ts) > window_secs:
+                # Compute per-category staleness window if no explicit freshness provided
+                local_window_secs = window_secs
+                try:
+                    if (not freshness_days) or (int(freshness_days) <= 0):
+                        if _tiered is not None:
+                            cat_days = _tiered.staleness_days_for_category(cat_name)
+                            if cat_days and int(cat_days) > 0:
+                                local_window_secs = int(cat_days) * 86400
+                except Exception:
+                    pass
+                if (now_ts - pub_ts) > local_window_secs:
                     with obs_lock:
                         obs_discard_old['dateline_out_of_window'] = obs_discard_old.get('dateline_out_of_window', 0) + 1
                     decision = 'reject'
@@ -824,10 +969,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'browser_used': f.browser_used,
             'kind': ex.kind,
             'date_confidence': ('high' if pub_ts and ex.date else ('medium' if pub_ts else 'low')),
-            'domain_trust': bool(is_allowlisted or (use_trust and (t_score >= threshold))),
+            'domain_trust': bool(trusted_by_tier or is_allowlisted or (use_trust and (t_score >= threshold))),
             'trust_score': (t_score if use_trust else None),
             'trust_mode': trust_mode,
             'undated': bool(not ex.date),
+            'tier': (int(tier_val) if (tier_val is not None) else None),
+            'category': cat_name,
             'lines': [],
         }
         try:
@@ -903,15 +1050,167 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 obs_discard_old['missing_dateline'] = obs_discard_old.get('missing_dateline', 0) + dropped_missing
         except Exception:
             pass
-    # Prefer trusted domains and higher date confidence, then by risk/url
+    # Prefer lower trust tier (0 best), then trusted domains and higher date confidence, then by risk/url
     def _conf_val(v: str) -> int:
         return 2 if v == 'high' else (1 if v == 'medium' else 0)
+    def _tier_rank(c: Dict[str, Any]) -> int:
+        try:
+            tv = c.get('tier')
+            return int(tv) if tv is not None else 3
+        except Exception:
+            return 3
     citations.sort(key=lambda c: (
+        _tier_rank(c),
         -1 if c.get('domain_trust') else 0,
         -_conf_val(str(c.get('date_confidence','low'))),
         c.get('risk',''),
         hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
     ))
+
+    # Policy: Tier 2 requires corroboration from Tier 0/1; mark as provisional if missing
+    try:
+        has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)
+        for c in citations:
+            if c.get('tier') == 2:
+                c['provisional'] = (not has_tier01)
+    except Exception:
+        pass
+
+    # Tier sweep pass: if we have no allowlisted or Tier 0/1 citations, attempt a site-restricted sweep
+    try:
+        enable_sweep = bool(getattr(cfg, 'enable_tier_sweep', True))
+    except Exception:
+        enable_sweep = True
+    if enable_sweep:
+        try:
+            has_trusted = any(bool(c.get('domain_trust')) or (c.get('tier') in (0, 1)) for c in citations)
+        except Exception:
+            has_trusted = False
+        if (not has_trusted):
+            try:
+                _progress.emit_current({"stage": "tier_sweep", "status": "start"})
+            except Exception:
+                pass
+            # Collect candidate domains from tiered categories seen in search results, then global Tier 0, then allow_list
+            sites: List[str] = []
+            seen_sites: set[str] = set()
+            try:
+                def _add_site(s: str):
+                    ss = (s or '').strip().lower()
+                    if not ss:
+                        return
+                    # Strip path if provided
+                    if '/' in ss:
+                        ss = ss.split('/', 1)[0]
+                    # Skip discouraged/blocked
+                    try:
+                        if _tiered is not None and _tiered.discouraged_host(ss):
+                            return
+                    except Exception:
+                        pass
+                    if ss in seen_sites:
+                        return
+                    seen_sites.add(ss)
+                    sites.append(ss)
+                # 1) categories from initial search results
+                if _tiered is not None:
+                    try:
+                        cats_seen: set[str] = set()
+                        for sr in results:
+                            try:
+                                h0 = (urlparse(sr.url).hostname or '').lower().strip('.')
+                            except Exception:
+                                h0 = ''
+                            if not h0:
+                                continue
+                            cn = _tiered.category_for_host(h0)
+                            if cn:
+                                cats_seen.add(cn)
+                        # seeds_by_cat: (seed, tier, cat)
+                        for seed, tval, cat in getattr(_tiered, 'seeds_by_cat', []) or []:
+                            if cat in cats_seen and (int(tval) in (0, 1)):
+                                _add_site(seed)
+                    except Exception:
+                        pass
+                    # 2) global tier 0 seeds
+                    try:
+                        for seed, tval in getattr(_tiered, 'seeds_by_tier', []) or []:
+                            if int(tval) == 0:
+                                _add_site(seed)
+                    except Exception:
+                        pass
+                # 3) merged allow_list as a fallback
+                try:
+                    for d in (allow_list or []):
+                        _add_site(d)
+                except Exception:
+                    pass
+            except Exception:
+                sites = []
+            # Cap list by configured maximum
+            try:
+                max_sites = int(getattr(cfg, 'tier_sweep_max_sites', 12) or 12)
+            except Exception:
+                max_sites = 12
+            sites = sites[:max_sites]
+            extra_citations: List[Dict[str, Any]] = []
+            good_found = False
+            # Execute site-restricted searches sequentially (bounded)
+            for site in sites:
+                try:
+                    sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
+                except Exception:
+                    sr_list = []
+                for sr2 in sr_list:
+                    try:
+                        cit2 = _build_citation(sr2)
+                    except Exception:
+                        cit2 = None
+                    if not cit2:
+                        continue
+                    extra_citations.append(cit2)
+                    if (cit2.get('tier') in (0, 1)) or bool(cit2.get('domain_trust')):
+                        good_found = True
+                        break
+                if good_found:
+                    break
+            if extra_citations:
+                try:
+                    citations.extend(extra_citations)
+                    citations = dedupe_citations(citations)
+                except Exception:
+                    pass
+                # Re-sort and re-mark provisional after merge
+                citations.sort(key=lambda c: (
+                    _tier_rank(c),
+                    -1 if c.get('domain_trust') else 0,
+                    -_conf_val(str(c.get('date_confidence','low'))),
+                    c.get('risk',''),
+                    hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
+                ))
+                try:
+                    has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)
+                    for c in citations:
+                        if c.get('tier') == 2:
+                            c['provisional'] = (not has_tier01)
+                except Exception:
+                    pass
+            # Strict mode: if requested and still no Tier 0/1, drop Tier 2-only sets
+            try:
+                strict = bool(getattr(cfg, 'tier_sweep_strict', False))
+            except Exception:
+                strict = False
+            if strict:
+                try:
+                    has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)
+                    if not has_tier01:
+                        citations = [c for c in citations if c.get('tier') in (0, 1)]
+                except Exception:
+                    pass
+            try:
+                _progress.emit_current({"stage": "tier_sweep", "status": "done", "added": len(extra_citations)})
+            except Exception:
+                pass
 
     # Soft-accept fallback for recency-like queries: if empty and enabled, allow 1–2 undated allowlisted/high-trust items
     # Use either the explicit recency gate or a positive freshness window as a signal.
