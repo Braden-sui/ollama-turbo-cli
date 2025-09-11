@@ -1,7 +1,14 @@
 from __future__ import annotations
 import json
 from typing import Optional
-from ..web.pipeline import run_research
+try:
+    # Import lazily-safe: on plugin loader eager import failures, keep a placeholder
+    from ..web.pipeline import run_research as _pipeline_run_research
+except Exception:
+    _pipeline_run_research = None  # type: ignore
+
+# Expose a module-level symbol that tests can monkeypatch regardless of import timing
+run_research = _pipeline_run_research  # type: ignore
 
 TOOL_SCHEMA = {
     "type": "function",
@@ -31,6 +38,9 @@ def web_research(query: str, top_k: int = 8, site_include: Optional[str] = None,
     if not top_k:
         # Keep a simple, robust default locally; planners/callers may override
         top_k = 8
+    # Use the module-level symbol so tests can monkeypatch it
+    if run_research is None:  # type: ignore
+        raise RuntimeError("run_research pipeline not available")
     res = run_research(
         query,
         top_k=int(top_k or 8),
