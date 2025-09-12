@@ -92,6 +92,9 @@ from .evidence import score_evidence
 from .wire_dedup import collapse_citations, WIRE_HOSTS
 from .rescue import adaptive_rescue
 from .corroborate import compute_corroboration, claim_key
+from .counter_claim import evaluate_counter_claim
+from .reputation import compute_prior
+from .ledger import log_veracity
 from .normalize import canonicalize, dedupe_citations
 from .loc import format_loc
 from datetime import datetime, timedelta
@@ -227,6 +230,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             corroborate_enable = (str(env_corro).strip().lower() not in {"0","false","no","off"}) if env_corro is not None else False
         except Exception:
             corroborate_enable = False
+        # PR5 flags
+        try:
+            env_cc = os.getenv("WEB_COUNTER_CLAIM_ENABLE")
+            counter_claim_enable = (str(env_cc).strip().lower() not in {"0","false","no","off"}) if env_cc is not None else False
+        except Exception:
+            counter_claim_enable = False
+        try:
+            env_rep = os.getenv("WEB_REPUTATION_ENABLE")
+            reputation_enable = (str(env_rep).strip().lower() not in {"0","false","no","off"}) if env_rep is not None else False
+        except Exception:
+            reputation_enable = False
+        try:
+            env_led = os.getenv("WEB_VERACITY_LEDGER_ENABLE")
+            ledger_enable = (str(env_led).strip().lower() not in {"0","false","no","off"}) if env_led is not None else False
+        except Exception:
+            ledger_enable = False
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -1170,6 +1189,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                         'notes': [],
                     },
                 }
+                # PR5: optional counter-claim + reputation prior (debug-only; no ranking change)
+                try:
+                    if counter_claim_enable:
+                        cc = evaluate_counter_claim(ex.markdown or '', claims)
+                        cit['ef']['reasons']['counter_claim'] = cc
+                    if reputation_enable:
+                        prior, prior_feats = compute_prior(snap, tiered=_tiered)
+                        cit['ef']['reasons']['reputation_inputs'] = prior_feats
+                        # mirror into ef breakdown prior slice (debug only)
+                        cbd = cit['ef'].get('confidence_breakdown') if isinstance(cit['ef'].get('confidence_breakdown'), dict) else {}
+                        if isinstance(cbd, dict):
+                            cbd['prior'] = float(prior)
+                            cit['ef']['confidence_breakdown'] = cbd
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -1770,6 +1804,21 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 ) + "]"
             )
             answer['debug']['summary_line'] = line
+        except Exception:
+            pass
+        # PR5: ledger logging (best-effort)
+        try:
+            if ledger_enable:
+                log_veracity(cfg.cache_root, {
+                    'query': q_sanitized,
+                    'citations': [c.get('canonical_url') for c in citations[:top_k] if isinstance(c, dict)],
+                    'flags': {
+                        'ef': bool(getattr(cfg, 'evidence_first', False)),
+                        'corroborate': bool('corroborate_enable' in locals() and corroborate_enable),
+                        'counter_claim': bool(counter_claim_enable),
+                        'reputation': bool(reputation_enable),
+                    },
+                })
         except Exception:
             pass
 
