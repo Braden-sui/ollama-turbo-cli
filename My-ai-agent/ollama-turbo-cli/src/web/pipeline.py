@@ -78,6 +78,10 @@ from .trust import trust_score
 from .extract import extract_content
 from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
+from .snapshot import build_snapshot
+from .claims import extract_claims
+from .validators import validate_claim
+from .evidence import score_evidence
 from .normalize import canonicalize, dedupe_citations
 from .loc import format_loc
 from datetime import datetime, timedelta
@@ -990,6 +994,40 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'category': cat_name,
             'lines': [],
         }
+        # Evidence-first (PR3): attach minimal analysis behind flags (no behavior change)
+        try:
+            if bool(getattr(cfg, 'evidence_first', False)) and not bool(getattr(cfg, 'evidence_first_kill_switch', True)):
+                snap = build_snapshot(f.final_url, f.headers or {}, ex.markdown or '')
+                claims = extract_claims(snap)
+                # Per-claim validators; compute average validator score
+                v_scores = []
+                v_outcomes_agg = []
+                for cl in claims[:5]:  # bound per citation
+                    outs, vscore, gated = validate_claim(cl, snap)
+                    v_scores.append(vscore)
+                    v_outcomes_agg.append({'id': cl.id, 'outcomes': [{'validator': o.validator, 'status': o.status} for o in outs]})
+                validator_avg = (sum(v_scores) / len(v_scores)) if v_scores else 0.0
+                ev_score, features = score_evidence(snap, claims)
+                # Combine partial scores per SPEC weights (no corroboration/prior yet)
+                w_e, w_v, w_c, w_p = 0.45, 0.25, 0.20, 0.10
+                final = max(0.0, min(1.0, w_e * ev_score + w_v * validator_avg))
+                cit['ef'] = {
+                    'snapshot_id': snap.id,
+                    'claim_count': len(claims),
+                    'validator_avg': validator_avg,
+                    'evidence_score': ev_score,
+                    'confidence_breakdown': {
+                        'evidence': ev_score,
+                        'validators': validator_avg,
+                        'corroboration': 0.0,
+                        'prior': 0.0,
+                        'final_score': final,
+                    },
+                    'validators': v_outcomes_agg,
+                    'features': features,
+                }
+        except Exception:
+            pass
         try:
             if cfg.debug_metrics:
                 with obs_lock:

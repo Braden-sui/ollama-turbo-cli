@@ -83,7 +83,7 @@ _predicates = (
 )
 # Optional article (The/A/An), then a capitalized subject, then predicate, then the rest until sentence end.
 _SUBJ_VERB_RE = re.compile(
-    rf"\b(?:(?:T|t)he\s+|(?:A|a)n?\s+)?([A-Z][\w&\.\- ]{{1,80}}?)\s+({ _predicates })\b(.*?)([\.!?]|$)",
+    rf"\b(?:(?:T|t)he\s+|(?:A|a)n?\s+)?([A-Z][\w&\.\- ]{{1,80}}?)\s+({_predicates})\b(.*?)([\.!?]|$)",
     re.DOTALL,
 )
 _DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2}|(19|20)\d{2})\b")
