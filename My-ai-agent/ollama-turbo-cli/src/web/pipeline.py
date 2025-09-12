@@ -168,6 +168,19 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cfg.tier_sweep_strict = False
             except Exception:
                 pass
+        # Evidence-first flags: env overrides
+        try:
+            env_ef = os.getenv("EVIDENCE_FIRST")
+            if env_ef is not None:
+                cfg.evidence_first = str(env_ef).strip().lower() not in {"0","false","no","off"}
+        except Exception:
+            pass
+        try:
+            env_ef_ks = os.getenv("EVIDENCE_FIRST_KILL_SWITCH")
+            if env_ef_ks is not None:
+                cfg.evidence_first_kill_switch = str(env_ef_ks).strip().lower() not in {"0","false","no","off"}
+        except Exception:
+            pass
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -1402,6 +1415,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'forced_refresh_used': bool(force_refresh),
             'freshness_days': freshness_final,
             'top_k': top_k,
+            # Evidence-first rollout flags surfaced for observability (PR1, no behavior change)
+            'evidence_first': bool(getattr(cfg, 'evidence_first', False)),
+            'evidence_first_kill_switch': bool(getattr(cfg, 'evidence_first_kill_switch', True)),
         },
     }
 

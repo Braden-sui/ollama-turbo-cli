@@ -32,7 +32,8 @@ test-results/
 .env.production
 .env.test
 !.env.example
-s
+
 # Local run data and audit logs
 runs/
 **/audit.jsonl
+My-ai-agent/ollama-turbo-cli/docs/evidence_first_refactor.yaml

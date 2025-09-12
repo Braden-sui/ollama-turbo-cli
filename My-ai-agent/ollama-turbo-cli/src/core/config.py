@@ -430,6 +430,9 @@ class WebConfig:
     variant_max: int = field(
         default_factory=lambda: _env_int("WEB_VARIANT_MAX", 3, min_value=0)
     )
+    # Evidence-first rollout flags (no behavior change in PR1)
+    evidence_first: bool = field(default_factory=lambda: _env_bool("EVIDENCE_FIRST", False))
+    evidence_first_kill_switch: bool = field(default_factory=lambda: _env_bool("EVIDENCE_FIRST_KILL_SWITCH", True))
 
 @dataclass
 class ClientRuntimeConfig:
