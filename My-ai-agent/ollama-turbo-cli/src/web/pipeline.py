@@ -2131,7 +2131,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
         try:
-            answer['debug']['extract'] = {'fail_count': obs_extract_fail}
+            answer['debug']['extract'] = {
+                'fail_count': obs_extract_fail,
+                'fail_by_host': obs_extract_fail_by_host,
+                'modes': obs_extract_modes,
+            }
         except Exception:
             pass
         try:
