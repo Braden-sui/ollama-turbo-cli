@@ -363,6 +363,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     # Observability counters
     obs_fetch_fail: Dict[str, int] = {}
     obs_extract_fail: int = 0
+    obs_extract_fail_by_host: Dict[str, int] = {}
+    obs_extract_modes: Dict[str, int] = {}
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
     obs_trust_decisions: List[Dict[str, Any]] = []
@@ -888,6 +890,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             nonlocal obs_extract_fail
             with obs_lock:
                 obs_extract_fail += 1
+                try:
+                    h_fail = (urlparse(f.final_url).hostname or '').lower()
+                    if h_fail:
+                        obs_extract_fail_by_host[h_fail] = obs_extract_fail_by_host.get(h_fail, 0) + 1
+                except Exception:
+                    pass
             try:
                 _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
             except Exception:
@@ -1206,6 +1214,33 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             has_canon = False
 
+        # Determine extraction mode (PR10)
+        try:
+            used = ex.used or {}
+        except Exception:
+            used = {}
+        try:
+            if ex.kind == 'pdf':
+                if used.get('pymupdf'):
+                    extraction_mode = 'pdf-pymupdf'
+                elif used.get('pdfminer'):
+                    extraction_mode = 'pdf-pdfminer'
+                elif used.get('ocrmypdf'):
+                    extraction_mode = 'pdf-ocr'
+                else:
+                    extraction_mode = 'pdf-unknown'
+            else:
+                if used.get('trafilatura'):
+                    extraction_mode = 'trafilatura'
+                elif used.get('readability'):
+                    extraction_mode = 'readability'
+                elif used.get('jina'):
+                    extraction_mode = 'jina'
+                else:
+                    extraction_mode = 'html-unknown'
+        except Exception:
+            extraction_mode = 'unknown'
+
         cit = {
             'canonical_url': f.final_url,
             'archive_url': archive.get('archive_url', ''),
@@ -1218,6 +1253,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'risk_reasons': ex.risk_reasons,
             'browser_used': f.browser_used,
             'kind': ex.kind,
+            'extraction_mode': extraction_mode,
             'date_confidence': ('high' if pub_ts and ex.date else ('medium' if pub_ts else 'low')),
             'domain_trust': bool(trusted_by_tier or is_allowlisted or (use_trust and (t_score >= threshold))),
             'trust_score': (t_score if use_trust else None),
@@ -1231,6 +1267,13 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'has_canonical': has_canon,
             'lines': [],
         }
+        # Record extraction mode histogram (PR10)
+        try:
+            with obs_lock:
+                obs_extract_modes[extraction_mode] = obs_extract_modes.get(extraction_mode, 0) + 1
+        except Exception:
+            pass
+
         # Evidence-first (PR3): attach minimal analysis behind flags (no behavior change)
         try:
             if bool(getattr(cfg, 'evidence_first', False)) and not bool(getattr(cfg, 'evidence_first_kill_switch', True)):
@@ -1487,30 +1530,149 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 max_sites = 12
             sites = sites[:max_sites]
             extra_citations: List[Dict[str, Any]] = []
-            good_found = False
-            # Execute site-restricted searches sequentially (bounded); PR7: deterministic site order by seed
+            tier_escalations: List[Dict[str, Any]] = []
+            # Execute site-restricted searches with optional adaptive budget
             try:
                 sites = sorted(sites, key=lambda s: _seeded_url_hash(s))
             except Exception:
                 pass
-            for site in sites:
+            def _apex_name(h: str) -> str:
                 try:
-                    sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
+                    parts = (h or '').split('.')
+                    return '.'.join(parts[-2:]) if len(parts) >= 2 else (h or '')
                 except Exception:
-                    sr_list = []
-                for sr2 in sr_list:
-                    try:
-                        cit2 = _build_citation(sr2)
-                    except Exception:
-                        cit2 = None
-                    if not cit2:
-                        continue
-                    extra_citations.append(cit2)
-                    if (cit2.get('tier') in (0, 1)) or bool(cit2.get('domain_trust')):
-                        good_found = True
+                    return h or ''
+            def _quota_met(cits_all: List[Dict[str, Any]]) -> bool:
+                try:
+                    now = time.time()
+                    # distinct apex of Tier 0/1 or domain_trust within windows
+                    fast_h = int(getattr(cfg, 'tier_sweep_quota_fast_hours', 2) or 2)
+                    fast_n = int(getattr(cfg, 'tier_sweep_quota_fast_count', 2) or 2)
+                    slow_h = int(getattr(cfg, 'tier_sweep_quota_slow_hours', 24) or 24)
+                    slow_n = int(getattr(cfg, 'tier_sweep_quota_slow_count', 3) or 3)
+                    fast_cut = now - fast_h * 3600
+                    slow_cut = now - slow_h * 3600
+                    fast_hosts: set[str] = set()
+                    slow_hosts: set[str] = set()
+                    for c in cits_all:
+                        try:
+                            if not (bool(c.get('domain_trust')) or (c.get('tier') in (0,1))):
+                                continue
+                            ts = float(c.get('date_ts') or 0.0)
+                            host = _apex_name((urlparse(c.get('canonical_url') or '').hostname or '').lower())
+                            if host:
+                                if ts >= fast_cut and ts > 0:
+                                    fast_hosts.add(host)
+                                if ts >= slow_cut and ts > 0:
+                                    slow_hosts.add(host)
+                        except Exception:
+                            continue
+                    if len(fast_hosts) >= fast_n:
+                        return True
+                    if len(slow_hosts) >= slow_n:
+                        return True
+                    return False
+                except Exception:
+                    return False
+            if bool(getattr(cfg, 'tier_sweep_adaptive_enable', False)):
+                total_sites = len(sites)
+                cap = min(int(getattr(cfg, 'tier_sweep_max_sites_cap', 24) or 24), max_sites, total_sites)
+                budget = min(int(getattr(cfg, 'tier_sweep_initial_sites', 8) or 8), cap)
+                processed = 0
+                while True:
+                    batch_sites = sites[processed:budget]
+                    for site in batch_sites:
+                        try:
+                            sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
+                        except Exception:
+                            sr_list = []
+                        for sr2 in sr_list:
+                            try:
+                                cit2 = _build_citation(sr2)
+                            except Exception:
+                                cit2 = None
+                            if cit2:
+                                extra_citations.append(cit2)
+                    processed = budget
+                    # Check quota
+                    if _quota_met(list(citations) + list(extra_citations)):
                         break
-                if good_found:
-                    break
+                    if budget >= cap:
+                        break
+                    prev = budget
+                    budget = min(budget * 2, cap)
+                    tier_escalations.append({'from': prev, 'to': budget, 'reason': 'quota_not_met'})
+                if extra_citations:
+                    try:
+                        citations.extend(extra_citations)
+                        citations = dedupe_citations(citations)
+                    except Exception:
+                        pass
+                    # Re-sort and re-mark provisional after merge
+                    citations.sort(key=lambda c: (
+                        _tier_rank(c),
+                        -1 if c.get('domain_trust') else 0,
+                        -_conf_val(str(c.get('date_confidence','low'))),
+                        c.get('risk',''),
+                        _seeded_url_hash(c.get('canonical_url','') or '')
+                    ))
+                    try:
+                        has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)
+                        for c in citations:
+                            if c.get('tier') == 2:
+                                c['provisional'] = (not has_tier01)
+                    except Exception:
+                        pass
+                try:
+                    _progress.emit_current({"stage": "tier_sweep", "status": "done", "added": len(extra_citations)})
+                except Exception:
+                    pass
+            else:
+                # Legacy single-pass sweep
+                good_found = False
+                for site in sites:
+                    try:
+                        sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
+                    except Exception:
+                        sr_list = []
+                    for sr2 in sr_list:
+                        try:
+                            cit2 = _build_citation(sr2)
+                        except Exception:
+                            cit2 = None
+                        if not cit2:
+                            continue
+                        extra_citations.append(cit2)
+                        if (cit2.get('tier') in (0, 1)) or bool(cit2.get('domain_trust')):  
+                            good_found = True
+                            break
+                    if good_found:
+                        break
+                if extra_citations:
+                    try:
+                        citations.extend(extra_citations)
+                        citations = dedupe_citations(citations)
+                    except Exception:
+                        pass
+                    # Re-sort and re-mark provisional after merge
+                    citations.sort(key=lambda c: (
+                        _tier_rank(c),
+                        -1 if c.get('domain_trust') else 0,
+                        -_conf_val(str(c.get('date_confidence','low'))),
+                        c.get('risk',''),
+                        _seeded_url_hash(c.get('canonical_url','') or '')
+                    ))
+                    try:
+                        has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)      
+                        for c in citations:
+                            if c.get('tier') == 2:
+                                c['provisional'] = (not has_tier01)
+                    except Exception:
+                        pass
+                try:
+                    _progress.emit_current({"stage": "tier_sweep", "status": "done", "added": len(extra_citations)})
+                except Exception:
+                    pass
             if extra_citations:
                 try:
                     citations.extend(extra_citations)
@@ -1881,6 +2043,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'prefiltered_discouraged': prefiltered_discouraged_count,
                 'tier_first_added': tier_first_added,
             }
+            try:
+                # Include escalation events if adaptive sweep ran
+                if 'tier_escalations' in locals() and tier_escalations:
+                    answer['debug']['tier']['escalation_events'] = tier_escalations
+            except Exception:
+                pass
         except Exception:
             pass
         # Rescue preview meta
