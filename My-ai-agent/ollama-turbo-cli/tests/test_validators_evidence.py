@@ -8,7 +8,7 @@ import src.web.pipeline as pipeline_mod
 from src.web.pipeline import run_research
 from src.web.snapshot import build_snapshot
 from src.web.claims import extract_claims_from_text
-from src.web.validators import validate_claim
+from src.validators.claim_validation import validate_claim
 from src.web.evidence import score_evidence
 
 

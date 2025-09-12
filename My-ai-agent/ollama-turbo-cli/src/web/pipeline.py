@@ -80,7 +80,7 @@ from .rerank import chunk_text, rerank_chunks
 from .archive import save_page_now, get_memento
 from .snapshot import build_snapshot
 from .claims import extract_claims
-from .validators import validate_claim
+from src.validators.claim_validation import validate_claim
 from .evidence import score_evidence
 from .normalize import canonicalize, dedupe_citations
 from .loc import format_loc
@@ -1014,7 +1014,6 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cit['ef'] = {
                     'snapshot_id': snap.id,
                     'claim_count': len(claims),
-                    'validator_avg': validator_avg,
                     'evidence_score': ev_score,
                     'confidence_breakdown': {
                         'evidence': ev_score,
@@ -1023,8 +1022,25 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                         'prior': 0.0,
                         'final_score': final,
                     },
-                    'validators': v_outcomes_agg,
-                    'features': features,
+                    'claim_validation': {
+                        'validator_avg': validator_avg,
+                        'validator_outcomes': v_outcomes_agg,
+                    },
+                    'reasons': {
+                        'snapshot_id': snap.id,
+                        'features': features,
+                        'validator_outcomes': v_outcomes_agg,
+                        'corroborators': [],
+                        'reputation_inputs': {},
+                        'confidence_breakdown': {
+                            'evidence': ev_score,
+                            'validators': validator_avg,
+                            'corroboration': 0.0,
+                            'prior': 0.0,
+                            'final_score': final,
+                        },
+                        'notes': [],
+                    },
                 }
         except Exception:
             pass
