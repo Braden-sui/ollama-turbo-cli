@@ -76,15 +76,17 @@ def _rotate_and_index(cache_root: str, run_id: str, payload: Dict[str, Any]) -> 
     # Retention cleanup
     try:
         days = int(os.getenv("VERACITY_LEDGER_RETENTION_DAYS", "14"))
-        if days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        # days >= 0 means enforce retention; 0 keeps only today's file
+        if days >= 0:
+            today_dt = datetime.now(timezone.utc)
+            cutoff_date = (today_dt - timedelta(days=days)).date()
             for fn in os.listdir(base):
                 if not fn.startswith("veracity_ledger.") or not fn.endswith(".jsonl"):
                     continue
                 try:
                     stamp = fn.split(".")[1]
-                    dt = datetime.strptime(stamp, "%Y%m%d").replace(tzinfo=timezone.utc)
-                    if dt < cutoff:
+                    dt = datetime.strptime(stamp, "%Y%m%d").date()
+                    if dt < cutoff_date:
                         try:
                             os.remove(os.path.join(base, fn))
                         except Exception:

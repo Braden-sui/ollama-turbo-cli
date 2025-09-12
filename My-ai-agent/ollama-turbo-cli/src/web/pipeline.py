@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 import re
 import threading
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .robots import RobotsPolicy
 from .config import WebConfig
@@ -125,7 +126,9 @@ def _query_cache_key(query: str, opts: Dict[str, Any]) -> str:
 
 
 def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: Optional[str] = None, site_exclude: Optional[str] = None, freshness_days: Optional[int] = None, top_k: int = 8, force_refresh: bool = False) -> Dict[str, Any]:
-    cfg = cfg or _DEFAULT_CFG or WebConfig()
+    # Use a fresh, isolated config instance per call to prevent cross-test or cross-run mutation of defaults
+    if cfg is None:
+        cfg = copy.deepcopy(_DEFAULT_CFG) if _DEFAULT_CFG is not None else WebConfig()
     # Honor per-call env overrides for dynamic fields used in tests and runtime tuning
     try:
         env_excl = os.getenv("WEB_EXCLUDE_CITATION_DOMAINS")
@@ -344,6 +347,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         pass
     _search_t0 = time.time()
     results = search(q_sanitized, cfg=cfg, site=site_include, freshness_days=freshness_final)
+    # PR14: drain provider throttle events from search providers
+    try:
+        throttle_events = _drain_throttle_events()
+    except Exception:
+        throttle_events = []
     _search_ms = int((time.time() - _search_t0) * 1000)
     try:
         _progress.emit_current({"stage": "search", "status": "done", "count": len(results)})
@@ -435,7 +443,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
 
-    if not results and cfg.emergency_bootstrap:
+    if not results and bool(getattr(cfg, 'emergency_bootstrap', True)):
         # Emergency: call providers directly here to bootstrap candidates
         try:
             def _dedup_add(acc: list[SearchResult], seen: set[str], title: str, url: str, snippet: str, source: str):
@@ -459,13 +467,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 # Brave
                 if getattr(cfg, 'brave_key', None):
                     try:
-                        headers = {"X-Subscription-Token": cfg.brave_key, "Accept": "application/json", "User-Agent": cfg.user_agent}
-                        r = c.get("https://api.search.brave.com/res/v1/web/search", params={"q": em_q, "count": 10}, headers=headers, timeout=cfg.timeout_read)
-                        if r.status_code == 200:
-                            data = r.json()
-                            for d in ((data.get('web') or {}).get('results') or []):
-                                _dedup_add(tmp, seen_urls, d.get('title',''), d.get('url',''), d.get('description',''), 'brave')
-                            # generic crawl fallback
+                    
                             if not tmp:
                                 def _walk(v):
                                     if isinstance(v, dict):
@@ -1156,9 +1158,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             ranked = rerank_chunks(query, chunks, cfg=cfg, top_k=3)
         # Archive on first success (with optional Memento pre-check)
         archive = {'archive_url': '', 'timestamp': ''}
-        if cfg.archive_enabled:
+        if bool(getattr(cfg, 'archive_enabled', False)):
             try:
-                if cfg.archive_check_memento_first:
+                if bool(getattr(cfg, 'archive_check_memento_first', False)):
                     m = get_memento(f.final_url, cfg=cfg)
                     if m.get('archive_url'):
                         archive = m
@@ -1528,13 +1530,10 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                                 _add_site(seed)
                     except Exception:
                         pass
-                    # 2) global tier 0 seeds
-                    try:
-                        for seed, tval in getattr(_tiered, 'seeds_by_tier', []) or []:
-                            if int(tval) == 0:
-                                _add_site(seed)
-                    except Exception:
-                        pass
+                    # 2) global seeds from allowlist (all tiers)
+                    for seed, tval in getattr(_tiered, 'seeds_by_tier', []) or []:
+                        # Include all tiers to allow adaptive sweep to progress
+                        _add_site(seed)
                 # 3) merged allow_list as a fallback
                 try:
                     for d in (allow_list or []):
@@ -2187,6 +2186,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             answer['debug']['rerank_softdate_selected'] = len([c for c in citations[:top_k] if str(c.get('date_confidence','low')) != 'high'])
             answer['debug']['recency_soft_accept_used'] = recency_soft_accept_used
             answer['debug']['undated_accepted_count'] = undated_soft_count
+            # PR14: search throttle events and knob changes
+            try:
+                if 'throttle_events' in locals() and throttle_events:
+                    answer['debug'].setdefault('search', {})
+                    answer['debug']['search']['provider_throttle_events'] = throttle_events
+                    answer['debug']['search']['knob_changes'] = {'reduced_concurrency_to': max_workers}
+            except Exception:
+                pass
             answer['debug']['trust_decisions'] = obs_trust_decisions
         except Exception:
             pass
