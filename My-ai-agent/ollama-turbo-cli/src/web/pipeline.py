@@ -185,6 +185,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cfg.evidence_first_kill_switch = str(env_ef_ks).strip().lower() not in {"0","false","no","off"}
         except Exception:
             pass
+        # Optional telemetry/filters
+        try:
+            env_prefilt = os.getenv("WEB_PREFILTER_DISCOURAGED")
+            prefilter_discouraged = (str(env_prefilt).strip().lower() not in {"0","false","no","off"}) if env_prefilt is not None else False
+        except Exception:
+            prefilter_discouraged = False
+        try:
+            env_tier_first = os.getenv("WEB_TIER_FIRST_PASS")
+            tier_first_enabled = (str(env_tier_first).strip().lower() not in {"0","false","no","off"}) if env_tier_first is not None else False
+        except Exception:
+            tier_first_enabled = False
+        try:
+            env_tier_first_max = os.getenv("WEB_TIER_FIRST_PASS_MAX_SITES")
+            tier_first_max_sites = max(1, int(env_tier_first_max)) if env_tier_first_max not in (None, "") else 4
+        except Exception:
+            tier_first_max_sites = 4
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -274,6 +290,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         _progress.emit_current({"stage": "search", "status": "done", "count": len(results)})
     except Exception:
         pass
+
+    # Tier/category telemetry placeholders
+    tier_first_added = 0
+    prefiltered_discouraged_count = 0
+    tier_counts = {0: 0, 1: 0, 2: 0}
+    categories_seen: Dict[str, int] = {}
 
     simplified_used = False
     emergency_used = False
@@ -481,6 +503,77 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         # Replace results with expanded list if we added anything
         if wiki_refs_added > 0:
             results = expanded
+    except Exception:
+        pass
+
+    # Optional tier-first warm start: add small number of Tier 0 seeds (seeded search)
+    if tier_first_enabled and (_tiered is not None):
+        try:
+            sites: list[str] = []
+            for sd, tval in getattr(_tiered, 'seeds_by_tier', []) or []:
+                try:
+                    if int(tval) == 0:
+                        s = (sd or '').strip().lower()
+                        if s and '/' in s:
+                            s = s.split('/', 1)[0]
+                        if s and s not in sites:
+                            sites.append(s)
+                except Exception:
+                    continue
+            sites = sites[: tier_first_max_sites]
+            seen_urls: set[str] = {getattr(sr, 'url', '') for sr in results}
+            added: list[Any] = []
+            for site in sites:
+                try:
+                    sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
+                except Exception:
+                    sr_list = []
+                for sr2 in sr_list:
+                    u2 = getattr(sr2, 'url', '')
+                    if u2 and (u2 not in seen_urls):
+                        added.append(sr2)
+                        seen_urls.add(u2)
+                if len(added) >= tier_first_max_sites:
+                    break
+            if added:
+                results.extend(added)
+                tier_first_added = len(added)
+        except Exception:
+            pass
+
+    # Optional prefilter: drop discouraged hosts before worker submission
+    if prefilter_discouraged and (_tiered is not None):
+        try:
+            kept: list[Any] = []
+            for sr in results:
+                try:
+                    h0 = (urlparse(getattr(sr, 'url', '')).hostname or '').lower().strip('.')
+                except Exception:
+                    h0 = ''
+                if h0 and _tiered.discouraged_host(h0):
+                    prefiltered_discouraged_count += 1
+                    continue
+                kept.append(sr)
+            results = kept
+        except Exception:
+            pass
+
+    # Compute tier/category telemetry on current results
+    try:
+        if _tiered is not None:
+            for sr in results:
+                try:
+                    h0 = (urlparse(getattr(sr, 'url', '')).hostname or '').lower().strip('.')
+                except Exception:
+                    h0 = ''
+                if not h0:
+                    continue
+                tv = _tiered.tier_for_host(h0)
+                if tv is not None and int(tv) in (0,1,2):
+                    tier_counts[int(tv)] = tier_counts.get(int(tv), 0) + 1
+                cn = _tiered.category_for_host(h0)
+                if cn:
+                    categories_seen[cn] = categories_seen.get(cn, 0) + 1
     except Exception:
         pass
 
@@ -1533,6 +1626,16 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'excluded': excluded_skips,
                 'wiki_refs_added': wiki_refs_added,
                 'fail_reasons': obs_fetch_fail,
+            }
+        except Exception:
+            pass
+        # Tier/category telemetry
+        try:
+            answer['debug']['tier'] = {
+                'tier_counts': tier_counts,
+                'categories_seen': categories_seen,
+                'prefiltered_discouraged': prefiltered_discouraged_count,
+                'tier_first_added': tier_first_added,
             }
         except Exception:
             pass
