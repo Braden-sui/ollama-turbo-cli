@@ -1190,6 +1190,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     hi = mid - 1
             return ans + 1
 
+        # Derive additional fields for wire dedup representative selection
+        try:
+            body_chars = len(ex.markdown or '')
+        except Exception:
+            body_chars = 0
+        try:
+            # Prefer pub_ts from recency pass; else parse ex.date if available
+            date_ts_val = float(pub_ts) if pub_ts else (float(_parse_pub_date(ex.date) or 0.0) if ex.date else 0.0)
+        except Exception:
+            date_ts_val = 0.0
+        try:
+            meta_obj = ex.meta or {}
+            has_canon = bool(meta_obj.get('canonical') or meta_obj.get('canonical_url') or meta_obj.get('link_canonical') or meta_obj.get('og:url') or meta_obj.get('twitter:url'))
+        except Exception:
+            has_canon = False
+
         cit = {
             'canonical_url': f.final_url,
             'archive_url': archive.get('archive_url', ''),
@@ -1210,6 +1226,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'tier': (int(tier_val) if (tier_val is not None) else None),
             'category': cat_name,
             'content_fingerprint': content_fingerprint(ex.markdown or ''),
+            'body_char_count': body_chars,
+            'date_ts': date_ts_val,
+            'has_canonical': has_canon,
             'lines': [],
         }
         # Evidence-first (PR3): attach minimal analysis behind flags (no behavior change)
@@ -1957,6 +1976,13 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
         try:
             answer['debug']['year_guard'] = yg_counters
+        except Exception:
+            pass
+        # PR8: wire/syndication dedup preview meta
+        try:
+            if 'wire_dedup_enable' in locals() and wire_dedup_enable:
+                _collapsed, wmeta = collapse_citations(citations[:top_k])
+                answer['debug']['wire'] = wmeta
         except Exception:
             pass
         try:

@@ -24,9 +24,12 @@ def _apex(host: str) -> str:
     return host
 
 
-def _text_key(c: Dict[str, Any]) -> str:
+def _fingerprint(c: Dict[str, Any]) -> str:
+    fp = c.get('content_fingerprint') or ''
+    if fp:
+        return fp
+    # Fallback: approximate by title + first line hash if fingerprint is absent
     title = (c.get('title') or '').strip().lower()
-    # Include top lines text if available
     lines = c.get('lines') or []
     first_line = ''
     if lines and isinstance(lines, list):
@@ -35,7 +38,7 @@ def _text_key(c: Dict[str, Any]) -> str:
         except Exception:
             first_line = ''
     key = f"{title}\n{first_line}"
-    h = hashlib.sha256()
+    h = hashlib.md5()
     h.update(key.encode('utf-8', 'ignore'))
     return h.hexdigest()
 
@@ -56,24 +59,62 @@ def collapse_citations(citations: List[Dict[str, Any]]) -> Tuple[List[Dict[str, 
             host = ''
         apex = _apex(host)
         is_wire = apex in WIRE_HOSTS
-        tkey = _text_key(cit)
-        fkey = f"{tkey}:{apex}:{'wire' if is_wire else 'pub'}"
+        fp = _fingerprint(cit)
+        # One group per content fingerprint; include apex/wire tag in meta only
+        fkey = fp
         groups.setdefault(fkey, []).append(idx)
 
     collapsed = []
     kept_indices = set()
     for fkey, members in groups.items():
-        # keep the first as canonical
         if not members:
             continue
-        canonical_idx = members[0]
+        # Choose representative deterministically
+        def _tier_val(c: Dict[str, Any]) -> int:
+            try:
+                tv = c.get('tier')
+                return int(tv) if tv is not None else 3
+            except Exception:
+                return 3
+        def _body_len(c: Dict[str, Any]) -> int:
+            try:
+                return int(c.get('body_char_count') or 0)
+            except Exception:
+                return 0
+        def _date_ts(c: Dict[str, Any]) -> float:
+            try:
+                return float(c.get('date_ts') or 0.0) or 0.0
+            except Exception:
+                return 0.0
+        def _has_canonical(c: Dict[str, Any]) -> int:
+            try:
+                return 1 if bool(c.get('has_canonical')) else 0
+            except Exception:
+                return 0
+        def _url(c: Dict[str, Any]) -> str:
+            return (c.get('canonical_url') or c.get('url') or '')
+        # Preference: lower tier (0 best), then longer body, then earliest date, then canonical rel present, finally URL tie-break
+        members_sorted = sorted(members, key=lambda i: (
+            _tier_val(citations[i]),
+            -_body_len(citations[i]),
+            _date_ts(citations[i]) if _date_ts(citations[i]) > 0 else float('inf'),
+            -_has_canonical(citations[i]),
+            _url(citations[i])
+        ))
+        canonical_idx = members_sorted[0]
         kept_indices.add(canonical_idx)
         # others considered duplicates in meta only
         meta_groups.append({
-            'fingerprint': fkey,
+            'wire_group_id': fkey,
             'canonical': canonical_idx,
-            'duplicates': [i for i in members[1:]],
+            'duplicates': [i for i in members if i != canonical_idx],
             'size': len(members),
+            'chosen_reason': {
+                'tier': _tier_val(citations[canonical_idx]),
+                'body_chars': _body_len(citations[canonical_idx]),
+                'date_ts': _date_ts(citations[canonical_idx]) or None,
+                'has_canonical': bool(_has_canonical(citations[canonical_idx])),
+            }
         })
 
     for i, cit in enumerate(citations or []):
