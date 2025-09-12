@@ -59,6 +59,13 @@ except Exception:
                         _os.environ[_key] = _val
         except Exception:
             pass
+        # Wire/syndication dedup preview
+        try:
+            if 'wire_dedup_enable' in locals() and wire_dedup_enable:
+                _collapsed, wmeta = collapse_citations(citations[:top_k])
+                answer['debug']['wire'] = wmeta
+        except Exception:
+            pass
     try:
         _p_local = _find_upwards('.env.local')
         if _p_local:
@@ -82,6 +89,9 @@ from .snapshot import build_snapshot
 from .claims import extract_claims
 from src.validators.claim_validation import validate_claim
 from .evidence import score_evidence
+from .wire_dedup import collapse_citations, WIRE_HOSTS
+from .rescue import adaptive_rescue
+from .corroborate import compute_corroboration, claim_key
 from .normalize import canonicalize, dedupe_citations
 from .loc import format_loc
 from datetime import datetime, timedelta
@@ -201,6 +211,22 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             tier_first_max_sites = max(1, int(env_tier_first_max)) if env_tier_first_max not in (None, "") else 4
         except Exception:
             tier_first_max_sites = 4
+        # Wire dedup and rescue preview flags
+        try:
+            env_wire = os.getenv("WEB_WIRE_DEDUP_ENABLE")
+            wire_dedup_enable = (str(env_wire).strip().lower() not in {"0","false","no","off"}) if env_wire is not None else False
+        except Exception:
+            wire_dedup_enable = False
+        try:
+            env_rescue = os.getenv("WEB_RESCUE_SWEEP")
+            rescue_preview = (str(env_rescue).strip().lower() not in {"0","false","no","off"}) if env_rescue is not None else False
+        except Exception:
+            rescue_preview = False
+        try:
+            env_corro = os.getenv("WEB_CORROBORATE_ENABLE")
+            corroborate_enable = (str(env_corro).strip().lower() not in {"0","false","no","off"}) if env_corro is not None else False
+        except Exception:
+            corroborate_enable = False
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -576,6 +602,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     categories_seen[cn] = categories_seen.get(cn, 0) + 1
     except Exception:
         pass
+
+    # Rescue preview (do not merge; debug only)
+    rescue_meta = None
+    try:
+        if rescue_preview and (_tiered is not None):
+            _added, rescue_meta = adaptive_rescue(q_sanitized, cfg=cfg, tiered=_tiered, categories_seen=categories_seen, freshness_days=freshness_final, risk='low', early_exit=True)
+    except Exception:
+        rescue_meta = None
 
     citations: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
@@ -1107,6 +1141,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cit['ef'] = {
                     'snapshot_id': snap.id,
                     'claim_count': len(claims),
+                    'claim_keys': [claim_key(cl) for cl in claims[:10]],
                     'evidence_score': ev_score,
                     'confidence_breakdown': {
                         'evidence': ev_score,
@@ -1549,6 +1584,49 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             allowlist_fallback_hit = bool(citations)
 
 
+    # Optional: compute corroboration across citations (debug-only)
+    if 'corroborate_enable' in locals() and corroborate_enable:
+        try:
+            pairs: list[tuple[int, list[str]]] = []
+            for idx, cit in enumerate(citations):
+                try:
+                    ef = cit.get('ef') if isinstance(cit, dict) else None
+                    keys = list((ef or {}).get('claim_keys') or []) if isinstance(ef, dict) else []
+                    if keys:
+                        pairs.append((idx, keys))
+                except Exception:
+                    continue
+            corrob_map = compute_corroboration(pairs)
+            if corrob_map:
+                for idx, data in corrob_map.items():
+                    try:
+                        ef = citations[idx].get('ef')
+                        if isinstance(ef, dict):
+                            # attach corroborators list and set corroboration score in breakdown
+                            all_c = list(data.get('all_corrob') or [])
+                            # write into reasons
+                            reasons = ef.get('reasons') if isinstance(ef.get('reasons'), dict) else {}
+                            if isinstance(reasons, dict):
+                                reasons['corroborators'] = all_c
+                                # bounded simple score for debug only
+                                cor_score = min(1.0, len(all_c) / 3.0)
+                                cb = reasons.get('confidence_breakdown') if isinstance(reasons.get('confidence_breakdown'), dict) else {}
+                                if isinstance(cb, dict):
+                                    cb['corroboration'] = cor_score
+                                    reasons['confidence_breakdown'] = cb
+                                ef['reasons'] = reasons
+                            # keep ef.confidence_breakdown.final_score unchanged (no behavior change)
+                            cbd = ef.get('confidence_breakdown') if isinstance(ef.get('confidence_breakdown'), dict) else {}
+                            if isinstance(cbd, dict):
+                                cbd['corroboration'] = min(1.0, len(all_c) / 3.0)
+                                ef['confidence_breakdown'] = cbd
+                            citations[idx]['ef'] = ef
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # Answer assembly
     answer = {
         'query': q_sanitized,
         'top_k': top_k,
@@ -1637,6 +1715,20 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 'prefiltered_discouraged': prefiltered_discouraged_count,
                 'tier_first_added': tier_first_added,
             }
+        except Exception:
+            pass
+        # Rescue preview meta
+        try:
+            if rescue_meta is not None:
+                answer['debug']['rescue'] = rescue_meta
+            elif rescue_preview:
+                # Provide minimal stub so callers can introspect flag behavior
+                answer['debug']['rescue'] = {
+                    'added_count': 0,
+                    'cap': 0,
+                    'sites_considered': [],
+                    'reason': 'not_available',
+                }
         except Exception:
             pass
         try:
