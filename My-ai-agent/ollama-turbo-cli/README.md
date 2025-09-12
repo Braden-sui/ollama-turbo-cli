@@ -382,6 +382,9 @@ python -m src.cli --message "Research: What are the latest results on Llama 3.2 
 - `MEM0_ORG_ID`: Optional organization id
 - `MEM0_PROJECT_ID`: Optional project id
 - `MEM0_VERSION`: Preferred Mem0 API version (default: "v2"). The client prefers v2 and gracefully falls back if the SDK doesn't support the `version` parameter.
+- `WEB_WIRE_DEDUP_ENABLE`: Wire/Syndication preview
+- `WEB_RESCUE_SWEEP`: Enable/disable rescue sweep
+- `WEB_RESCUE_STRATEGY`: Rescue strategy ∈ {`opportunistic`, `adaptive`, `exhaustive`}
 
 Mem0 runtime knobs (advanced):
 

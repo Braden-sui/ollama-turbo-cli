@@ -79,7 +79,7 @@ except Exception:
     except Exception:
         pass
 from . import progress as _progress
-from .search import search, SearchResult, _year_guard
+from .search import search, SearchResult, _year_guard, _drain_throttle_events
 from .fetch import fetch_url, _httpx_client
 from .trust import trust_score
 from .extract import extract_content
@@ -222,9 +222,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             wire_dedup_enable = False
         try:
             env_rescue = os.getenv("WEB_RESCUE_SWEEP")
-            rescue_preview = (str(env_rescue).strip().lower() not in {"0","false","no","off"}) if env_rescue is not None else False
+            if env_rescue is None:
+                # PR15: backward compatibility with legacy name
+                env_rescue = os.getenv("WEB_RESCUE_PREVIEW")
+            rescue_sweep = (str(env_rescue).strip().lower() not in {"0","false","no","off"}) if env_rescue is not None else False
         except Exception:
-            rescue_preview = False
+            rescue_sweep = False
         try:
             env_corro = os.getenv("WEB_CORROBORATE_ENABLE")
             corroborate_enable = (str(env_corro).strip().lower() not in {"0","false","no","off"}) if env_corro is not None else False
@@ -368,6 +371,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
     obs_trust_decisions: List[Dict[str, Any]] = []
+    # PR14: fetch timing samples
+    fetch_timing_samples: List[Dict[str, Any]] = []
     # PR6 deprecation counters (legacy gates) — telemetry only
     obs_deprecation: Dict[str, int] = {
         'discouraged_domain': 0,
@@ -1241,6 +1246,15 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             extraction_mode = 'unknown'
 
+        # PR14: capture fetch timing sample
+        try:
+            ttfb_ms = int((f.headers or {}).get('x-debug-ttfb-ms', 0)) if f.headers else 0
+            ttc_ms = int((f.headers or {}).get('x-debug-ttc-ms', 0)) if f.headers else 0
+            with obs_lock:
+                fetch_timing_samples.append({'url': f.final_url, 'ttfb_ms': ttfb_ms, 'ttc_ms': ttc_ms})
+        except Exception:
+            pass
+
         cit = {
             'canonical_url': f.final_url,
             'archive_url': archive.get('archive_url', ''),
@@ -1368,6 +1382,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     candidates = results[: top_k * 2]
     # For deterministic metrics in tests, serialize worker execution when debug metrics is on
     max_workers = 1 if cfg.debug_metrics else max(1, min(8, cfg.per_host_concurrency))
+    # PR14: reduce concurrency if providers throttled
+    try:
+        if throttle_events:
+            max_workers = max(1, min(max_workers, 2))
+    except Exception:
+        pass
     # PR6 metric: time to first trustworthy citation
     first_trust_ms: Optional[int] = None
     with ThreadPoolExecutor(max_workers=max_workers) as exr:
@@ -2051,11 +2071,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 pass
         except Exception:
             pass
-        # Rescue preview meta
+        # Rescue sweep meta
         try:
             if rescue_meta is not None:
                 answer['debug']['rescue'] = rescue_meta
-            elif rescue_preview:
+            elif rescue_sweep:
                 # Provide minimal stub so callers can introspect flag behavior
                 answer['debug']['rescue'] = {
                     'added_count': 0,
@@ -2150,7 +2170,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             answer['debug']['year_guard'] = yg_counters
         except Exception:
             pass
-        # PR8: wire/syndication dedup preview meta
+        # PR8: wire/syndication dedup sweep meta
         try:
             if 'wire_dedup_enable' in locals() and wire_dedup_enable:
                 _collapsed, wmeta = collapse_citations(citations[:top_k])
@@ -2190,6 +2210,96 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 f"• kept={kept} • extracted={kept} • {ds_note} • sources=[{srcs}]"
             )
             answer['debug']['summary_line'] = line
+        except Exception:
+            pass
+        # PR14: aggregate fetch timings
+        try:
+            ts = list(fetch_timing_samples)
+            if ts:
+                ttfbs = [int(x.get('ttfb_ms', 0)) for x in ts]
+                ttcs = [int(x.get('ttc_ms', 0)) for x in ts]
+                answer['debug'].setdefault('fetch', {})
+                answer['debug']['fetch']['timings'] = {
+                    'count': len(ts),
+                    'ttfb_ms': {'avg': int(sum(ttfbs)/len(ttfbs)), 'min': min(ttfbs), 'max': max(ttfbs)},
+                    'ttc_ms': {'avg': int(sum(ttcs)/len(ttcs)), 'min': min(ttcs), 'max': max(ttcs)},
+                    'examples': ts[:3],
+                }
+        except Exception:
+            pass
+
+        # PR11: EF hygiene aggregation (contradictions, confidence components, degrade)
+        try:
+            # Collect claim keys per kept citation
+            ck_by_idx: List[tuple[int, List[str]]] = []
+            conf_parts = {'evidence': [], 'validators': [], 'corroboration': [], 'prior': [], 'final_score': []}
+            for i, c in enumerate(citations[:top_k]):
+                try:
+                    ef = c.get('ef') or {}
+                    keys = list(ef.get('claim_keys') or [])
+                    ck_by_idx.append((i, keys))
+                    cbd = ef.get('confidence_breakdown') or {}
+                    for k in conf_parts.keys():
+                        if k in cbd:
+                            conf_parts[k].append(float(cbd.get(k) or 0.0))
+                except Exception:
+                    continue
+            # Compute corroboration map (already available util)
+            cor_map = compute_corroboration(ck_by_idx)
+            # Detect simple contradictions: same subj|pred, object differs by negation token
+            def _split_key(k: str) -> tuple[str,str,str]:
+                try:
+                    s,p,o = k.split('|',2)
+                    return s,p,o
+                except Exception:
+                    return ('','','')
+            def _is_negated(o: str) -> bool:
+                t = o.strip().lower()
+                return t.startswith('not ') or t.startswith("no ") or " didn't " in t or ' no ' in t
+            pairs: List[Dict[str, Any]] = []
+            for i, keys_i in ck_by_idx:
+                for j, keys_j in ck_by_idx:
+                    if j <= i:
+                        continue
+                    for ka in keys_i:
+                        sa,pa,oa = _split_key(ka)
+                        if not sa and not pa:
+                            continue
+                        for kb in keys_j:
+                            sb,pb,ob = _split_key(kb)
+                            if sa==sb and pa==pb and _is_negated(oa) != _is_negated(ob):
+                                pairs.append({'keyA': ka, 'keyB': kb, 'citations': [i,j]})
+                                break
+            # Aggregate confidence
+            comp = {k: (sum(v)/len(v) if v else 0.0) for k,v in conf_parts.items()}
+            note_parts: List[str] = []
+            if comp['evidence'] < 0.5:
+                note_parts.append('Low evidence density')
+            if not cor_map:
+                note_parts.append('no corroboration')
+            if comp['prior'] == 0.0:
+                note_parts.append('prior neutral')
+            conf_note = '; '.join(note_parts) if note_parts else 'balanced'
+            answer['debug'].setdefault('ef', {})
+            answer['debug']['ef']['contradiction_pairs'] = pairs
+            answer['debug']['ef']['confidence_components'] = comp
+            answer['debug']['ef']['confidence_note'] = conf_note
+            # Degrade gating
+            try:
+                if bool(getattr(cfg, 'ef_degrade_enable', False)):
+                    degraded = False
+                    if comp['final_score'] < 0.4:
+                        degraded = True
+                    if recency_gate:
+                        has_t01 = any(c.get('tier') in (0,1) or c.get('domain_trust') for c in citations[:top_k])
+                        if not has_t01:
+                            degraded = True
+                    if degraded:
+                        answer['degraded'] = True
+                        answer['debug'].setdefault('policy', {})
+                        answer['debug']['policy']['degraded_reason'] = conf_note or 'low confidence'
+            except Exception:
+                pass
         except Exception:
             pass
         # PR5: ledger logging (best-effort)

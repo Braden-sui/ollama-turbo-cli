@@ -486,6 +486,8 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
                     req_headers['If-None-Match'] = str(prev_etag)
                 if prev_lm:
                     req_headers['If-Modified-Since'] = str(prev_lm)
+                t_start = time.time()
+                t_first: Optional[float] = None
                 with client.stream("GET", url, headers=req_headers) as resp:
                     status = resp.status_code
                     # Handle 304 revalidation
@@ -509,10 +511,20 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
                     for chunk in resp.iter_bytes():
                         if chunk:
                             buf += chunk
+                            if t_first is None:
+                                t_first = time.time()
                             if len(buf) >= cfg.max_download_bytes:
                                 break
                     data = bytes(buf)
                     headers = {k: v for k, v in resp.headers.items()}
+                    # Attach timings as debug headers
+                    try:
+                        ttfb_ms = int(((t_first or time.time()) - t_start) * 1000)
+                        ttc_ms = int((time.time() - t_start) * 1000)
+                        headers['x-debug-ttfb-ms'] = str(max(0, ttfb_ms))
+                        headers['x-debug-ttc-ms'] = str(max(0, ttc_ms))
+                    except Exception:
+                        pass
                     content_type = headers.get('content-type', '')
                     resp_final_url = str(resp.request.url)
                 break
@@ -596,6 +608,12 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             content_type = bres.content_type
             raw = open(bres.body_path, 'rb').read() if bres.body_path and os.path.isfile(bres.body_path) else raw
             browser_used = True
+            try:
+                # Attach approximate timings for browser path
+                headers['x-debug-ttfb-ms'] = headers.get('x-debug-ttfb-ms', '0')
+                headers['x-debug-ttc-ms'] = headers.get('x-debug-ttc-ms', '0')
+            except Exception:
+                pass
         else:
             # keep HTTP result if any
             pass

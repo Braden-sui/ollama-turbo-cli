@@ -10,11 +10,33 @@ from urllib.parse import quote_plus, urlparse, urljoin, parse_qs, unquote
 import xml.etree.ElementTree as ET
 import gzip
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .config import WebConfig
 from .query_utils import generate_variants
 from .fetch import _httpx_client
+_THROTTLE_EVENTS: List[Dict[str, Any]] = []
+
+
+def _record_throttle(provider: str, status: int, backoff: float) -> None:
+    try:
+        _THROTTLE_EVENTS.append({
+            'provider': provider,
+            'status': int(status),
+            'backoff': float(backoff),
+            'ts': datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+def _drain_throttle_events() -> List[Dict[str, Any]]:
+    try:
+        ev = list(_THROTTLE_EVENTS)
+        _THROTTLE_EVENTS.clear()
+        return ev
+    except Exception:
+        return []
 
 
 @dataclass
@@ -308,6 +330,14 @@ def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchRe
                         return out
                     for it in _flatten(data.get("RelatedTopics")):
                         results.append(_norm(it, "duckduckgo"))
+                elif r.status_code in (429, 503):
+                    try:
+                        _record_throttle('duckduckgo', int(r.status_code), backoff=1.0)
+                    except Exception:
+                        pass
+                    results = []
+                else:
+                    results = []
             except Exception:
                 results = []
             if results:
@@ -335,6 +365,11 @@ def _search_duckduckgo_fallback(q: SearchQuery, cfg: WebConfig) -> List[SearchRe
                 except Exception:
                     continue
                 if r2.status_code != 200:
+                    if r2.status_code in (429, 503):
+                        try:
+                            _record_throttle('duckduckgo_html', int(r2.status_code), backoff=1.0)
+                        except Exception:
+                            pass
                     continue
                 html = r2.text or ""
                 links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I)

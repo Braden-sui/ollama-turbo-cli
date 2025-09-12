@@ -23,7 +23,7 @@ def canonicalize(url: str) -> str:
     if path != '/' and path.endswith('/'):
         path = path[:-1]
     # Clean query
-    bad_keys = {"ref", "source", "icmpid"}
+    bad_keys = {"gclid", "fbclid", "ref", "mc_cid", "mc_eid", "igshid", "source", "icmpid"}
     qs = []
     for k, v in parse_qsl(p.query, keep_blank_values=False):
         kl = (k or '').lower()

@@ -31,7 +31,7 @@ flowchart TD
   Q -- yes --> R[Site-restricted Searches\n(seeds by category/tier/allowlist)] --> S[Merge, Dedupe, Re-sort]
   Q -- no --> S
 
-  S --> T{Rescue Preview?\nWEB_RESCUE_SWEEP}
+  S --> T{Rescue Sweep?\nWEB_RESCUE_SWEEP}
   T -- yes --> U[adaptive_rescue\ndebug.rescue]
   T -- no --> V[skip]
 
@@ -58,7 +58,7 @@ flowchart TD
   - Entrypoint `run_research()` orchestrates:
     - YearGuard, search, citation build (policy/fetch/extract/rerank/archive), normalization, sorting, tier sweep.
     - Optional EF analysis (claims/validators/evidence, counter-claim, reputation, corroboration) — all flag-gated, debug-only.
-    - Optional rescue preview and wire/syndication dedup preview — debug-only.
+    - Optional rescue sweep and wire/syndication dedup preview — debug-only.
     - Rich `answer.debug` schema v1 telemetry (search/fetch/tier/rescue/wire/extract/discard/source_type/metrics/deprecation/summary_line).
   - Provides centralized config plumbing via `_DEFAULT_CFG` and `set_default_config()`.
 

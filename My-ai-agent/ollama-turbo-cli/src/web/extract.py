@@ -5,6 +5,7 @@ import io
 import json
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+import logging
 
 from .config import WebConfig
 from .fetch import _httpx_client
@@ -56,7 +57,7 @@ def _assess_risk(text: str) -> tuple[str, list[str]]:
     return risk, reasons
 
 
-def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
+def _html_to_markdown(html: str, cfg: WebConfig) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     # Logging noise control is centralized in core.config
     used = {"trafilatura": False, "readability": False, "jina": False}
     meta: Dict[str, Any] = {"title": "", "date": None, "lang": ""}
@@ -71,71 +72,72 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
             meta["lang"] = (mlang.group(1) or '').lower()
     except Exception:
         pass
-    # Try trafilatura
-    try:
-        import trafilatura  # type: ignore
-        art = trafilatura.extract(html, include_formatting=True, include_links=True, output_format='markdown')
-        if art:
-            markdown = art
-            used["trafilatura"] = True
-            meta["title"] = trafilatura.bare_extraction(html).get('title', '') if hasattr(trafilatura, 'bare_extraction') else ''
-            # Try to parse date from common meta tags and JSON-LD
-            try:
-                m = re.search(r"<meta[^>]+property=\"article:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
-                if m:
-                    meta["date"] = m.group(1)
-                if not meta.get('date'):
-                    m2 = re.search(r"<time[^>]+datetime=\"([^\"]+)\"", html, flags=re.I)
-                    if m2:
-                        meta["date"] = m2.group(1)
-                # OpenGraph published/updated time
-                if not meta.get('date'):
-                    m3 = re.search(r"<meta[^>]+property=\"og:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
-                    if m3:
-                        meta["date"] = m3.group(1)
-                if not meta.get('date'):
-                    m4 = re.search(r"<meta[^>]+property=\"og:updated_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
-                    if m4:
-                        meta["date"] = m4.group(1)
-                # itemprop and common name fallbacks
-                if not meta.get('date'):
-                    m5 = re.search(r"<meta[^>]+itemprop=\"datePublished\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
-                    if m5:
-                        meta["date"] = m5.group(1)
-                if not meta.get('date'):
-                    m6 = re.search(r"<meta[^>]+name=\"(date|pubdate|publishdate)\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
-                    if m6:
-                        meta["date"] = m6.group(2)
-                if not meta.get('date'):
-                    for js in re.findall(r"<script[^>]+type=\"application/ld\+json\"[^>]*>(.*?)</script>", html, flags=re.I|re.S):
-                        try:
-                            data = json.loads(js.strip())
-                        except Exception:
-                            continue
-                        def _find_date(obj):
-                            if isinstance(obj, dict):
-                                if (obj.get('@type') in {'NewsArticle','Article'}) and obj.get('datePublished'):
-                                    return obj.get('datePublished')
-                                for v in obj.values():
-                                    r = _find_date(v)
-                                    if r:
-                                        return r
-                            if isinstance(obj, list):
-                                for it in obj:
-                                    r = _find_date(it)
-                                    if r:
-                                        return r
-                            return None
-                        d = _find_date(data)
-                        if d:
-                            meta['date'] = d
-                            break
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Try trafilatura (if enabled)
+    if getattr(cfg, 'extract_trafilatura_enabled', True):
+        try:
+            import trafilatura  # type: ignore
+            art = trafilatura.extract(html, include_formatting=True, include_links=True, output_format='markdown')
+            if art:
+                markdown = art
+                used["trafilatura"] = True
+                meta["title"] = trafilatura.bare_extraction(html).get('title', '') if hasattr(trafilatura, 'bare_extraction') else ''
+                # Try to parse date from common meta tags and JSON-LD
+                try:
+                    m = re.search(r"<meta[^>]+property=\"article:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                    if m:
+                        meta["date"] = m.group(1)
+                    if not meta.get('date'):
+                        m2 = re.search(r"<time[^>]+datetime=\"([^\"]+)\"", html, flags=re.I)
+                        if m2:
+                            meta["date"] = m2.group(1)
+                    # OpenGraph published/updated time
+                    if not meta.get('date'):
+                        m3 = re.search(r"<meta[^>]+property=\"og:published_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                        if m3:
+                            meta["date"] = m3.group(1)
+                    if not meta.get('date'):
+                        m4 = re.search(r"<meta[^>]+property=\"og:updated_time\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                        if m4:
+                            meta["date"] = m4.group(1)
+                    # itemprop and common name fallbacks
+                    if not meta.get('date'):
+                        m5 = re.search(r"<meta[^>]+itemprop=\"datePublished\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                        if m5:
+                            meta["date"] = m5.group(1)
+                    if not meta.get('date'):
+                        m6 = re.search(r"<meta[^>]+name=\"(date|pubdate|publishdate)\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+                        if m6:
+                            meta["date"] = m6.group(2)
+                    if not meta.get('date'):
+                        for js in re.findall(r"<script[^>]+type=\"application/ld\+json\"[^>]*>(.*?)</script>", html, flags=re.I|re.S):
+                            try:
+                                data = json.loads(js.strip())
+                            except Exception:
+                                continue
+                            def _find_date(obj):
+                                if isinstance(obj, dict):
+                                    if (obj.get('@type') in {'NewsArticle','Article'}) and obj.get('datePublished'):
+                                        return obj.get('datePublished')
+                                    for v in obj.values():
+                                        r = _find_date(v)
+                                        if r:
+                                            return r
+                                if isinstance(obj, list):
+                                    for it in obj:
+                                        r = _find_date(it)
+                                        if r:
+                                            return r
+                                return None
+                            d = _find_date(data)
+                            if d:
+                                meta['date'] = d
+                                break
+                except Exception:
+                    pass
+        except Exception:
+            pass
     # Fallback readability-lxml
-    if not markdown:
+    if not markdown and getattr(cfg, 'extract_readability_enabled', True):
         try:
             from readability import Document  # type: ignore
             doc = Document(html)
@@ -159,25 +161,26 @@ def _html_to_markdown(html: str) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     return markdown or "", meta, used
 
 
-def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
+def _pdf_to_text(bin_data: bytes, cfg: WebConfig) -> tuple[str, Dict[str, Any], Dict[str, bool]]:
     used = {"pdfminer": False, "pymupdf": False, "ocrmypdf": False}
     text = ""
     meta: Dict[str, Any] = {}
     pages: list[str] = []
     # Prefer PyMuPDF for speed/robustness
-    try:
-        import fitz  # PyMuPDF type: ignore
-        doc = fitz.open(stream=bin_data, filetype="pdf")
-        parts: list[str] = []
-        for page in doc:
-            parts.append(page.get_text())
-        text = "\n\n".join(parts)
-        pages = parts[:]
-        used["pymupdf"] = True
-    except Exception:
-        pass
+    if getattr(cfg, 'extract_pymupdf_enabled', True):
+        try:
+            import fitz  # PyMuPDF type: ignore
+            doc = fitz.open(stream=bin_data, filetype="pdf")
+            parts: list[str] = []
+            for page in doc:
+                parts.append(page.get_text())
+            text = "\n\n".join(parts)
+            pages = parts[:]
+            used["pymupdf"] = True
+        except Exception:
+            pass
     # Fallback to pdfminer if PyMuPDF failed or yielded empty
-    if not text:
+    if not text and getattr(cfg, 'extract_pdfminer_enabled', True):
         try:
             from pdfminer.high_level import extract_text  # type: ignore
             with io.BytesIO(bin_data) as fp:
@@ -186,7 +189,7 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
         except Exception:
             pass
     # OCR fallback if text density is very low
-    if len((text or '').strip()) < 40:
+    if len((text or '').strip()) < 40 and getattr(cfg, 'extract_ocr_enabled', False):
         # Attempt OCR if ocrmypdf exists in PATH
         try:
             import shutil, subprocess, tempfile
@@ -226,6 +229,16 @@ def _pdf_to_text(bin_data: bytes) -> tuple[str, Dict[str, Any], Dict[str, bool]]
 
 def extract_content(fetch_meta: Dict[str, Any], *, cfg: Optional[WebConfig] = None) -> ExtractResult:
     cfg = cfg or WebConfig()
+    # Silence noisy extractors when configured
+    try:
+        if getattr(cfg, 'extract_silence_warnings', True):
+            for name in [
+                'trafilatura', 'trafilatura.core', 'trafilatura.xml', 'trafilatura.utils',
+                'pdfminer', 'pdfminer.pdftypes', 'pdfminer.high_level'
+            ]:
+                logging.getLogger(name).setLevel(logging.ERROR)
+    except Exception:
+        pass
     ctype = (fetch_meta.get('content_type') or '').lower()
     body_path = fetch_meta.get('body_path')
     raw = b''
@@ -238,19 +251,19 @@ def extract_content(fetch_meta: Dict[str, Any], *, cfg: Optional[WebConfig] = No
     used: Dict[str, bool] = {}
 
     if 'pdf' in ctype or (body_path and body_path.lower().endswith('.pdf')):
-        text, meta_pdf, used_pdf = _pdf_to_text(raw)
+        text, meta_pdf, used_pdf = _pdf_to_text(raw, cfg)
         markdown = text
         meta.update(meta_pdf)
         used.update(used_pdf)
         kind = 'pdf'
     elif 'html' in ctype or ('<html' in raw[:200].decode(errors='ignore').lower() if raw else False):
-        md, meta_html, used_html = _html_to_markdown(raw.decode(errors='ignore'))
+        md, meta_html, used_html = _html_to_markdown(raw.decode(errors='ignore'), cfg)
         markdown = md
         meta.update(meta_html)
         used.update(used_html)
         kind = 'html'
         # If empty, try Jina Reader fallback
-        if not markdown:
+        if not markdown and getattr(cfg, 'extract_jina_enabled', True):
             try:
                 reader_url = f"https://r.jina.ai/{fetch_meta.get('final_url') or fetch_meta.get('url')}"
                 with _httpx_client(cfg) as client:
