@@ -141,6 +141,19 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         env_debug = os.getenv("WEB_DEBUG_METRICS")
         if env_debug is not None:
             cfg.debug_metrics = str(env_debug).strip().lower() not in {"0","false","no","off"}
+        # Determinism: allow per-call seed/run_id to be overridden from environment
+        env_seed = os.getenv("WEB_RUN_SEED")
+        if env_seed not in (None, ""):
+            try:
+                cfg.seed = int(env_seed)
+            except Exception:
+                pass
+        env_run_id = os.getenv("WEB_RUN_ID")
+        if env_run_id not in (None, ""):
+            try:
+                cfg.run_id = str(env_run_id)
+            except Exception:
+                pass
         # Allow tests/callers to enable the recency soft-accept fallback via env
         env_soft_accept = os.getenv("WEB_RECENCY_SOFT_ACCEPT_WHEN_EMPTY")
         if env_soft_accept is not None:
