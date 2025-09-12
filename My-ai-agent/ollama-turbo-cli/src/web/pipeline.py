@@ -95,7 +95,7 @@ from .corroborate import compute_corroboration, claim_key
 from .counter_claim import evaluate_counter_claim
 from .reputation import compute_prior
 from .ledger import log_veracity
-from .normalize import canonicalize, dedupe_citations
+from .normalize import canonicalize, dedupe_citations, content_fingerprint
 from .loc import format_loc
 from datetime import datetime, timedelta
 
@@ -252,6 +252,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             cutover_prep = (str(env_cut).strip().lower() not in {"0","false","no","off"}) if env_cut is not None else False
         except Exception:
             cutover_prep = False
+        # PR7: rescue strategy reporting (behavior unchanged; used in summary only)
+        try:
+            rescue_strategy = (os.getenv("WEB_RESCUE_STRATEGY", "adaptive") or "adaptive").strip().lower()
+        except Exception:
+            rescue_strategy = "adaptive"
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -958,6 +963,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             # Initialize date variables for both recency and evergreen paths
         pub_ts: Optional[float] = None
         date_conf: str = 'low'
+        date_source: str = 'none'
+        date_conflict: Dict[str, Any] = {}
+        date_tz: str = 'unknown'
 
         # Recency/date gating and language sanity for recent events (hardened dateline)
         # PDFs are typically evergreen/primary sources; bypass recency gating
@@ -965,6 +973,19 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             # Determine date and confidence
             pub_ts = _parse_pub_date(ex.date)
             if pub_ts:
+                date_source = 'meta'
+                # crude tz detection (Z or [+/-]HH:MM)
+                try:
+                    ds = str(ex.date or '')
+                    if ds.endswith('Z'):
+                        date_tz = 'UTC'
+                    else:
+                        import re as _re
+                        m_tz = _re.search(r"([+-]\d{2}:\d{2})$", ds)
+                        if m_tz:
+                            date_tz = m_tz.group(1)
+                except Exception:
+                    pass
                 date_conf = 'high'
                 nonlocal dateline_from_structured
                 with obs_lock:
@@ -975,7 +996,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     try:
                         p = urlparse(u)
                         path = (p.path or '')
-                        m = re.search(r"/20(\d{2})/(\d{2})/(\d{2})/", path)
+                        m = re.search(r"/20(\d{2})/(\d{2})/(\d{2})", path)
                         if m:
                             y, mo, da = int('20'+m.group(1)), int(m.group(2)), int(m.group(3))
                             return datetime(y, mo, da).timestamp()
@@ -993,10 +1014,19 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 path_ts = _date_from_path(f.final_url)
                 if path_ts:
                     pub_ts = path_ts
+                    date_source = 'url'
                     date_conf = 'medium'
                     nonlocal dateline_from_path
                     with obs_lock:
                         dateline_from_path += 1
+                # If both meta and path dates exist and disagree, record conflict
+                try:
+                    if ex.date:
+                        meta_ts = _parse_pub_date(ex.date)
+                        if meta_ts and path_ts and abs(meta_ts - path_ts) > (48 * 3600):
+                            date_conflict = {'sources': {'meta': ex.date, 'url': f.final_url}, 'resolution': 'meta_preferred'}
+                except Exception:
+                    pass
             # Decide acceptance for recency
             if not pub_ts:
                 # Track that we processed an undated candidate in recency mode
@@ -1101,7 +1131,16 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
         chunks = chunk_text(ex.markdown)
-        ranked = rerank_chunks(query, chunks, cfg=cfg, top_k=3)
+        # PR7: deterministic tie-break for rerank results using cfg.seed
+        try:
+            def _tie_key(item: Dict[str, Any]) -> tuple:
+                sc = float(item.get('score', 0.0) or 0.0)
+                ident = str(item.get('id') or item.get('start_line') or "")
+                h = hashlib.sha256(f"{getattr(cfg,'seed',0)}|{ident}".encode()).hexdigest()
+                return (-sc, h)
+            ranked = sorted(list(rerank_chunks(query, chunks, cfg=cfg, top_k=3) or []), key=_tie_key)
+        except Exception:
+            ranked = rerank_chunks(query, chunks, cfg=cfg, top_k=3)
         # Archive on first success (with optional Memento pre-check)
         archive = {'archive_url': '', 'timestamp': ''}
         if cfg.archive_enabled:
@@ -1156,6 +1195,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'archive_url': archive.get('archive_url', ''),
             'title': ex.title or sr.title,
             'date': ex.date or sr.published,
+            'date_source': date_source,
+            'date_conflict': date_conflict,
+            'date_tz': date_tz,
             'risk': ex.risk,
             'risk_reasons': ex.risk_reasons,
             'browser_used': f.browser_used,
@@ -1167,6 +1209,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             'undated': bool(not ex.date),
             'tier': (int(tier_val) if (tier_val is not None) else None),
             'category': cat_name,
+            'content_fingerprint': content_fingerprint(ex.markdown or ''),
             'lines': [],
         }
         # Evidence-first (PR3): attach minimal analysis behind flags (no behavior change)
@@ -1324,12 +1367,18 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             return int(tv) if tv is not None else 3
         except Exception:
             return 3
+    def _seeded_url_hash(u: str) -> str:
+        try:
+            sid = str(getattr(cfg, 'seed', 0))
+            return hashlib.sha256((sid + '|' + (u or '')).encode()).hexdigest()
+        except Exception:
+            return hashlib.sha256((u or '').encode()).hexdigest()
     citations.sort(key=lambda c: (
         _tier_rank(c),
         -1 if c.get('domain_trust') else 0,
         -_conf_val(str(c.get('date_confidence','low'))),
         c.get('risk',''),
-        hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
+        _seeded_url_hash(c.get('canonical_url','') or '')
     ))
 
     # Policy: Tier 2 requires corroboration from Tier 0/1; mark as provisional if missing
@@ -1420,7 +1469,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             sites = sites[:max_sites]
             extra_citations: List[Dict[str, Any]] = []
             good_found = False
-            # Execute site-restricted searches sequentially (bounded)
+            # Execute site-restricted searches sequentially (bounded); PR7: deterministic site order by seed
+            try:
+                sites = sorted(sites, key=lambda s: _seeded_url_hash(s))
+            except Exception:
+                pass
             for site in sites:
                 try:
                     sr_list = search(q_sanitized, cfg=cfg, site=site, freshness_days=freshness_final)
@@ -1451,7 +1504,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     -1 if c.get('domain_trust') else 0,
                     -_conf_val(str(c.get('date_confidence','low'))),
                     c.get('risk',''),
-                    hashlib.sha256((c.get('canonical_url','') or '').encode()).hexdigest()
+                    _seeded_url_hash(c.get('canonical_url','') or '')
                 ))
                 try:
                     has_tier01 = any((c.get('tier') in (0, 1)) for c in citations)
@@ -1920,13 +1973,23 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
         try:
-            # One-line summary for quick telemetry
+            # One-line summary for quick telemetry (PR7 augmentation)
             kept = len(citations[:top_k])
+            srcs = ",".join(sorted({(urlparse(c.get('canonical_url') or '').hostname or '').split(':')[0] for c in citations[:top_k] if c.get('canonical_url')}))
+            # date resolution note: count sources
+            ds_counts = {'meta':0,'url':0,'none':0}
+            for c in citations[:top_k]:
+                ds = str(c.get('date_source') or 'none')
+                if ds not in ds_counts:
+                    ds_counts[ds] = 0
+                ds_counts[ds] += 1
+            ds_note = f"date=meta:{ds_counts.get('meta',0)},url:{ds_counts.get('url',0)},none:{ds_counts.get('none',0)}"
+            rid = getattr(cfg, 'run_id', '')
+            seed = getattr(cfg, 'seed', 0)
             line = (
-                f"mode=researcher • fresh={freshness_final or cfg.default_freshness_days}d • hits={len(results)} "
-                f"• kept={kept} • extracted={kept} • sources=[" + ",".join(
-                    sorted({(urlparse(c.get('canonical_url') or '').hostname or '').split(':')[0] for c in citations[:top_k] if c.get('canonical_url')})
-                ) + "]"
+                f"mode=researcher • run={str(rid)[:8]} • seed={seed} • rescue={rescue_strategy} "
+                f"• fresh={freshness_final or cfg.default_freshness_days}d • hits={len(results)} "
+                f"• kept={kept} • extracted={kept} • {ds_note} • sources=[{srcs}]"
             )
             answer['debug']['summary_line'] = line
         except Exception:

@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 import os
 import logging
 import warnings
+import uuid
+import random
 
 _LOG_SILENCERS = (os.getenv("LOG_SILENCERS", "1").strip().lower() not in {"0","false","no","off"})
 _BACKOFF_SILENCE = (os.getenv("BACKOFF_SILENCE", "1").strip().lower() not in {"0","false","no","off"})
@@ -433,6 +435,9 @@ class WebConfig:
     # Evidence-first rollout flags (no behavior change in PR1)
     evidence_first: bool = field(default_factory=lambda: _env_bool("EVIDENCE_FIRST", False))
     evidence_first_kill_switch: bool = field(default_factory=lambda: _env_bool("EVIDENCE_FIRST_KILL_SWITCH", True))
+    # Determinism (PR7)
+    run_id: str = field(default_factory=lambda: (os.getenv("WEB_RUN_ID") or uuid.uuid4().hex))
+    seed: int = field(default_factory=lambda: (int(os.getenv("WEB_RUN_SEED")) if (os.getenv("WEB_RUN_SEED") not in (None, "")) else random.SystemRandom().randint(1, 2**31 - 1)))
 
 @dataclass
 class ClientRuntimeConfig:

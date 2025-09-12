@@ -1,4 +1,48 @@
-Ollama Turbo CLI
+## Architecture Overview
+
+This project ships a policy-aware web research pipeline with optional Evidence-First (EF) analysis. The entrypoint is `src/web/pipeline.py::run_research()`, which orchestrates search → fetch → extract → rerank → archive → normalization → sorting, with optional EF add-ons (claims/validators/evidence, counter-claim, reputation, corroboration) and telemetry surfaces.
+
+For a full system diagram and deep-dive, see `docs/architecture.md`.
+
+### Diagram (Mermaid)
+
+The Mermaid source is in `docs/architecture.md`. Most renderers will display it inline; GitHub requires a plugin/preview or conversion.
+
+### EF (Evidence-First) stack (flag-gated)
+
+- Claim extraction, domain validators, evidence scoring
+- Optional counter-claim signals, reputation prior, corroboration mapping
+- All added as `citation['ef']` with a `confidence_breakdown` (evidence/validators/corroboration/prior)
+- No ranking or acceptance changes unless future flags enable it
+
+### Key flags
+
+- EF: `EVIDENCE_FIRST`, `EVIDENCE_FIRST_KILL_SWITCH`
+- Corroboration: `WEB_CORROBORATE_ENABLE`
+- Counter-claim: `WEB_COUNTER_CLAIM_ENABLE`
+- Reputation: `WEB_REPUTATION_ENABLE`
+- Ledger: `WEB_VERACITY_LEDGER_ENABLE`
+- Wire/Syndication preview: `WEB_WIRE_DEDUP_ENABLE`
+- Rescue sweep preview: `WEB_RESCUE_SWEEP`
+- Tier sweep controls: `WEB_TIER_SWEEP`, `WEB_TIER_SWEEP_MAX_SITES`, `WEB_TIER_SWEEP_STRICT`
+- Debug/Cutover: `WEB_DEBUG_METRICS`, `WEB_CUTOVER_PREP`
+
+### Debug schema (v1)
+
+`answer.debug.schema_version = 1` with sections: `search`, `fetch`, `tier`, `wire`, `rescue`, `extract`, `discard`, `source_type`, `metrics`, `deprecation` (when `WEB_CUTOVER_PREP=1`), and `summary_line`.
+
+## Current State
+
+- PR1–PR3 landed earlier (flags, EF scaffolding with validators/evidence, provisional rendering hooks).
+- PR4 completed: rescue preview, wire/syndication dedup preview, corroboration (debug only), all behind flags.
+- PR5 completed: counter-claim, reputation prior, veracity ledger scaffolds (debug-only), behind flags.
+- PR6 completed: unified debug schema v1, cutover-prep deprecation counters, and metrics scaffolds.
+
+All EF-era features are flag-gated and default to no behavior change (ranking/acceptance unchanged). A kill switch restores legacy behavior instantly.
+
+For migration guidance and validation, see `CUTOVER.md`.
+
+# Ollama Turbo CLI
 
 A production-ready CLI for talking to gpt-oss:120b and DeepSeek V3.1:671B via the Ollama Turbo cloud. It supports real tool calling, streaming, and a tidy developer experience.
 

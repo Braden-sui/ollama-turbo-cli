@@ -1,0 +1,45 @@
+flowchart TD
+  A[run_research(query, cfg)\nsrc/web/pipeline.py] --> B[Search\nsrc/web/search.py]
+  B -->|SearchResult[]| C[_build_citation(sr)\npolicy+fetch+extract+rerank]
+
+  subgraph Citation Build
+    C --> D[Policy Checks\nallowlist/blocklist/exclude\nsource_type: liveblog/map]
+    D -->|ok| E[Fetch\nfetch_url\nsrc/web/fetch.py → sandbox]
+    D -->|drop| Z1[items += reason\n(debug.fetch + deprecation)]
+    E --> F[Extract\nextract_content\nsrc/web/extract.py]
+    F --> G[Recency Discipline\nparse dates; accept/soft-accept/reject\n(debug.discard)]
+    G --> H[Dedupe\nurl + body-hash per-host\n(normalize.py)]
+    H --> I[Rerank\nchunk_text + rerank_chunks]
+    I --> J[Archive (optional)\nget_memento/save_page_now]
+    J --> K[Attach Citation Fields\ntrust, tier, excerpts]
+    K --> L{EF enabled?\nEVIDENCE_FIRST=1\nkill_switch=0}
+    L -- yes --> M[EF Analysis\nclaims + validators + evidence\n+ counter-claim + reputation]
+    L -- no --> N[Skip EF]
+  end
+
+  C --> O[Canonicalize + Dedupe\nsrc/web/normalize.py]
+  O --> P[Sort + Provisional]
+
+  P --> Q{Tier Sweep?\nno trusted}
+  Q -- yes --> R[Site-restricted Searches\n(seeds by category/tier/allowlist)] --> S[Merge, Dedupe, Re-sort]
+  Q -- no --> S
+
+  S --> T{Rescue Preview?\nWEB_RESCUE_SWEEP}
+  T -- yes --> U[adaptive_rescue\ndebug.rescue]
+  T -- no --> V[skip]
+
+  S --> W{Wire Dedup Preview?\nWEB_WIRE_DEDUP_ENABLE}
+  W -- yes --> X[collapse_citations\ndebug.wire]
+  W -- no --> Y[skip]
+
+  S --> AA[Corroboration (debug)\nWEB_CORROBORATE_ENABLE]
+  AA --> AB[compute_corroboration\nattach ef.reasons.corroborators\nset small corroboration slice]
+
+  AB --> AC[Assemble Answer\npolicy + debug schema v1]
+  V --> AC
+  Y --> AC
+  U --> AC
+
+  AC --> AD{Ledger?\nWEB_VERACITY_LEDGER_ENABLE}
+  AD -- yes --> AE[Append JSONL\n<cache_root>/veracity_ledger.jsonl]
+  AD -- no --> AF[done]
