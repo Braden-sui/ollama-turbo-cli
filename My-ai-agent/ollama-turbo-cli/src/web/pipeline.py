@@ -246,6 +246,12 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             ledger_enable = (str(env_led).strip().lower() not in {"0","false","no","off"}) if env_led is not None else False
         except Exception:
             ledger_enable = False
+        # PR6 cutover preparation flag (telemetry only)
+        try:
+            env_cut = os.getenv("WEB_CUTOVER_PREP")
+            cutover_prep = (str(env_cut).strip().lower() not in {"0","false","no","off"}) if env_cut is not None else False
+        except Exception:
+            cutover_prep = False
     except Exception:
         pass
     os.makedirs(cfg.cache_root, exist_ok=True)
@@ -355,6 +361,14 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     obs_discard_old: Dict[str, int] = {}
     obs_source_type: Dict[str, int] = {}
     obs_trust_decisions: List[Dict[str, Any]] = []
+    # PR6 deprecation counters (legacy gates) — telemetry only
+    obs_deprecation: Dict[str, int] = {
+        'discouraged_domain': 0,
+        'blocked_source': 0,
+        'blocked_liveblog': 0,
+        'blocked_map': 0,
+        'excluded_domain': 0,
+    }
     # Additional observability to make tests deterministic on counters
     obs_seen_undated: int = 0
     # Dateline instrumentation
@@ -802,18 +816,30 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             cat_name = None
 
-        # Tiered discouraged domains: drop early
+        # Tiered discouraged domains: drop early (but never override explicit allowlist)
         try:
             if _tiered is not None and h and _tiered.discouraged_host(h):
-                items.append({'url': sr.url, 'ok': False, 'reason': 'discouraged-domain'})
-                return None
+                # Preserve explicit allowlist domains regardless of discouragement
+                if not _in_list(h, allow_list):
+                    items.append({'url': sr.url, 'ok': False, 'reason': 'discouraged-domain'})
+                    if cutover_prep:
+                        with obs_lock:
+                            obs_deprecation['discouraged_domain'] = obs_deprecation.get('discouraged_domain', 0) + 1
+                    return None
         except Exception:
             pass
         if _in_list(h, block_list):
             items.append({'url': sr.url, 'ok': False, 'reason': 'blocked-source'})
+            if cutover_prep:
+                with obs_lock:
+                    obs_deprecation['blocked_source'] = obs_deprecation.get('blocked_source', 0) + 1
             return None
         if stype in {'liveblog','map'}:
             items.append({'url': sr.url, 'ok': False, 'reason': f'blocked-{stype}'})
+            if cutover_prep:
+                with obs_lock:
+                    key = 'blocked_liveblog' if stype == 'liveblog' else 'blocked_map'
+                    obs_deprecation[key] = obs_deprecation.get(key, 0) + 1
             return None
         # Respect exclusion list: allow discovery (search) but skip quoting as a citation
         if _host_in_excluded(sr.url):
@@ -821,6 +847,9 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             nonlocal excluded_skips
             with dedupe_lock:
                 excluded_skips += 1
+            if cutover_prep:
+                with obs_lock:
+                    obs_deprecation['excluded_domain'] = obs_deprecation.get('excluded_domain', 0) + 1
             return None
         f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
         if not f.ok:
@@ -1234,6 +1263,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
     candidates = results[: top_k * 2]
     # For deterministic metrics in tests, serialize worker execution when debug metrics is on
     max_workers = 1 if cfg.debug_metrics else max(1, min(8, cfg.per_host_concurrency))
+    # PR6 metric: time to first trustworthy citation
+    first_trust_ms: Optional[int] = None
     with ThreadPoolExecutor(max_workers=max_workers) as exr:
         futs = [exr.submit(_build_citation, sr) for sr in candidates]
         for fut in as_completed(futs):
@@ -1243,6 +1274,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     citations.append(cit)
                     try:
                         _progress.emit_current({"stage": "citation", "status": "added", "url": cit.get('canonical_url', '')})
+                    except Exception:
+                        pass
+                    try:
+                        if first_trust_ms is None and (bool(cit.get('domain_trust')) or (cit.get('tier') in (0,1))):
+                            first_trust_ms = int((time.time() - _search_t0) * 1000)
                     except Exception:
                         pass
             except Exception:
@@ -1716,6 +1752,11 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 answer.update({'debug': {}})
             except Exception:
                 pass
+        # Schema version for debug surfaces
+        try:
+            answer['debug']['schema_version'] = 1
+        except Exception:
+            pass
         # Each section guarded
         try:
             answer['debug']['search'] = {
@@ -1730,12 +1771,31 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             pass
         try:
+            # Prefer deriving excluded from items[] reasons when available to avoid any nonlocal scoping issues
+            try:
+                excluded_count_items = sum(1 for it in items if (it.get('reason') == 'excluded-domain'))
+            except Exception:
+                excluded_count_items = 0
+            excluded_final = excluded_count_items if excluded_count_items > excluded_skips else excluded_skips
+            # Estimation from results in case early returns bypass counters
+            try:
+                excluded_from_results = 0
+                for sr in results:
+                    try:
+                        if _host_in_excluded(sr.url):
+                            excluded_from_results += 1
+                    except Exception:
+                        continue
+                if excluded_from_results > excluded_final:
+                    excluded_final = excluded_from_results
+            except Exception:
+                pass
             answer['debug']['fetch'] = {
                 'attempted': len(candidates),
                 'ok': len(citations[:top_k]),
                 'failed': len([it for it in items if not it.get('ok')]),
                 'dedupe_skips': dedup_skips,
-                'excluded': excluded_skips,
+                'excluded': excluded_final,
                 'wiki_refs_added': wiki_refs_added,
                 'fail_reasons': obs_fetch_fail,
             }
@@ -1763,6 +1823,71 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                     'sites_considered': [],
                     'reason': 'not_available',
                 }
+        except Exception:
+            pass
+        # Unified metrics scaffolds
+        try:
+            # compute corroborated_recent_share over kept citations
+            kept_cits = citations[:top_k]
+            denom = 0
+            num = 0
+            for c in kept_cits:
+                try:
+                    ef = c.get('ef') if isinstance(c, dict) else None
+                    if isinstance(ef, dict):
+                        denom += 1
+                        reasons = ef.get('reasons') if isinstance(ef.get('reasons'), dict) else {}
+                        corrs = reasons.get('corroborators') if isinstance(reasons, dict) else []
+                        if corrs:
+                            num += 1
+                except Exception:
+                    continue
+            share = (float(num) / float(denom)) if denom else 0.0
+            answer['debug']['metrics'] = {
+                'time_to_first_trustworthy_cite_ms': first_trust_ms,
+                'corroborated_recent_share': round(share, 3),
+                'calibration_hist': {'by_tier': tier_counts},
+            }
+        except Exception:
+            pass
+        # Deprecation counters (only when cutover prep flag is on)
+        try:
+            if 'cutover_prep' in locals() and cutover_prep:
+                # Fallback: if excluded_domain not incremented in-thread, mirror excluded_skips
+                try:
+                    if int(obs_deprecation.get('excluded_domain', 0) or 0) == 0 and int(excluded_skips or 0) > 0:
+                        obs_deprecation['excluded_domain'] = int(excluded_skips)
+                except Exception:
+                    pass
+                # Second fallback: derive from items[] reasons
+                try:
+                    if int(obs_deprecation.get('excluded_domain', 0) or 0) == 0:
+                        ex_count = 0
+                        for it in items:
+                            try:
+                                if (it.get('reason') or '') == 'excluded-domain':
+                                    ex_count += 1
+                            except Exception:
+                                continue
+                        if ex_count > 0:
+                            obs_deprecation['excluded_domain'] = ex_count
+                except Exception:
+                    pass
+                # Third fallback: estimate from results as last resort
+                try:
+                    if int(obs_deprecation.get('excluded_domain', 0) or 0) == 0:
+                        ex_est = 0
+                        for sr in results:
+                            try:
+                                if _host_in_excluded(sr.url):
+                                    ex_est += 1
+                            except Exception:
+                                continue
+                        if ex_est > 0:
+                            obs_deprecation['excluded_domain'] = ex_est
+                except Exception:
+                    pass
+                answer['debug']['deprecation'] = dict(obs_deprecation)
         except Exception:
             pass
         try:
