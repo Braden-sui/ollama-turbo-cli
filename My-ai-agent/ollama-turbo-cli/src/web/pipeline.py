@@ -95,7 +95,8 @@ from .rescue import adaptive_rescue
 from .corroborate import compute_corroboration, claim_key
 from .counter_claim import evaluate_counter_claim
 from .reputation import compute_prior
-from .ledger import log_veracity
+from src.debug.ledger import log_veracity
+from . import feature_gates as gates
 from .normalize import canonicalize, dedupe_citations, content_fingerprint
 from .loc import format_loc
 from datetime import datetime, timedelta
@@ -280,11 +281,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             wire_dedup_enable = False
         try:
-            env_rescue = os.getenv("WEB_RESCUE_SWEEP")
-            if env_rescue is None:
-                # PR15: backward compatibility with legacy name
-                env_rescue = os.getenv("WEB_RESCUE_PREVIEW")
-            rescue_sweep = (str(env_rescue).strip().lower() not in {"0","false","no","off"}) if env_rescue is not None else False
+            rescue_sweep = bool(gates.exp_rescue(cfg))
         except Exception:
             rescue_sweep = False
         try:
@@ -304,8 +301,7 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
         except Exception:
             reputation_enable = False
         try:
-            env_led = os.getenv("WEB_VERACITY_LEDGER_ENABLE")
-            ledger_enable = (str(env_led).strip().lower() not in {"0","false","no","off"}) if env_led is not None else False
+            ledger_enable = bool(gates.exp_ledger(cfg))
         except Exception:
             ledger_enable = False
         # PR6 cutover preparation flag (telemetry only)

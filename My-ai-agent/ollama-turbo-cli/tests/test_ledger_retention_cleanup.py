@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+import pytest
 
-from src.web.ledger import log_veracity
+from src.debug.ledger import log_veracity
 
 
+@pytest.mark.debug
 def test_ledger_retention_removes_old_files(tmp_path, monkeypatch):
     cache_root = tmp_path / ".webcache"
     cache_root.mkdir(parents=True, exist_ok=True)
