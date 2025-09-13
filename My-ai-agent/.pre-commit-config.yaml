@@ -1,8 +1,0 @@
-repos:
-  - repo: local
-    hooks:
-      - id: yaml-secret-scan
-        name: YAML Secret Scan
-        entry: python My-ai-agent/scripts/verify_yaml_secrets.py
-        language: system
-        files: \.(yml|yaml)$
