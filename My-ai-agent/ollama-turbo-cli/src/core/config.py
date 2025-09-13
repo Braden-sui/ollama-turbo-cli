@@ -354,7 +354,7 @@ class WebConfig:
     ])
     # Policies
     respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
-    allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", False))
+    allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
     # Query policy hardening
     year_guard_enabled: bool = field(default_factory=lambda: _env_bool("WEB_YEAR_GUARD_ENABLED", True))
     default_freshness_days: int = field(default_factory=lambda: _env_int("WEB_DEFAULT_FRESHNESS_DAYS", 90, min_value=1))
@@ -385,7 +385,7 @@ class WebConfig:
     tier_sweep_strict: bool = field(default_factory=lambda: _env_bool("WEB_TIER_SWEEP_STRICT", False))
     # PR9 adaptive tier sweep
     tier_sweep_adaptive_enable: bool = field(default_factory=lambda: _env_bool("WEB_TIER_SWEEP_ADAPTIVE_ENABLE", False))
-    tier_sweep_initial_sites: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_INITIAL_SITES", 8, min_value=1))
+    tier_sweep_initial_sites: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_INITIAL_SITES", 12, min_value=1))
     tier_sweep_max_sites_cap: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_MAX_SITES_CAP", 24, min_value=1))
     tier_sweep_quota_fast_count: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_QUOTA_FAST_COUNT", 2, min_value=1))
     tier_sweep_quota_fast_hours: int = field(default_factory=lambda: _env_int("WEB_TIER_SWEEP_QUOTA_FAST_HOURS", 2, min_value=1))
