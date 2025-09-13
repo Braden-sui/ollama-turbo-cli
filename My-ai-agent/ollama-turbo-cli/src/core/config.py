@@ -329,6 +329,8 @@ class WebConfig:
     client_pool_size: int = field(default_factory=lambda: _env_int("WEB_CLIENT_POOL_SIZE", 32, min_value=1))
     # Caching and robots
     cache_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_CACHE_TTL_SECONDS", 86400, min_value=0))
+    # Short TTL for raw fetch artifacts (HTML/JS). Processed markdown should be persisted longer by callers.
+    raw_artifacts_ttl_hours: int = field(default_factory=lambda: _env_int("WEB_RAW_ARTIFACTS_TTL_HOURS", 24, min_value=1))
     robots_ttl_seconds: int = field(default_factory=lambda: _env_int("WEB_ROBOTS_TTL_SECONDS", 3600, min_value=0))
     max_crawl_delay_s: int = field(default_factory=lambda: _env_int("WEB_MAX_CRAWL_DELAY_S", 20, min_value=0))
     # Provider keys
@@ -352,7 +354,7 @@ class WebConfig:
     ])
     # Policies
     respect_robots: bool = field(default_factory=lambda: _env_bool("WEB_RESPECT_ROBOTS", True))
-    allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", True))
+    allow_browser: bool = field(default_factory=lambda: _env_bool("WEB_ALLOW_BROWSER", False))
     # Query policy hardening
     year_guard_enabled: bool = field(default_factory=lambda: _env_bool("WEB_YEAR_GUARD_ENABLED", True))
     default_freshness_days: int = field(default_factory=lambda: _env_int("WEB_DEFAULT_FRESHNESS_DAYS", 90, min_value=1))

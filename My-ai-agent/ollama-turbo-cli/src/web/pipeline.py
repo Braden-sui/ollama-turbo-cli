@@ -201,6 +201,49 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 cfg.tier_sweep_strict = False
             except Exception:
                 pass
+        # PR9 adaptive sweep: ensure env changes are respected per call even when cfg was deep-copied earlier
+        try:
+            env_adapt = os.getenv("WEB_TIER_SWEEP_ADAPTIVE_ENABLE")
+            if env_adapt is not None:
+                cfg.tier_sweep_adaptive_enable = str(env_adapt).strip().lower() not in {"0","false","no","off"}
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_INITIAL_SITES")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_initial_sites = max(1, int(v))
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_MAX_SITES_CAP")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_max_sites_cap = max(1, int(v))
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_QUOTA_FAST_COUNT")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_quota_fast_count = max(1, int(v))
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_QUOTA_FAST_HOURS")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_quota_fast_hours = max(1, int(v))
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_QUOTA_SLOW_COUNT")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_quota_slow_count = max(1, int(v))
+        except Exception:
+            pass
+        try:
+            v = os.getenv("WEB_TIER_SWEEP_QUOTA_SLOW_HOURS")
+            if v is not None and str(v).strip() != "":
+                cfg.tier_sweep_quota_slow_hours = max(1, int(v))
+        except Exception:
+            pass
         # Evidence-first flags: env overrides
         try:
             env_ef = os.getenv("EVIDENCE_FIRST")
@@ -878,7 +921,8 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
                 with obs_lock:
                     obs_deprecation['excluded_domain'] = obs_deprecation.get('excluded_domain', 0) + 1
             return None
-        f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
+        # First fetch: never escalate to browser. Browser escalation is decided after extraction
+        f = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=False)
         if not f.ok:
             items.append({'url': sr.url, 'ok': False, 'reason': f.reason or f"HTTP {f.status}"})
             try:
@@ -906,21 +950,63 @@ def run_research(query: str, *, cfg: Optional[WebConfig] = None, site_include: O
             pass
         ex = extract_content(meta, cfg=cfg)
         if not ex.ok:
-            items.append({'url': sr.url, 'ok': False, 'reason': 'extract-failed'})
-            nonlocal obs_extract_fail
-            with obs_lock:
-                obs_extract_fail += 1
+            # Only escalate to browser if enabled and host is trusted (allowlist or tier 0/1)
+            try:
+                h_escalate = (urlparse(f.final_url).hostname or '').lower()
+            except Exception:
+                h_escalate = ''
+            try:
+                cfg_allow = list(allow_list or [])
+            except Exception:
+                cfg_allow = []
+            try:
+                cfg_allow2 = list(getattr(cfg, 'allowlist_domains', []) or [])
+            except Exception:
+                cfg_allow2 = []
+            wildcard_escalate = ('*' in cfg_allow) or ('*' in cfg_allow2)
+            is_allowlisted_escalate = (not wildcard_escalate) and (_in_list(h_escalate, cfg_allow) or _in_list(h_escalate, cfg_allow2))
+            trusted_by_tier_escalate = False
+            try:
+                if _tiered is not None and h_escalate:
+                    tv = _tiered.tier_for_host(h_escalate)
+                    trusted_by_tier_escalate = (tv is not None) and int(tv) in {0, 1}
+            except Exception:
+                trusted_by_tier_escalate = False
+            if bool(getattr(cfg, 'allow_browser', False)) and (is_allowlisted_escalate or trusted_by_tier_escalate):
+                # Re-fetch allowing browser escalation
+                f2 = fetch_url(sr.url, cfg=cfg, force_refresh=force_refresh, use_browser_if_needed=True)
+                if f2.ok:
+                    meta2 = {
+                        'url': f2.url,
+                        'final_url': f2.final_url,
+                        'status': f2.status,
+                        'content_type': f2.content_type,
+                        'body_path': f2.body_path,
+                        'headers': f2.headers,
+                    }
+                    ex2 = extract_content(meta2, cfg=cfg)
+                    if ex2.ok:
+                        ex = ex2
+                        f = f2
+                    else:
+                        # fall through to failure handling
+                        pass
+            if not ex.ok:
+                items.append({'url': sr.url, 'ok': False, 'reason': 'extract-failed'})
+                nonlocal obs_extract_fail
+                with obs_lock:
+                    obs_extract_fail += 1
+                    try:
+                        h_fail = (urlparse(f.final_url).hostname or '').lower()
+                        if h_fail:
+                            obs_extract_fail_by_host[h_fail] = obs_extract_fail_by_host.get(h_fail, 0) + 1
+                    except Exception:
+                        pass
                 try:
-                    h_fail = (urlparse(f.final_url).hostname or '').lower()
-                    if h_fail:
-                        obs_extract_fail_by_host[h_fail] = obs_extract_fail_by_host.get(h_fail, 0) + 1
+                    _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
                 except Exception:
                     pass
-            try:
-                _progress.emit_current({"stage": "extract", "status": "error", "url": f.final_url})
-            except Exception:
-                pass
-            return None
+                return None
         # Trust and wildcard configuration
         try:
             cfg_allow = list(allow_list or [])

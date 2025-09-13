@@ -115,6 +115,59 @@ def _cache_paths(cfg: WebConfig, url: str) -> Tuple[str, str]:
     return os.path.join(root, f"{key}.bin"), os.path.join(root, f"{key}.json")
 
 
+_RAW_PURGE_MARK = ".last_raw_purge"
+
+def _purge_raw_cache_if_due(cfg: WebConfig) -> None:
+    """Lazy daily purge of raw artifacts older than raw_artifacts_ttl_hours.
+    The purge marker prevents repeated scans within the same day.
+    """
+    try:
+        root = cfg.cache_root
+        os.makedirs(root, exist_ok=True)
+        mark_path = os.path.join(root, _RAW_PURGE_MARK)
+        now = time.time()
+        do_scan = True
+        if os.path.isfile(mark_path):
+            try:
+                with open(mark_path, 'r', encoding='utf-8') as mf:
+                    last = float(mf.read().strip() or '0')
+                # Once per ~24h
+                do_scan = (now - last) > 23*3600
+            except Exception:
+                do_scan = True
+        if not do_scan:
+            return
+        ttl = max(3600, int(getattr(cfg, 'raw_artifacts_ttl_hours', 24) * 3600))
+        cutoff = now - ttl
+        # Remove stale *.bin/*.json that correspond to raw fetches (including browser variants)
+        for name in os.listdir(root):
+            if not (name.endswith('.json') or name.endswith('.bin')):
+                continue
+            if name.startswith('last_screenshot_'):
+                # Browser debug screenshots: purge with same TTL
+                full = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(full) < cutoff:
+                        os.remove(full)
+                except Exception:
+                    pass
+                continue
+            full = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(full)
+                if mtime < cutoff:
+                    os.remove(full)
+            except Exception:
+                pass
+        try:
+            with open(mark_path, 'w', encoding='utf-8') as mf:
+                mf.write(str(now))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _idna_ascii(host: str) -> str:
     try:
         return host.encode('idna').decode('ascii') if host else host
@@ -406,6 +459,8 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
     except Exception:
         pass
 
+    # Daily purge pass for raw artifacts
+    _purge_raw_cache_if_due(cfg)
     body_path, meta_path = _cache_paths(cfg, url)
     now = time.time()
     cached = False
@@ -413,7 +468,13 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
         try:
             with open(meta_path, 'r', encoding='utf-8') as _mf:
                 meta = json.load(_mf)
-            if now - float(meta.get('ts', 0)) <= cfg.cache_ttl_seconds:
+            # Raw artifacts use the minimum of general cache TTL and the raw TTL
+            try:
+                raw_ttl = int(getattr(cfg, 'raw_artifacts_ttl_hours', 24) * 3600)
+            except Exception:
+                raw_ttl = 24*3600
+            effective_ttl = min(int(cfg.cache_ttl_seconds), max(3600, raw_ttl))
+            if now - float(meta.get('ts', 0)) <= effective_ttl:
                 with open(body_path, 'rb') as _bf:
                     raw = _bf.read()
                 return FetchResult(True, int(meta.get('status', 200)), url, meta.get('final_url', url), dict(meta.get('headers', {})), meta.get('content_type', ''), len(raw), body_path, meta_path, True, bool(meta.get('browser_used', False)))
@@ -437,7 +498,7 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
         prev_lm = None
 
     # Build common headers
-    accept = cfg.accept_header_override or "text/html,application/xhtml+xml,application/pdf;q=0.9,text/plain;q=0.8,*/*;q=0.1"
+    accept = cfg.accept_header_override or "text/html,application/xhtml+xml,application/pdf;q=0.9,text/plain;q=0.8"
     common_headers = {"Accept": accept}
 
     # HTTP path
@@ -618,7 +679,7 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             # keep HTTP result if any
             pass
 
-    # Save to cache
+    # Save to cache (sanitize HTML to strip script blocks before disk)
     try:
         meta = {
             'ts': now,
@@ -628,6 +689,14 @@ def fetch_url(url: str, *, cfg: Optional[WebConfig] = None, robots: Optional[Rob
             'content_type': content_type,
             'browser_used': browser_used,
         }
+        try:
+            if 'html' in (content_type or '').lower() and isinstance(raw, (bytes, bytearray)) and raw:
+                # Strip <script>...</script> blocks conservatively
+                txt = raw.decode(errors='ignore')
+                txt = re.sub(r"<script\b[^>]*>.*?</script>", "", txt, flags=re.I|re.S)
+                raw = txt.encode('utf-8', errors='ignore')
+        except Exception:
+            pass
         # Atomic writes to avoid partial reads by parallel workers
         tmp_body = body_path + ".tmp"
         tmp_meta = meta_path + ".tmp"
